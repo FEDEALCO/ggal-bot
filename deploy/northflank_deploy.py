@@ -68,7 +68,15 @@ def die(msg):
 
 
 def api(session, method, path, **kwargs):
-    resp = session.request(method, f"{BASE}{path}", **kwargs)
+    print(f"  ({method} {path} ...)")
+    kwargs.setdefault("timeout", 30)
+    try:
+        resp = session.request(method, f"{BASE}{path}", **kwargs)
+    except requests.exceptions.Timeout:
+        die(f"{method} {path} -> se colgó (timeout de 30s). Probá de nuevo; si se repite, "
+            f"puede ser un problema de conectividad puntual con la API de Northflank.")
+    except requests.exceptions.RequestException as e:
+        die(f"{method} {path} -> error de conexión: {e}")
     if not resp.ok:
         # No imprimir el body completo en pasos que puedan incluir secretos
         # (por eso el paso de secrets no llama a esta func para el error).
