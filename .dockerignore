@@ -1,0 +1,19 @@
+# No meter secretos ni estado/logs locales dentro de la imagen Docker.
+.env
+.env.*
+!.env.example
+logs/
+state/
+data_cache/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+dist/
+build/
+*.spec
+dashboard/__pycache__/
+.pytest_cache/
+venv/
+.venv/
+instruments_sample.json

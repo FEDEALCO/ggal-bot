@@ -1,0 +1,37 @@
+# Copiar este archivo a ".env" y completar con las credenciales reales del ALYC.
+# NUNCA subir el archivo ".env" real a un repositorio o compartirlo.
+
+# --- Credenciales de PyRofex / API del ALYC ---------------------------------
+PYROFEX_USER=
+PYROFEX_PASSWORD=
+PYROFEX_ACCOUNT=
+
+# REMARKET = ambiente de paper trading (usar siempre primero aca)
+# LIVE     = ambiente real, opera con dinero real
+PYROFEX_ENV=REMARKET
+
+# Endpoints propios del ALYC (opcional). Muchos brokers argentinos corren su
+# propia instancia de la API Matriz/Primary sobre la que trabaja pyRofex; si
+# tu ALYC te dio una URL de REST y otra de WebSocket, completalas aca. Si se
+# dejan vacias, pyRofex usa el default de la libreria para el ambiente elegido.
+PYROFEX_REST_URL=
+PYROFEX_WS_URL=
+
+# Reconexion automatica de websocket (ver order_gateway.WebSocketConnectionManager)
+PYROFEX_WS_RECONNECT_INITIAL_SECONDS=2
+PYROFEX_WS_RECONNECT_MAX_SECONDS=60
+PYROFEX_WS_RECONNECT_BACKOFF_FACTOR=2
+PYROFEX_WS_MAX_RECONNECT_ATTEMPTS=0
+
+# --- Parametros cuantitativos por defecto -----------------------------------
+# Tasa libre de riesgo local (ARS) anualizada, en decimal (0.40 = 40%)
+GGAL_BOT_RISK_FREE_RATE=0.40
+GGAL_BOT_DIVIDEND_YIELD=0.0
+
+# Umbral de delta-neutralidad: acciones equivalentes de GGAL antes de rehedgear
+GGAL_BOT_DELTA_NEUTRAL_THRESHOLD=150
+
+# Slippage maximo tolerado en ordenes (fraccion, 0.01 = 1%)
+GGAL_BOT_MAX_SLIPPAGE_PCT=0.01
+# Movimiento del subyacente que fuerza cancelar/repricear una orden pendiente
+GGAL_BOT_UNDERLYING_MOVE_CANCEL_PCT=0.005

@@ -1,0 +1,26 @@
+# Secretos reales - NUNCA subir esto a un repo (ver .env.example).
+.env
+.env.*
+!.env.example
+
+# Estado/telemetria local (no son "codigo", y ademas revelan operativa real).
+logs/
+state/
+data_cache/
+
+# Artefactos de build (PyInstaller) y de Python.
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Entornos virtuales / IDE.
+venv/
+.venv/
+.vscode/
+.idea/
+
+# Cache local pesado, no hace falta para correr el bot en el contenedor.
+instruments_sample.json

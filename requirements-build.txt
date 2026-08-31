@@ -1,0 +1,4 @@
+# Dependencias solo para EMPAQUETAR el bot como ejecutable de Windows
+# (ver build_exe.bat). No hacen falta para correr el bot normalmente con
+# "python run_bot.py" - por eso estan separadas de requirements.txt.
+pyinstaller>=6.0.0
