@@ -70,8 +70,9 @@ def die(msg):
 def api(session, method, path, **kwargs):
     resp = session.request(method, f"{BASE}{path}", **kwargs)
     if not resp.ok:
-        # No imprimir el body completo en pasos que puedan incluir secretos.
-        body = resp.text[:500]
+        # No imprimir el body completo en pasos que puedan incluir secretos
+        # (por eso el paso de secrets no llama a esta func para el error).
+        body = resp.text[:1500]
         die(f"{method} {path} -> HTTP {resp.status_code}\n{body}")
     return resp.json() if resp.content else {}
 
@@ -145,54 +146,70 @@ def main():
         "Elegí el número de plan (recomendado: el más barato, [0]): "
     )
 
-    print("\n== Paso 2/5: creando el proyecto en Northflank ==")
-    project = api(session, "POST", "/projects", json={
-        "name": PROJECT_NAME,
-        "description": "GGAL options vol-arbitrage bot (shadow mode)",
-        "region": region["id"],
-    })
-    project_id = project["data"]["id"]
-    print(f"Proyecto creado: {project_id}")
+    print("\n== Paso 2/5: creando (o reutilizando) el proyecto en Northflank ==")
+    existing_projects = api(session, "GET", "/projects").get("data", {}).get("projects", [])
+    existing = next((p for p in existing_projects if p.get("name") == PROJECT_NAME), None)
+    if existing:
+        project_id = existing["id"]
+        print(f"Ya existía un proyecto '{PROJECT_NAME}' (de una corrida anterior) -> lo reutilizo: {project_id}")
+    else:
+        project = api(session, "POST", "/projects", json={
+            "name": PROJECT_NAME,
+            "description": "GGAL options vol-arbitrage bot (shadow mode)",
+            "region": region["id"],
+        })
+        project_id = project["data"]["id"]
+        print(f"Proyecto creado: {project_id}")
 
     print("\n== Paso 3/5: cargando tus variables reales como secret group ==")
     print(f"Leyendo: {env_path}")
     env_vars = load_env_file(env_path)
     print(f"({len(env_vars)} variables encontradas — sus valores NO se imprimen acá)")
-    api(session, "POST", f"/projects/{project_id}/secrets", json={
-        "name": SECRET_GROUP_NAME,
-        "type": "secret",
-        "secretType": "environment",
-        "priority": 10,
-        "secrets": {"variables": env_vars},
-    })
-    print("Secret group creado y disponible para todos los servicios del proyecto.")
+    existing_secrets = api(session, "GET", f"/projects/{project_id}/secrets").get("data", {}).get("secrets", [])
+    if any(s.get("name") == SECRET_GROUP_NAME for s in existing_secrets):
+        print(f"Ya existía el secret group '{SECRET_GROUP_NAME}' -> lo dejo como está (no lo piso).")
+    else:
+        api(session, "POST", f"/projects/{project_id}/secrets", json={
+            "name": SECRET_GROUP_NAME,
+            "type": "secret",
+            "secretType": "environment",
+            "priority": 10,
+            "secrets": {"variables": env_vars},
+        })
+        print("Secret group creado y disponible para todos los servicios del proyecto.")
 
     print("\n== Paso 4/5: creando el servicio (build desde GitHub + Dockerfile) ==")
-    service = api(session, "POST", f"/projects/{project_id}/services", json={
-        "name": SERVICE_NAME,
-        "description": "GGAL_BOT - shadow mode",
-        "billing": {
-            "deploymentPlan": plan["id"],
-            "buildPlan": plan["id"],
-        },
-        "deployment": {
-            "instances": 1,
-            "type": "deployment",
-        },
-        "vcsData": {
-            "projectUrl": GITHUB_REPO_URL,
-            "projectType": "github",
-            "projectBranch": GITHUB_BRANCH,
-        },
-        "buildSettings": {
-            "dockerfile": {
-                "dockerFilePath": "/Dockerfile",
-                "dockerWorkDir": "/",
-            }
-        },
-    })
-    service_id = service["data"]["id"]
-    print(f"Servicio creado: {service_id}")
+    existing_services = api(session, "GET", f"/projects/{project_id}/services").get("data", {}).get("services", [])
+    existing_service = next((s for s in existing_services if s.get("name") == SERVICE_NAME), None)
+    if existing_service:
+        service_id = existing_service["id"]
+        print(f"Ya existía el servicio '{SERVICE_NAME}' -> lo reutilizo: {service_id}")
+    else:
+        service = api(session, "POST", f"/projects/{project_id}/services/combined", json={
+            "name": SERVICE_NAME,
+            "description": "GGAL_BOT - shadow mode",
+            "billing": {
+                "deploymentPlan": plan["id"],
+                "buildPlan": plan["id"],
+            },
+            "deployment": {
+                "instances": 1,
+                "type": "deployment",
+            },
+            "vcsData": {
+                "projectUrl": GITHUB_REPO_URL,
+                "projectType": "github",
+                "projectBranch": GITHUB_BRANCH,
+            },
+            "buildSettings": {
+                "dockerfile": {
+                    "dockerFilePath": "/Dockerfile",
+                    "dockerWorkDir": "/",
+                }
+            },
+        })
+        service_id = service["data"]["id"]
+        print(f"Servicio creado: {service_id}")
 
     print("\n== Paso 5/5 (best-effort): volumen persistente para state/logs/data_cache ==")
     try:
