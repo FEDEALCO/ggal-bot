@@ -464,6 +464,47 @@ def test_scan_spread_completion_signals_excludes_stale_wing_candidate():
     assert len(signals_fresh) == 1
 
 
+def test_scan_spread_completion_signals_forced_expiry_ignores_other_expiries():
+    """
+    Feature nueva (2026-09-01, a pedido explicito del usuario -
+    GGAL_BOT_FORCE_EXPIRY / InstrumentsConfig.forced_expiry, ver run_bot.py
+    __init__ y _run_weekly_asymmetric_cycle): cuando se pasa `forced_expiry`,
+    scan_spread_completion_signals debe ignorar POR COMPLETO cualquier
+    posicion larga confirmada y cualquier wing candidato de otro
+    vencimiento - incluso si esa otra posicion tiene un wing perfectamente
+    valido disponible. Simula dos vencimientos con una larga confirmada cada
+    uno; sin forced_expiry ambos completan spread, con
+    forced_expiry=Setiembre solo debe completarse el de Setiembre.
+    """
+    chain = OptionChain()
+    long_call_sep = _quote("GFGC5200O", 5200, 0.55, 5200.0, days_biz=3, expiry=date(2026, 9, 4))
+    wing_call_sep = _quote("GFGC5400O", 5400, 0.50, 5200.0, days_biz=3, expiry=date(2026, 9, 4))
+    long_call_oct = _quote("GFGC5200OC", 5200, 0.55, 5200.0, days_biz=33, expiry=date(2026, 10, 16))
+    wing_call_oct = _quote("GFGC5400OC", 5400, 0.50, 5200.0, days_biz=33, expiry=date(2026, 10, 16))
+    for q in (long_call_sep, wing_call_sep, long_call_oct, wing_call_oct):
+        chain.upsert_quote(q)
+
+    strategy = WeeklyAsymmetricStrategy(
+        _lenient_risk_manager(), config=_default_config(spread_wing_moneyness_pct=0.02),
+    )
+    portfolio = Portfolio()
+    portfolio.add(Position(symbol=long_call_sep.symbol, quantity=5, multiplier=100.0))
+    portfolio.add(Position(symbol=long_call_oct.symbol, quantity=5, multiplier=100.0))
+
+    # Sin forced_expiry (comportamiento por defecto): ambos vencimientos completan su spread.
+    signals_all = strategy.scan_spread_completion_signals(chain, portfolio, trend="BULLISH")
+    assert len(signals_all) == 2
+
+    # Con forced_expiry=Setiembre: Octubre se ignora por completo, aunque tenga
+    # una larga confirmada y un wing perfectamente valido disponibles.
+    signals_forced = strategy.scan_spread_completion_signals(
+        chain, portfolio, trend="BULLISH", forced_expiry=date(2026, 9, 4),
+    )
+    assert len(signals_forced) == 1
+    assert signals_forced[0].long_symbol == "GFGC5200O"
+    assert signals_forced[0].short_symbol == "GFGC5400O"
+
+
 def test_scan_spread_completion_signals_picks_lower_strike_wing_for_bear_put_spread():
     chain = OptionChain()
     long_put = _quote("GFGV5200O", 5200, 0.55, 5200.0, days_biz=3, option_type=OptionType.PUT)
@@ -1014,6 +1055,7 @@ ALL_TESTS = [
     test_scan_spread_completion_signals_empty_without_confirmed_long_position,
     test_scan_spread_completion_signals_requires_positive_quantity_not_just_any_position,
     test_scan_spread_completion_signals_picks_further_otm_wing_for_bull_call_spread,
+    test_scan_spread_completion_signals_forced_expiry_ignores_other_expiries,
     test_scan_spread_completion_signals_excludes_stale_wing_candidate,
     test_scan_spread_completion_signals_picks_lower_strike_wing_for_bear_put_spread,
     test_scan_entry_signals_bullish_trend_only_considers_calls,

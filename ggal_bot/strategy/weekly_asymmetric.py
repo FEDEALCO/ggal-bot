@@ -111,7 +111,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Dict, List, Optional
 
 from ggal_bot.config import SETTINGS
@@ -360,6 +360,7 @@ class WeeklyAsymmetricStrategy:
     def scan_spread_completion_signals(
         self, option_chain: OptionChain, portfolio: Portfolio, trend: str = Trend.NEUTRAL.value,
         max_quote_age_seconds: Optional[float] = None, now: Optional[float] = None,
+        forced_expiry: Optional[date] = None,
     ) -> List[SpreadCompletionSignal]:
         """
         `trend`: misma lectura inyectada que scan_entry_signals(). Bajo
@@ -387,6 +388,13 @@ class WeeklyAsymmetricStrategy:
         criterio que el resto del modulo: libre de I/O, testeable con
         datos sinteticos. Default None = sin filtro de staleness (compatible
         hacia atras con cualquier llamador que no los pase).
+
+        `forced_expiry` (a pedido explicito del usuario, 2026-09-01 - ver
+        InstrumentsConfig.forced_expiry): si se pasa, se ignoran por
+        completo las bases de cualquier OTRO vencimiento (ni como pata
+        larga confirmada ni como candidata a wing) - mismo criterio que el
+        filtro equivalente en run_bot.py:_run_weekly_asymmetric_cycle para
+        entradas nuevas. Default None = sin filtro (compatible hacia atras).
         """
         if not self.cfg.enable_spread_completion:
             return []
@@ -403,6 +411,8 @@ class WeeklyAsymmetricStrategy:
 
         signals: List[SpreadCompletionSignal] = []
         for quote in option_chain.all_quotes():
+            if forced_expiry is not None and quote.expiry != forced_expiry:
+                continue  # vencimiento forzado: se ignora cualquier otro por completo
             if allowed_option_type is not None and quote.option_type is not allowed_option_type:
                 continue  # filtro direccional tecnico: no se agrega exposicion contraria a la tendencia vigente
 
