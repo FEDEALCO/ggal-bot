@@ -510,6 +510,55 @@ def test_broker_rest_source_near_the_money_refresh_is_throttled():
         mod.BrokerRestSource._login = original_login
 
 
+def test_broker_rest_source_near_the_money_refresh_failure_does_not_lose_batch_data():
+    """
+    BUG REAL CORREGIDO (2026-09-01, ver seguimiento de la auditoria - el
+    primer rollout de _refresh_near_the_money_quotes() NUNCA logueo su
+    linea de exito ni de fallo en produccion): una excepcion DENTRO de
+    _refresh_near_the_money_quotes_unsafe() (ej. self._login() relanzando
+    un 503 real de IOL en /token) NO debe propagar fuera de
+    fetch_snapshot() - si lo hiciera, LiveShadowFeed.poll() (via
+    _safe_call) descartaria TODO el resultado de este poll, incluido el
+    spot/cadena que YA se habian conseguido bien mas arriba en la MISMA
+    llamada, degradando un refresco parcialmente exitoso a "nada".
+    """
+    import ggal_bot.data.live_shadow_feed as mod
+
+    original_login = mod.BrokerRestSource._login
+    original_http_get_json = mod.http_get_json
+    original_unsafe = mod.BrokerRestSource._refresh_near_the_money_quotes_unsafe
+    underlying = SETTINGS.instruments.underlying_symbol
+
+    def fake_http_get_json(url, timeout, headers=None):  # noqa: ARG001
+        if url.endswith(f"/{underlying}/Cotizacion"):
+            return {"ultimoPrecio": 7000.0, "puntas": []}
+        assert url.endswith("/Opciones")
+        return [
+            {
+                "cotizacion": {"ultimoPrecio": 5.0, "puntas": None},
+                "tipoOpcion": "Call", "simbolo": "GFGC7000SE", "fechaVencimiento": "2026-09-18T15:30:00",
+            },
+        ]
+
+    def raising_unsafe(self, now):  # noqa: ARG001
+        raise RuntimeError("503 Server Error (simulado) durante el refresco individual")
+
+    mod.BrokerRestSource._login = lambda self: True
+    mod.http_get_json = fake_http_get_json
+    mod.BrokerRestSource._refresh_near_the_money_quotes_unsafe = raising_unsafe
+    try:
+        source = mod.BrokerRestSource()
+        source.bootstrap()
+        spot, options = source.fetch_snapshot()
+        assert spot is not None and spot.last_price == 7000.0
+        assert "GFGC7000SE" in options
+        assert source.had_last_fetch_error() is False
+    finally:
+        mod.http_get_json = original_http_get_json
+        mod.BrokerRestSource._login = original_login
+        mod.BrokerRestSource._refresh_near_the_money_quotes_unsafe = original_unsafe
+
+
 def test_broker_rest_source_bootstrap_precarga_el_cache_de_cotizaciones():
     """bootstrap() debe aprovechar la 'cotizacion' embebida en /Opciones para precargar el cache, sin esperar a poll()."""
     import ggal_bot.data.live_shadow_feed as mod
@@ -866,6 +915,7 @@ ALL_TESTS = [
     test_broker_rest_source_fetch_snapshot_refreshes_whole_chain_in_one_request,
     test_broker_rest_source_refreshes_near_the_money_quotes_individually,
     test_broker_rest_source_near_the_money_refresh_is_throttled,
+    test_broker_rest_source_near_the_money_refresh_failure_does_not_lose_batch_data,
     test_broker_rest_source_bootstrap_precarga_el_cache_de_cotizaciones,
     test_live_shadow_feed_respects_explicit_source_priority_order,
     test_live_shadow_feed_ignores_unknown_source_name_in_priority,
