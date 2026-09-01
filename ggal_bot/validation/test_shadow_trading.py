@@ -559,6 +559,77 @@ def test_broker_rest_source_near_the_money_refresh_failure_does_not_lose_batch_d
         mod.BrokerRestSource._refresh_near_the_money_quotes_unsafe = original_unsafe
 
 
+def test_broker_rest_source_near_the_money_refresh_splits_budget_evenly_across_expiries():
+    """
+    BUG REAL CORREGIDO (2026-09-01, ver seguimiento de la auditoria - primer
+    dato real en produccion tras desplegar _refresh_near_the_money_quotes()):
+    self._universe trae TODAS las expiraciones que devuelve la API, y un
+    cupo GLOBAL rankeado solo por cercania de strike (sin agrupar por
+    vencimiento) podia dejar a la expiracion MAS PROXIMA (la unica operable
+    bajo el horizonte semanal) con menos cotizaciones validas que una
+    expiracion mas lejana, solo porque esta ultima tenia strikes MAS
+    cercanos al spot en una foto puntual (confirmado en produccion:
+    2026-10-16 con 10 validas vs. 2026-09-18, la realmente operable, con
+    apenas 2 - por debajo del piso de 3 para escanear). Este test confirma
+    que el cupo ahora se reparte PAREJO entre las expiraciones relevantes,
+    incluso cuando una de ellas tiene strikes objetivamente mas cercanos.
+    """
+    import ggal_bot.data.live_shadow_feed as mod
+
+    original_login = mod.BrokerRestSource._login
+    original_http_get_json = mod.http_get_json
+    original_max_symbols = SETTINGS.broker_rest.individual_quote_max_symbols
+    original_expiries_ahead = SETTINGS.instruments.expiries_ahead
+    underlying = SETTINGS.instruments.underlying_symbol
+    individual_calls = []
+
+    def fake_http_get_json(url, timeout, headers=None):  # noqa: ARG001
+        if url.endswith(f"/{underlying}/Cotizacion"):
+            return {"ultimoPrecio": 7000.0, "puntas": []}
+        if url.endswith("/Opciones"):
+            records = []
+            # Octubre (vencimiento mas LEJANO, pero con strikes MAS cercanos
+            # al spot que Setiembre en esta foto puntual - a proposito).
+            for strike in (7000, 7010, 7020, 7030):
+                records.append({
+                    "cotizacion": {"ultimoPrecio": 1.0, "puntas": None},
+                    "tipoOpcion": "Call", "simbolo": f"GFGC{strike}OC",
+                    "fechaVencimiento": "2026-10-16T15:30:00",
+                })
+            # Setiembre (vencimiento mas PROXIMO, el unico realmente operable
+            # bajo el horizonte semanal), strikes un poco mas lejos del spot.
+            for strike in (7000, 7050, 7100, 7150):
+                records.append({
+                    "cotizacion": {"ultimoPrecio": 1.0, "puntas": None},
+                    "tipoOpcion": "Call", "simbolo": f"GFGC{strike}SE",
+                    "fechaVencimiento": "2026-09-18T15:30:00",
+                })
+            return records
+        individual_calls.append(url)
+        return {"ultimoPrecio": 1.0, "puntas": [
+            {"precioCompra": 0.9, "cantidadCompra": 10, "precioVenta": 1.1, "cantidadVenta": 10},
+        ]}
+
+    mod.BrokerRestSource._login = lambda self: True
+    mod.http_get_json = fake_http_get_json
+    SETTINGS.broker_rest.individual_quote_max_symbols = 4
+    SETTINGS.instruments.expiries_ahead = 2
+    try:
+        source = mod.BrokerRestSource()
+        source.bootstrap()
+        source.fetch_snapshot()
+        se_calls = [u for u in individual_calls if u.endswith("SE/Cotizacion")]
+        oc_calls = [u for u in individual_calls if u.endswith("OC/Cotizacion")]
+        assert len(individual_calls) == 4
+        assert len(se_calls) == 2, f"Setiembre (la operable) deberia recibir su mitad pareja del cupo: {se_calls}"
+        assert len(oc_calls) == 2, f"Octubre deberia recibir su mitad pareja del cupo, no mas: {oc_calls}"
+    finally:
+        mod.http_get_json = original_http_get_json
+        mod.BrokerRestSource._login = original_login
+        SETTINGS.broker_rest.individual_quote_max_symbols = original_max_symbols
+        SETTINGS.instruments.expiries_ahead = original_expiries_ahead
+
+
 def test_broker_rest_source_bootstrap_precarga_el_cache_de_cotizaciones():
     """bootstrap() debe aprovechar la 'cotizacion' embebida en /Opciones para precargar el cache, sin esperar a poll()."""
     import ggal_bot.data.live_shadow_feed as mod
@@ -916,6 +987,7 @@ ALL_TESTS = [
     test_broker_rest_source_refreshes_near_the_money_quotes_individually,
     test_broker_rest_source_near_the_money_refresh_is_throttled,
     test_broker_rest_source_near_the_money_refresh_failure_does_not_lose_batch_data,
+    test_broker_rest_source_near_the_money_refresh_splits_budget_evenly_across_expiries,
     test_broker_rest_source_bootstrap_precarga_el_cache_de_cotizaciones,
     test_live_shadow_feed_respects_explicit_source_priority_order,
     test_live_shadow_feed_ignores_unknown_source_name_in_priority,
