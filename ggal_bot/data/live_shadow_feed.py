@@ -987,23 +987,48 @@ class BrokerRestSource(ShadowDataSource):
             )
             return
 
+        # BUG REAL CORREGIDO (2026-09-01, ver seguimiento de la auditoria -
+        # primer dato real tras desplegar este metodo): self._universe trae
+        # TODAS las expiraciones que devuelve la API (no solo las 2 que el
+        # bot realmente sigue - ver InstrumentsConfig.expiries_ahead=2;
+        # bootstrap() parsea el listado COMPLETO, incluyendo vencimientos
+        # mucho mas lejanos como Diciembre). Un cupo GLOBAL de
+        # individual_quote_max_symbols rankeado solo por cercania de strike
+        # (sin agrupar por vencimiento) puede dejar a la expiracion mas
+        # PROXIMA - la unica que la estrategia puede llegar a operar bajo
+        # el horizonte semanal (LongFirstConfig.max_holding_business_days)
+        # - con menos de las 3 cotizaciones minimas para escanear, mientras
+        # una expiracion mas lejana (que la estrategia jamas va a poder
+        # usar para una entrada, solo quizas como wing de spread) se lleva
+        # la mayoria del cupo por tener, en una foto puntual, strikes mas
+        # cercanos al spot. Confirmado en produccion: 10 validas en
+        # 2026-10-16 (bloqueadas igual por horizonte semanal) vs. apenas 2
+        # en 2026-09-18 (la unica realmente operable, por debajo del piso
+        # de 3). Se agrupa por vencimiento, se toman solo las
+        # `expiries_ahead` mas proximas, y se reparte el cupo PAREJO entre
+        # ellas.
         band = self._cfg.individual_quote_moneyness_band_pct
-        scored: List[Tuple[float, str]] = []
-        for symbol, _option_type, strike, _expiry in self._universe:
+        by_expiry: Dict[date, List[Tuple[float, str]]] = {}
+        for symbol, _option_type, strike, expiry in self._universe:
             if strike is None or strike <= 0:
                 continue
             log_moneyness = abs(math.log(strike / reference_spot))
             if log_moneyness <= band:
-                scored.append((log_moneyness, symbol))
-        if not scored:
+                by_expiry.setdefault(expiry, []).append((log_moneyness, symbol))
+        if not by_expiry:
             logger.info(
                 "BrokerRestSource: ninguna opcion del universo (%d candidatas) cae dentro de la banda de "
                 "moneyness |log(K/S)|<=%.2f alrededor del spot ref=%.2f.",
                 len(self._universe), band, reference_spot,
             )
             return
-        scored.sort(key=lambda item: item[0])
-        symbols_to_refresh = [symbol for _lm, symbol in scored[: self._cfg.individual_quote_max_symbols]]
+
+        relevant_expiries = sorted(by_expiry.keys())[: max(1, SETTINGS.instruments.expiries_ahead)]
+        per_expiry_budget = max(1, self._cfg.individual_quote_max_symbols // len(relevant_expiries))
+        symbols_to_refresh: List[str] = []
+        for expiry in relevant_expiries:
+            candidates = sorted(by_expiry[expiry], key=lambda item: item[0])
+            symbols_to_refresh.extend(symbol for _lm, symbol in candidates[:per_expiry_budget])
 
         if not self._login():
             logger.info("BrokerRestSource: refresco de puntas individuales pospuesto (fallo la autenticacion).")
