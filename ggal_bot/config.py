@@ -181,6 +181,34 @@ class BrokerRestConfig:
     # se deja configurable (poner "" para omitirlo) por si IOL lo cambia.
     api_version_segment: str = _env_str("BROKER_REST_API_VERSION_SEGMENT", "v2")
 
+    # --- Refresco de puntas INDIVIDUALES por opcion (ver BrokerRestSource.
+    # _refresh_near_the_money_quotes(), hallazgo del 2026-09-01 corriendo
+    # diagnose_iol_puntas.py contra una cuenta real durante horario de
+    # rueda): el endpoint de CADENA (`/Titulos/GGAL/Opciones`, usado por
+    # bootstrap()/fetch_snapshot() de arriba) devuelve 'puntas': null para
+    # el 100% de los registros SIEMPRE - incluso para una opcion con una
+    # operacion reciente (ultimoPrecio>0) - no es que el mercado este
+    # ilíquido, ese endpoint especifico simplemente no trae profundidad.
+    # El endpoint INDIVIDUAL por simbolo (el mismo que ya se usa para el
+    # SUBYACENTE) SI trae 'puntas' pobladas para el mismo simbolo en el
+    # mismo instante - confirmado en produccion. Pedir las ~104 opciones
+    # individualmente en cada poll no es viable (arriesga empeorar los
+    # timeouts/503 ya observados contra la API de IOL) - se restringe a
+    # una banda de moneyness alrededor del spot (las UNICAS opciones que
+    # la estrategia puede llegar a usar: ver LongFirstConfig.
+    # moneyness_band_pct=0.15 y spread_wing_moneyness_pct), con un tope
+    # duro de simbolos por refresh, y en un intervalo propio MAS LENTO que
+    # el poll principal (2s) - las puntas de opciones no necesitan ser mas
+    # frescas que esto para una estrategia semanal.
+    individual_quote_moneyness_band_pct: float = _env_float(
+        "BROKER_REST_INDIVIDUAL_QUOTE_MONEYNESS_BAND_PCT", 0.20
+    )
+    individual_quote_max_symbols: int = _env_int("BROKER_REST_INDIVIDUAL_QUOTE_MAX_SYMBOLS", 30)
+    individual_quote_timeout_seconds: float = _env_float("BROKER_REST_INDIVIDUAL_QUOTE_TIMEOUT", 8.0)
+    individual_quote_min_refresh_interval_seconds: float = _env_float(
+        "BROKER_REST_INDIVIDUAL_QUOTE_REFRESH_SECONDS", 20.0
+    )
+
 
 # ---------------------------------------------------------------------------
 # Universo de instrumentos: GGAL contado, futuro, y cadena de opciones
