@@ -122,11 +122,56 @@ def main() -> int:
         print("   " + json.dumps(without_puntas[0], indent=2, ensure_ascii=False).replace("\n", "\n   "))
 
     print(
-        "\nListo. Si en el punto 4 el campo 'puntas' SI trae 'precioCompra'/'precioVenta' con "
-        "valores > 0 pero BrokerRestSource igual los descarta, el bug esta en como se ACCEDE "
+        "\nListo (chain). Si en el punto 4 el campo 'puntas' SI trae 'precioCompra'/'precioVenta' "
+        "con valores > 0 pero BrokerRestSource igual los descarta, el bug esta en como se ACCEDE "
         "a esos valores (indentacion/anidamiento) en _parse_quote_record(), no en los nombres "
-        "de campo en si - pegar esta salida completa para ajustarlo."
+        "de campo en si."
     )
+
+    # --- 6. Hipotesis: el endpoint de CADENA (batch) no trae 'puntas' aunque haya
+    # mercado activo, y solo el endpoint INDIVIDUAL (por simbolo) lo trae real -
+    # se prueba pidiendo el mismo simbolo por los dos caminos, en el mismo instante.
+    traded = [r for r in options_data if isinstance(r, dict) and (r.get("cotizacion") or {}).get("ultimoPrecio", 0) not in (0, 0.0, None)]
+    if traded:
+        probe_symbol = traded[0].get("simbolo")
+        print(
+            f"\n6) HIPOTESIS: probando si el endpoint INDIVIDUAL (por simbolo, el mismo que usa "
+            f"BrokerRestSource para el SUBYACENTE) trae 'puntas' reales para una opcion que la "
+            f"cadena (batch) reporto con 'puntas': null pero con operaciones recientes "
+            f"(ultimoPrecio={traded[0]['cotizacion'].get('ultimoPrecio')}) - simbolo elegido: "
+            f"{probe_symbol}."
+        )
+        single_url = f"{cfg.base_url.rstrip('/')}/api/{version}{cfg.market}/Titulos/{probe_symbol}/Cotizacion"
+        print(f"   GET {single_url} ...")
+        try:
+            single_data = http_utils.http_get_json(single_url, timeout=cfg.request_timeout_seconds, headers=headers)
+            print("   Respuesta CRUDA del endpoint INDIVIDUAL para ese mismo simbolo:")
+            print("   " + json.dumps(single_data, indent=2, ensure_ascii=False).replace("\n", "\n   "))
+            single_puntas = single_data.get("puntas") if isinstance(single_data, dict) else None
+            if single_puntas:
+                print(
+                    "\n   -> CONFIRMADO: el endpoint individual SI trae 'puntas' pobladas para este "
+                    "simbolo, mientras que la cadena (batch) devolvio null. El fix es que "
+                    "BrokerRestSource haga un GET individual por opcion para el book (no solo el "
+                    "batch), o que se acepte usar solo ultimoPrecio/volumenNominal del batch como "
+                    "proxy de liquidez en vez de exigir 'puntas'."
+                )
+            else:
+                print(
+                    "\n   -> El endpoint individual TAMPOCO trae 'puntas' pobladas para este simbolo "
+                    "- no es un problema de que endpoint se llama, la punta simplemente no esta "
+                    "disponible via API de IOL para opciones en este momento (aunque la pagina web "
+                    "la muestre - puede usar un canal distinto, ej. streaming/websocket, no este REST)."
+                )
+        except Exception as exc:  # noqa: BLE001
+            print(f"   FALLO ({exc!r}).")
+    else:
+        print(
+            "\n6) Ningun registro de la cadena tiene 'ultimoPrecio' distinto de cero ahora mismo - "
+            "no hay un simbolo con operaciones recientes para probar la hipotesis del endpoint "
+            "individual."
+        )
+
     return 0
 
 
