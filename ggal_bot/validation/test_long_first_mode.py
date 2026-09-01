@@ -571,6 +571,67 @@ def test_scan_entry_signals_neutral_trend_allows_truly_extreme_dislocation():
     assert any(s.symbol == "GFGC5250O" for s in signals)
 
 
+def test_scan_entry_signals_diagnostics_report_closest_miss_under_neutral_trend():
+    """
+    EntryScanDiagnostics (agregado a pedido explicito, ver seguimiento de
+    auditoria del 2026-09-01 - duda sobre si los filtros son "muy duros"):
+    debe reportar, SIN cambiar el resultado de scan_entry_signals(), que
+    las 18 cotizaciones llegaron al chequeo de dislocacion (ningun filtro
+    anterior las bloquea en este fixture), que ninguna califico bajo el
+    umbral extremo de NEUTRAL, y cual fue la mas cerca de calificar.
+    """
+    cfg = _default_config()  # smile_threshold_vol_points=3.0
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    quotes = _bullish_smile_quotes()  # dislocacion de "cheap_*" ronda -3.9 vol pts
+    surface = VolatilitySurface(quotes)
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="NEUTRAL",
+    )
+    assert signals == []  # comportamiento sin cambios (mismo test que arriba)
+
+    diag = strategy.last_scan_diagnostics
+    assert diag is not None
+    assert diag.total_quotes == len(quotes) == 18
+    assert diag.blocked_by_direction == 0  # NEUTRAL nunca descarta option_type de antemano
+    assert diag.blocked_by_holding_days == 0
+    assert diag.blocked_by_liquidity == 0
+    assert diag.blocked_by_obi == 0
+    assert diag.blocked_by_moneyness == 0
+    assert diag.evaluated_for_dislocation == 18  # todas llegaron al chequeo de smile
+    assert diag.blocked_by_dislocation == 18     # ninguna alcanzo el umbral extremo (6.0)
+    assert diag.qualified == 0
+    # Las bases "cheap_*" (~-3.9 vol pts) son las mas cercanas a calificar,
+    # muy por delante de las bases de relleno (dislocacion ~0).
+    assert diag.closest_miss_symbol in ("GFGC5150O", "GFGV5150O")
+    assert diag.closest_miss_threshold_required == -6.0  # 3.0 * neutral_extreme_smile_multiplier=2.0
+    assert 0.0 < diag.closest_miss_shortfall_vol_points < 3.0
+
+
+def test_scan_entry_signals_diagnostics_identify_earlier_filter_as_bottleneck():
+    """
+    Cuando NINGUNA cotizacion llega siquiera al chequeo de dislocacion (acá,
+    todas quedan afuera de la banda de moneyness), evaluated_for_dislocation
+    debe quedar en 0 y blocked_by_moneyness debe explicar el motivo real -
+    para no confundir "el umbral de smile es muy duro" con "el problema esta
+    en otro filtro anterior".
+    """
+    cfg = _default_config(moneyness_band_pct=0.001)  # banda absurdamente angosta a proposito
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    quotes = _bullish_smile_quotes()
+    surface = VolatilitySurface(quotes)
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="NEUTRAL",
+    )
+    assert signals == []
+
+    diag = strategy.last_scan_diagnostics
+    assert diag is not None
+    assert diag.evaluated_for_dislocation == 0
+    assert diag.blocked_by_dislocation == 0
+    assert diag.blocked_by_moneyness == diag.total_quotes  # el cuello de botella real
+    assert diag.closest_miss_symbol is None  # nunca se llego a medir dislocacion
+
+
 def test_scan_entry_signals_technical_filter_disabled_ignores_trend():
     """Con GGAL_BOT_TECHNICAL_FILTER_ENABLED=false, el comportamiento debe ser identico al de antes de este modulo."""
     original_enabled = SETTINGS.technical_analysis.enabled
@@ -959,6 +1020,8 @@ ALL_TESTS = [
     test_scan_entry_signals_bearish_trend_only_considers_puts,
     test_scan_entry_signals_neutral_trend_requires_extreme_dislocation,
     test_scan_entry_signals_neutral_trend_allows_truly_extreme_dislocation,
+    test_scan_entry_signals_diagnostics_report_closest_miss_under_neutral_trend,
+    test_scan_entry_signals_diagnostics_identify_earlier_filter_as_bottleneck,
     test_scan_entry_signals_technical_filter_disabled_ignores_trend,
     test_scan_entry_signals_momentum_shift_allows_contrarian_type_only_at_extreme_threshold,
     test_scan_entry_signals_no_momentum_shift_still_bans_contrarian_type_even_if_extreme,
