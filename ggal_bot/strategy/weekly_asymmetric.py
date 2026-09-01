@@ -156,10 +156,48 @@ class ExitSignal:
     quantity: float = 0.0
 
 
+@dataclass
+class EntryScanDiagnostics:
+    """
+    Diagnostico PURO de scan_entry_signals(): NO cambia ningun umbral ni
+    comportamiento, solo cuenta en que filtro se descarta cada quote
+    candidata y guarda la dislocacion MAS CERCANA a calificar entre las
+    que llegaron al chequeo de smile sin alcanzar el umbral vigente.
+    Agregado a pedido explicito (ver seguimiento de auditoria del
+    2026-09-01) tras la duda de si los filtros son "muy duros": con el
+    deploy corriendo apenas unas horas y la tendencia 1D leyendo NEUTRAL
+    de forma sostenida (lo que ya DUPLICA el umbral de dislocacion exigido,
+    ver TechnicalAnalysisConfig.neutral_extreme_smile_multiplier), no habia
+    forma de distinguir "los umbrales estan mal calibrados" de "el mercado
+    todavia no presento una dislocacion que los mercados en NEUTRAL exigen"
+    - antes esta informacion se descartaba en silencio en cada `continue`.
+    Se guarda en WeeklyAsymmetricStrategy.last_scan_diagnostics (no se
+    retorna junto con las señales para no romper la firma/tests
+    existentes de scan_entry_signals) para que run_bot.py la loguee,
+    throttleada, sin que este modulo deje de estar libre de I/O.
+    """
+    total_quotes: int = 0
+    blocked_by_direction: int = 0       # smile_threshold None: bloqueo direccional tecnico (BULLISH/BEARISH sin reversion)
+    blocked_by_holding_days: int = 0
+    blocked_by_liquidity: int = 0
+    blocked_by_obi: int = 0
+    blocked_by_moneyness: int = 0
+    evaluated_for_dislocation: int = 0  # llegaron al chequeo de smile (pasaron todos los filtros anteriores)
+    blocked_by_dislocation: int = 0     # llegaron pero no alcanzaron el umbral vigente (normal o extremo bajo NEUTRAL)
+    qualified: int = 0                  # generaron EntrySignal
+    trend: str = ""
+    closest_miss_symbol: Optional[str] = None
+    closest_miss_dislocation: Optional[float] = None          # dislocation real observada (mas negativo = mas barata)
+    closest_miss_threshold_required: Optional[float] = None   # -smile_threshold exigido para esa opcion puntual
+    closest_miss_shortfall_vol_points: Optional[float] = None  # cuanto le falto en puntos de vol (siempre >= 0)
+
+
 class WeeklyAsymmetricStrategy:
     def __init__(self, risk_manager: RiskManager, config=None):
         self.risk_manager = risk_manager
         self.cfg = config if config is not None else SETTINGS.long_first
+        # Ver EntryScanDiagnostics: se sobreescribe en cada scan_entry_signals().
+        self.last_scan_diagnostics: Optional[EntryScanDiagnostics] = None
 
     # -- Entradas: unicamente BUY to Open, en bases baratas y de horizonte semanal --
 
@@ -232,19 +270,24 @@ class WeeklyAsymmetricStrategy:
                 return extreme_threshold if momentum_override_type is option_type else None
             return extreme_threshold  # NEUTRAL
 
+        diag = EntryScanDiagnostics(total_quotes=len(surface.quotes), trend=trend)
+
         candidates: List[EntrySignal] = []
         for q in surface.quotes:
             smile_threshold = _smile_threshold_for(q.option_type)
             if smile_threshold is None:
+                diag.blocked_by_direction += 1
                 continue  # filtro direccional tecnico: bajo BULLISH/BEARISH sin reversion temprana, ni se evalua
 
             # Horizonte semanal: nunca se abre una posicion que exceda el
             # maximo de ruedas habiles configurado, aunque este muy barata.
             if q.days_business > cfg.max_holding_business_days:
+                diag.blocked_by_holding_days += 1
                 continue
 
             volume = recent_volumes.get(q.symbol, 0.0)
             if not self.risk_manager.check_liquidity(q.book, volume):
+                diag.blocked_by_liquidity += 1
                 continue
 
             # Confirmacion de microestructura (ver models/microstructure.py):
@@ -253,16 +296,33 @@ class WeeklyAsymmetricStrategy:
             # extremo hacia el lado vendedor (tipico de una punta
             # aislada/iliquida en un libro tan delgado como el de GGAL).
             if cfg.enable_obi_filter and not passes_obi_filter(q.book, cfg.min_obi_for_entry):
+                diag.blocked_by_obi += 1
                 continue
 
             if not q.spot_ref or q.spot_ref <= 0:
                 continue
             log_moneyness = math.log(q.strike / q.spot_ref)
             if abs(log_moneyness) > cfg.moneyness_band_pct:
+                diag.blocked_by_moneyness += 1
                 continue  # fuera de la banda ATM/OTM cercana (convexidad objetivo)
 
+            diag.evaluated_for_dislocation += 1
             dislocation = surface.smile_dislocation(q)
             if dislocation >= -smile_threshold:
+                diag.blocked_by_dislocation += 1
+                # Cuanto le falto en puntos de vol para calificar (siempre >= 0)
+                # y si es el "menos lejos" visto en este ciclo, se guarda como
+                # el closest miss - dato real para juzgar si el umbral vigente
+                # es razonable, sin tener que aflojarlo a ciegas.
+                shortfall = dislocation - (-smile_threshold)
+                if (
+                    diag.closest_miss_shortfall_vol_points is None
+                    or shortfall < diag.closest_miss_shortfall_vol_points
+                ):
+                    diag.closest_miss_symbol = q.symbol
+                    diag.closest_miss_dislocation = dislocation
+                    diag.closest_miss_threshold_required = -smile_threshold
+                    diag.closest_miss_shortfall_vol_points = shortfall
                 continue  # no esta "barata" (o no lo suficiente bajo NEUTRAL): NUNCA se genera señal de venta para abrir
             if not level_ok:
                 continue
@@ -291,6 +351,8 @@ class WeeklyAsymmetricStrategy:
             ))
 
         candidates.sort(key=lambda s: s.convexity_score, reverse=True)
+        diag.qualified = len(candidates)
+        self.last_scan_diagnostics = diag
         return candidates
 
     # -- Spreads: la pata corta SOLO si la larga ya esta confirmada en portafolio --

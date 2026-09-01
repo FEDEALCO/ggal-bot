@@ -53,7 +53,7 @@ from ggal_bot.execution.order_gateway import (
 )
 from ggal_bot.strategy.delta_hedger import DeltaHedgingEngine
 from ggal_bot.strategy.vol_arbitrage import VolatilityArbitrageStrategy
-from ggal_bot.strategy.weekly_asymmetric import WeeklyAsymmetricStrategy
+from ggal_bot.strategy.weekly_asymmetric import EntryScanDiagnostics, WeeklyAsymmetricStrategy
 from ggal_bot.data.technical_analysis import TechnicalAnalysisEngine, Trend
 from ggal_bot.state_writer import StateWriter
 
@@ -128,6 +128,15 @@ class GgalOptionsBot:
         # "Tendencia 1D GGAL: ..." en cada ciclo mientras el cache del motor
         # tecnico siga vigente.
         self._last_ta_snapshot_logged = None
+        # Throttle del log de diagnostico de escaneo de entradas (ver
+        # strategy.weekly_asymmetric.EntryScanDiagnostics): el ciclo corre
+        # cada ~2s (run_forever), asi que sin este throttle el log de
+        # diagnostico saturaria logs/ggal_bot.log. Agregado a pedido
+        # explicito (ver seguimiento de auditoria del 2026-09-01) para poder
+        # ver, con datos reales, que tan lejos estan las bases candidatas
+        # del umbral de dislocacion vigente - sin cambiar ningun umbral.
+        self._last_entry_diagnostics_logged_at: Optional[float] = None
+        self._entry_diagnostics_log_interval_seconds: float = 300.0
         logger.info("Estrategia activa: %s", self.active_strategy_name)
 
         self.delta_hedger = DeltaHedgingEngine(delta_band=SETTINGS.risk.delta_band)
@@ -382,6 +391,68 @@ class GgalOptionsBot:
                 self._act_on_signal(s, spot)
         return all_signals
 
+    def _log_entry_scan_diagnostics_if_due(
+        self, diagnostics_by_expiry: Dict[object, EntryScanDiagnostics], now: datetime,
+    ) -> None:
+        """
+        Loguea (throttleado, ver __init__:
+        _entry_diagnostics_log_interval_seconds) un resumen de por que no
+        se generaron señales de entrada este ciclo: cuantas cotizaciones se
+        descartaron en cada filtro, y la candidata MAS CERCANA a calificar
+        (cuanto le falto en puntos de vol al umbral de dislocacion
+        vigente). Puro logging, no cambia ningun umbral ni comportamiento -
+        ver docstring de EntryScanDiagnostics para el porque se agrego.
+        """
+        if not diagnostics_by_expiry:
+            return
+        now_ts = now.timestamp() if hasattr(now, "timestamp") else time.time()
+        last_logged = self._last_entry_diagnostics_logged_at
+        if last_logged is not None and (now_ts - last_logged) < self._entry_diagnostics_log_interval_seconds:
+            return
+        self._last_entry_diagnostics_logged_at = now_ts
+
+        total = EntryScanDiagnostics(trend=next(iter(diagnostics_by_expiry.values())).trend)
+        best_miss: Optional[EntryScanDiagnostics] = None
+        for d in diagnostics_by_expiry.values():
+            total.total_quotes += d.total_quotes
+            total.blocked_by_direction += d.blocked_by_direction
+            total.blocked_by_holding_days += d.blocked_by_holding_days
+            total.blocked_by_liquidity += d.blocked_by_liquidity
+            total.blocked_by_obi += d.blocked_by_obi
+            total.blocked_by_moneyness += d.blocked_by_moneyness
+            total.evaluated_for_dislocation += d.evaluated_for_dislocation
+            total.blocked_by_dislocation += d.blocked_by_dislocation
+            total.qualified += d.qualified
+            if d.closest_miss_shortfall_vol_points is not None and (
+                best_miss is None
+                or d.closest_miss_shortfall_vol_points < best_miss.closest_miss_shortfall_vol_points
+            ):
+                best_miss = d
+
+        logger.info(
+            "Diagnostico escaneo de entradas [tendencia=%s]: %d cotizaciones evaluadas -> "
+            "bloqueadas por direccion tecnica=%d, horizonte semanal=%d, liquidez=%d, OBI=%d, "
+            "moneyness=%d; llegaron al chequeo de dislocacion de smile=%d (no alcanzaron el "
+            "umbral=%d, calificaron=%d).",
+            total.trend, total.total_quotes, total.blocked_by_direction, total.blocked_by_holding_days,
+            total.blocked_by_liquidity, total.blocked_by_obi, total.blocked_by_moneyness,
+            total.evaluated_for_dislocation, total.blocked_by_dislocation, total.qualified,
+        )
+        if total.evaluated_for_dislocation == 0 and total.total_quotes > 0:
+            logger.info(
+                "Ninguna cotizacion llego a evaluarse contra el umbral de dislocacion de smile este "
+                "ciclo: el cuello de botella esta en un filtro ANTERIOR (direccion tecnica/horizonte/"
+                "liquidez/OBI/moneyness), no en el umbral de smile en si."
+            )
+        elif best_miss is not None:
+            logger.info(
+                "Candidata mas cercana a calificar: %s con dislocacion observada=%.2f vol pts "
+                "(se necesitaba <= %.2f) - le faltaron %.2f vol pts bajo tendencia %s.",
+                best_miss.closest_miss_symbol, best_miss.closest_miss_dislocation,
+                best_miss.closest_miss_threshold_required, best_miss.closest_miss_shortfall_vol_points,
+                total.trend,
+            )
+
     def _run_weekly_asymmetric_cycle(self, spot: float) -> List[object]:
         """
         Ciclo bajo el modo Long-First / Weekly Asymmetric (ver
@@ -535,6 +606,7 @@ class GgalOptionsBot:
             self._market_data_stale_logged = False
 
         # -- 2) Entradas nuevas (recien despues de reconciliar salidas) ---------
+        entry_diagnostics_by_expiry: Dict[object, object] = {}
         if not market_data_stale:
             for expiry, quotes in self.option_chain.quotes_by_expiry().items():
                 # Ver comentario equivalente en _run_vol_arbitrage_cycle:
@@ -553,6 +625,8 @@ class GgalOptionsBot:
                 entry_signals = self.strategy.scan_entry_signals(
                     surface, self._recent_volumes, trend=trend, momentum_shift=momentum_shift,
                 )
+                if self.strategy.last_scan_diagnostics is not None:
+                    entry_diagnostics_by_expiry[expiry] = self.strategy.last_scan_diagnostics
                 all_signals.extend(entry_signals)
                 for es in entry_signals:
                     logger.info(
@@ -560,6 +634,8 @@ class GgalOptionsBot:
                         expiry, es.action, es.symbol, es.iv_dislocation_vol_points, es.convexity_score, es.reason,
                     )
                     self._act_on_entry_signal(es, spot)
+
+            self._log_entry_scan_diagnostics_if_due(entry_diagnostics_by_expiry, now)
 
             # -- 3) Completar spreads: pata corta solo tras la larga confirmada -
             if SETTINGS.long_first.enable_spread_completion:
