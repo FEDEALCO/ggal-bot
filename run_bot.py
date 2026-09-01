@@ -392,7 +392,10 @@ class GgalOptionsBot:
         return all_signals
 
     def _log_entry_scan_diagnostics_if_due(
-        self, diagnostics_by_expiry: Dict[object, EntryScanDiagnostics], now: datetime,
+        self,
+        diagnostics_by_expiry: Dict[object, EntryScanDiagnostics],
+        now: datetime,
+        quote_availability_by_expiry: Optional[Dict[object, Dict[str, int]]] = None,
     ) -> None:
         """
         Loguea (throttleado, ver __init__:
@@ -402,14 +405,42 @@ class GgalOptionsBot:
         (cuanto le falto en puntos de vol al umbral de dislocacion
         vigente). Puro logging, no cambia ningun umbral ni comportamiento -
         ver docstring de EntryScanDiagnostics para el porque se agrego.
+
+        AMPLIACION (2026-09-01, mismo pedido - se detecto que el log de
+        arriba nunca estaba apareciendo en produccion): scan_entry_signals()
+        solo se llama por vencimiento si `len(valid_quotes) >= 3` (ver
+        _run_weekly_asymmetric_cycle, filtro de `q.iv is not None and not
+        q.book.is_stale(...)` ANTES del loop de EntryScanDiagnostics) - si
+        NINGUN vencimiento llega a ese piso, `diagnostics_by_expiry` queda
+        vacio y el log de arriba nunca se dispara, sin dejar ninguna pista
+        de por que. `quote_availability_by_expiry` (total/validas/stale/
+        sin IV por vencimiento) hace visible ESE cuello de botella anterior
+        - tipicamente opciones sin punta vigente (bid=ask=0, "sin punta",
+        ver BrokerRestSource._parse_quote_record) que nunca calculan IV, no
+        necesariamente stale por conectividad.
         """
-        if not diagnostics_by_expiry:
+        if not diagnostics_by_expiry and not quote_availability_by_expiry:
             return
         now_ts = now.timestamp() if hasattr(now, "timestamp") else time.time()
         last_logged = self._last_entry_diagnostics_logged_at
         if last_logged is not None and (now_ts - last_logged) < self._entry_diagnostics_log_interval_seconds:
             return
         self._last_entry_diagnostics_logged_at = now_ts
+
+        if quote_availability_by_expiry:
+            for expiry, counts in quote_availability_by_expiry.items():
+                logger.info(
+                    "Disponibilidad de cotizaciones [venc=%s]: %d totales, %d validas (IV "
+                    "calculable y no-stale), %d sin punta vigente (IV no calculable), %d "
+                    "stale (> %.0fs) - %s.",
+                    expiry, counts["total"], counts["valid"], counts["no_iv"], counts["stale"],
+                    SETTINGS.risk.max_option_quote_staleness_seconds,
+                    "no llega al piso de 3 validas para escanear entradas este ciclo"
+                    if counts["valid"] < 3 else "llega al piso de 3 validas",
+                )
+
+        if not diagnostics_by_expiry:
+            return
 
         total = EntryScanDiagnostics(trend=next(iter(diagnostics_by_expiry.values())).trend)
         best_miss: Optional[EntryScanDiagnostics] = None
@@ -607,6 +638,7 @@ class GgalOptionsBot:
 
         # -- 2) Entradas nuevas (recien despues de reconciliar salidas) ---------
         entry_diagnostics_by_expiry: Dict[object, object] = {}
+        quote_availability_by_expiry: Dict[object, Dict[str, int]] = {}
         if not market_data_stale:
             for expiry, quotes in self.option_chain.quotes_by_expiry().items():
                 # Ver comentario equivalente en _run_vol_arbitrage_cycle:
@@ -614,11 +646,21 @@ class GgalOptionsBot:
                 # recompute_all()) conserva su ultimo IV conocido, que ya no es
                 # comparable contra el resto de la sonrisa recalculada con el
                 # spot actual - se excluye de la deteccion de señales de entrada.
+                is_stale_threshold = SETTINGS.risk.max_option_quote_staleness_seconds
                 valid_quotes = [
                     q for q in quotes
-                    if q.iv is not None
-                    and not q.book.is_stale(SETTINGS.risk.max_option_quote_staleness_seconds)
+                    if q.iv is not None and not q.book.is_stale(is_stale_threshold)
                 ]
+                # Diagnostico puro (ver _log_entry_scan_diagnostics_if_due): cuenta
+                # POR QUE una cotizacion no llego a "valida" - sin punta vigente
+                # (iv no calculable) vs. stale por conectividad - para no confundir
+                # ambos motivos cuando `valid_quotes` queda corto.
+                quote_availability_by_expiry[expiry] = {
+                    "total": len(quotes),
+                    "valid": len(valid_quotes),
+                    "no_iv": sum(1 for q in quotes if q.iv is None),
+                    "stale": sum(1 for q in quotes if q.book.is_stale(is_stale_threshold)),
+                }
                 if len(valid_quotes) < 3:
                     continue
                 surface = VolatilitySurface(valid_quotes)
@@ -635,7 +677,9 @@ class GgalOptionsBot:
                     )
                     self._act_on_entry_signal(es, spot)
 
-            self._log_entry_scan_diagnostics_if_due(entry_diagnostics_by_expiry, now)
+            self._log_entry_scan_diagnostics_if_due(
+                entry_diagnostics_by_expiry, now, quote_availability_by_expiry=quote_availability_by_expiry,
+            )
 
             # -- 3) Completar spreads: pata corta solo tras la larga confirmada -
             if SETTINGS.long_first.enable_spread_completion:
