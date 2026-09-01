@@ -1023,7 +1023,27 @@ class BrokerRestSource(ShadowDataSource):
             )
             return
 
-        relevant_expiries = sorted(by_expiry.keys())[: max(1, SETTINGS.instruments.expiries_ahead)]
+        # A pedido explicito del usuario (2026-09-01, ver
+        # InstrumentsConfig.forced_expiry / GGAL_BOT_FORCE_EXPIRY): si hay un
+        # vencimiento forzado, el cupo de puntas individuales NO se reparte
+        # entre `expiries_ahead` vencimientos - se dedica ENTERO al unico
+        # vencimiento que la estrategia puede llegar a operar. Repartirlo iba
+        # a seguir regalandole presupuesto a vencimientos que el resto del
+        # bot (ver run_bot.py y WeeklyAsymmetricStrategy.
+        # scan_spread_completion_signals) ya ignora por completo.
+        forced_expiry = SETTINGS.instruments.forced_expiry_date()
+        if forced_expiry is not None:
+            relevant_expiries = [forced_expiry] if forced_expiry in by_expiry else []
+            if not relevant_expiries:
+                logger.info(
+                    "BrokerRestSource: vencimiento forzado %s no tiene ninguna opcion dentro de la "
+                    "banda de moneyness (universo puede no incluirlo todavia, o esta fuera de banda "
+                    "en este spot ref=%.2f) - no se refresca ninguna punta individual este ciclo.",
+                    forced_expiry.isoformat(), reference_spot,
+                )
+                return
+        else:
+            relevant_expiries = sorted(by_expiry.keys())[: max(1, SETTINGS.instruments.expiries_ahead)]
         per_expiry_budget = max(1, self._cfg.individual_quote_max_symbols // len(relevant_expiries))
         symbols_to_refresh: List[str] = []
         for expiry in relevant_expiries:

@@ -139,6 +139,29 @@ class GgalOptionsBot:
         self._entry_diagnostics_log_interval_seconds: float = 300.0
         logger.info("Estrategia activa: %s", self.active_strategy_name)
 
+        # Vencimiento forzado (a pedido explicito del usuario, 2026-09-01 -
+        # ver InstrumentsConfig.forced_expiry): si esta seteado, se ignora
+        # por completo cualquier OTRO vencimiento, tanto para entradas
+        # nuevas (ver _run_weekly_asymmetric_cycle) como para completar
+        # spreads/wings (ver scan_spread_completion_signals). Se valida y
+        # se loguea UNA sola vez aca, no en cada ciclo.
+        raw_forced_expiry = SETTINGS.instruments.forced_expiry
+        self._forced_expiry = SETTINGS.instruments.forced_expiry_date()
+        if raw_forced_expiry.strip() and self._forced_expiry is None:
+            logger.warning(
+                "GGAL_BOT_FORCE_EXPIRY=%r no se pudo interpretar como fecha ISO (YYYY-MM-DD) - se "
+                "ignora, el bot sigue operando todos los vencimientos elegibles segun el horizonte "
+                "semanal (comportamiento normal).", raw_forced_expiry,
+            )
+        elif self._forced_expiry is not None:
+            logger.warning(
+                "Vencimiento FORZADO por config (GGAL_BOT_FORCE_EXPIRY=%s): el bot va a ignorar "
+                "cualquier otro vencimiento por completo, tanto para entradas nuevas como para "
+                "completar spreads - verificar que GGAL_BOT_MAX_HOLDING_BUSINESS_DAYS (hoy=%d dias "
+                "habiles) cubra el plazo real hasta ese vencimiento, o ninguna entrada va a poder "
+                "abrirse ahi.", self._forced_expiry.isoformat(), SETTINGS.long_first.max_holding_business_days,
+            )
+
         self.delta_hedger = DeltaHedgingEngine(delta_band=SETTINGS.risk.delta_band)
 
         # -- Ejecucion -----------------------------------------------------
@@ -641,6 +664,14 @@ class GgalOptionsBot:
         quote_availability_by_expiry: Dict[object, Dict[str, int]] = {}
         if not market_data_stale:
             for expiry, quotes in self.option_chain.quotes_by_expiry().items():
+                # Vencimiento forzado (a pedido explicito del usuario,
+                # 2026-09-01 - ver InstrumentsConfig.forced_expiry, validado
+                # y logueado una sola vez en __init__): se ignora POR
+                # COMPLETO cualquier otro vencimiento, ni siquiera se
+                # calculan valid_quotes/diagnosticos para el - el usuario
+                # eligio explicitamente operar solo este.
+                if self._forced_expiry is not None and expiry != self._forced_expiry:
+                    continue
                 # Ver comentario equivalente en _run_vol_arbitrage_cycle:
                 # una opcion excluida del recalculo por staleness (option_chain.
                 # recompute_all()) conserva su ultimo IV conocido, que ya no es
@@ -692,7 +723,7 @@ class GgalOptionsBot:
                 spread_signals = self.strategy.scan_spread_completion_signals(
                     self.option_chain, self.portfolio, trend=trend,
                     max_quote_age_seconds=SETTINGS.risk.max_option_quote_staleness_seconds,
-                    now=time.time(),
+                    now=time.time(), forced_expiry=self._forced_expiry,
                 )
                 all_signals.extend(spread_signals)
                 for sp in spread_signals:

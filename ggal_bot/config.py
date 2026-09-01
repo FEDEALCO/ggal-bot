@@ -11,6 +11,7 @@ de variables de entorno (ver .env.example) via python-dotenv.
 import os
 import sys
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -231,6 +232,32 @@ class InstrumentsConfig:
     # data/market_data_feed.py:bootstrap_universe) ---
     option_symbol_regex: str = r"^(\d+)([A-L])$"  # digitos de strike + letra de mes (A=Ene...L=Dic)
     strike_scale: float = 1.0  # multiplicador para convertir los digitos parseados en precio real
+
+    # --- Vencimiento forzado (a pedido explicito del usuario, 2026-09-01) ---
+    # Fuerza al bot a operar UN SOLO vencimiento especifico, ignorando el
+    # resto por completo (ni para entradas nuevas en run_bot.py ni para
+    # completar spreads/wings en WeeklyAsymmetricStrategy.
+    # scan_spread_completion_signals) - en vez de dejar que el horizonte
+    # semanal (LongFirstConfig.max_holding_business_days) determine solo
+    # que vencimiento termina siendo operable. Formato ISO "YYYY-MM-DD".
+    # Vacio (default) = sin forzar, comportamiento normal (todos los
+    # `expiries_ahead` vencimientos son elegibles segun el horizonte
+    # semanal, como antes). IMPORTANTE: si se fuerza un vencimiento mas
+    # lejano que max_holding_business_days (ej. un vencimiento mensual con
+    # el horizonte semanal default de 5 dias habiles), el bot lo va a
+    # trackear pero NUNCA va a poder abrir una entrada ahi - subir
+    # max_holding_business_days junto con esto si el vencimiento forzado
+    # excede el horizonte actual.
+    forced_expiry: str = _env_str("GGAL_BOT_FORCE_EXPIRY", "")
+
+    def forced_expiry_date(self) -> Optional[date]:
+        """Parsea `forced_expiry` a `date`, o None si esta vacio o es invalido (el llamador loguea el caso invalido)."""
+        if not self.forced_expiry.strip():
+            return None
+        try:
+            return date.fromisoformat(self.forced_expiry.strip())
+        except ValueError:
+            return None
 
 
 # ---------------------------------------------------------------------------

@@ -630,6 +630,76 @@ def test_broker_rest_source_near_the_money_refresh_splits_budget_evenly_across_e
         SETTINGS.instruments.expiries_ahead = original_expiries_ahead
 
 
+def test_broker_rest_source_near_the_money_refresh_dedicates_full_budget_to_forced_expiry():
+    """
+    Feature nueva (2026-09-01, a pedido explicito del usuario -
+    GGAL_BOT_FORCE_EXPIRY / InstrumentsConfig.forced_expiry): cuando hay un
+    vencimiento forzado, el cupo de puntas individuales NO debe repartirse
+    parejo entre `expiries_ahead` vencimientos como en el test anterior -
+    debe dedicarse ENTERO al unico vencimiento forzado, ignorando por
+    completo cualquier otro (incluso si tiene strikes mas cercanos al spot
+    en la foto puntual). Reusa el mismo fixture de Octubre/Setiembre que
+    `test_broker_rest_source_near_the_money_refresh_splits_budget_evenly_across_expiries`,
+    pero fuerza Setiembre y confirma que Octubre no recibe ni una sola
+    llamada individual.
+    """
+    import ggal_bot.data.live_shadow_feed as mod
+
+    original_login = mod.BrokerRestSource._login
+    original_http_get_json = mod.http_get_json
+    original_max_symbols = SETTINGS.broker_rest.individual_quote_max_symbols
+    original_expiries_ahead = SETTINGS.instruments.expiries_ahead
+    original_forced_expiry = SETTINGS.instruments.forced_expiry
+    underlying = SETTINGS.instruments.underlying_symbol
+    individual_calls = []
+
+    def fake_http_get_json(url, timeout, headers=None):  # noqa: ARG001
+        if url.endswith(f"/{underlying}/Cotizacion"):
+            return {"ultimoPrecio": 7000.0, "puntas": []}
+        if url.endswith("/Opciones"):
+            records = []
+            # Octubre: vencimiento NO forzado, con strikes mas cercanos al
+            # spot - no deberia recibir ni una sola llamada individual.
+            for strike in (7000, 7010, 7020, 7030):
+                records.append({
+                    "cotizacion": {"ultimoPrecio": 1.0, "puntas": None},
+                    "tipoOpcion": "Call", "simbolo": f"GFGC{strike}OC",
+                    "fechaVencimiento": "2026-10-16T15:30:00",
+                })
+            # Setiembre: el vencimiento FORZADO - debe llevarse todo el cupo.
+            for strike in (7000, 7050, 7100, 7150):
+                records.append({
+                    "cotizacion": {"ultimoPrecio": 1.0, "puntas": None},
+                    "tipoOpcion": "Call", "simbolo": f"GFGC{strike}SE",
+                    "fechaVencimiento": "2026-09-18T15:30:00",
+                })
+            return records
+        individual_calls.append(url)
+        return {"ultimoPrecio": 1.0, "puntas": [
+            {"precioCompra": 0.9, "cantidadCompra": 10, "precioVenta": 1.1, "cantidadVenta": 10},
+        ]}
+
+    mod.BrokerRestSource._login = lambda self: True
+    mod.http_get_json = fake_http_get_json
+    SETTINGS.broker_rest.individual_quote_max_symbols = 4
+    SETTINGS.instruments.expiries_ahead = 2
+    SETTINGS.instruments.forced_expiry = "2026-09-18"
+    try:
+        source = mod.BrokerRestSource()
+        source.bootstrap()
+        source.fetch_snapshot()
+        se_calls = [u for u in individual_calls if u.endswith("SE/Cotizacion")]
+        oc_calls = [u for u in individual_calls if u.endswith("OC/Cotizacion")]
+        assert len(oc_calls) == 0, f"Octubre no esta forzado - no deberia recibir cupo: {oc_calls}"
+        assert len(se_calls) == 4, f"Setiembre (forzado) deberia llevarse todo el cupo: {se_calls}"
+    finally:
+        mod.http_get_json = original_http_get_json
+        mod.BrokerRestSource._login = original_login
+        SETTINGS.broker_rest.individual_quote_max_symbols = original_max_symbols
+        SETTINGS.instruments.expiries_ahead = original_expiries_ahead
+        SETTINGS.instruments.forced_expiry = original_forced_expiry
+
+
 def test_broker_rest_source_bootstrap_precarga_el_cache_de_cotizaciones():
     """bootstrap() debe aprovechar la 'cotizacion' embebida en /Opciones para precargar el cache, sin esperar a poll()."""
     import ggal_bot.data.live_shadow_feed as mod
@@ -988,6 +1058,7 @@ ALL_TESTS = [
     test_broker_rest_source_near_the_money_refresh_is_throttled,
     test_broker_rest_source_near_the_money_refresh_failure_does_not_lose_batch_data,
     test_broker_rest_source_near_the_money_refresh_splits_budget_evenly_across_expiries,
+    test_broker_rest_source_near_the_money_refresh_dedicates_full_budget_to_forced_expiry,
     test_broker_rest_source_bootstrap_precarga_el_cache_de_cotizaciones,
     test_live_shadow_feed_respects_explicit_source_priority_order,
     test_live_shadow_feed_ignores_unknown_source_name_in_priority,
