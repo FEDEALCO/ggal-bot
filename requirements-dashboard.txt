@@ -1,6 +1,10 @@
 # Dependencias solo para el Dashboard de monitoreo (ver dashboard/app.py).
-# No hacen falta para correr el bot en si (run_bot.py) - por eso estan
-# separadas de requirements.txt, igual que requirements-build.txt.
+# No hacen falta para correr el bot en si (run_bot.py) - se mantienen
+# separadas de requirements.txt (igual que requirements-build.txt) para que
+# correr el bot LOCAL (run_bot.bat) o standalone no requiera instalarlas.
+# El Dockerfile de despliegue en Northflank SI instala ambos archivos
+# juntos, porque corre el bot y el dashboard en el mismo contenedor (ver
+# Dockerfile y entrypoint.sh) - ver ahi el porque.
 streamlit>=1.32.0
 plotly>=5.18.0
 pandas>=2.0.0
