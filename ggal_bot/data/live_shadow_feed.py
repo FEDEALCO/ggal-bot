@@ -48,6 +48,7 @@ Uso tipico (ver run_bot.py, rama SETTINGS.shadow.enabled):
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import math
 import random
@@ -642,6 +643,19 @@ class PrimaryMarketDataSource(ShadowDataSource):
         return spot_quote, snapshot
 
 
+# Pool DEDICADO (separado del pool compartido de http_utils, de solo 4
+# workers - ver docstring de ese modulo) para las puntas INDIVIDUALES por
+# opcion que refresca BrokerRestSource._refresh_near_the_money_quotes():
+# ese pool compartido esta dimensionado para "un par de llamadas por poll"
+# (spot + cadena batch), no para las hasta ~30 llamadas en paralelo que
+# puede pedir un refresh de puntas cercanas al spot - usar el mismo pool
+# para ambas cosas dejaria a las llamadas CRITICAS (spot/cadena de CADA
+# poll) esperando cola detras de este refresco, mas lento e infrecuente.
+_INDIVIDUAL_QUOTE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=6, thread_name_prefix="ggal-bot-iol-quote",
+)
+
+
 class BrokerRestSource(ShadowDataSource):
     """
     Fuente REST del broker IOL/InvertirOnline (https://www.invertironline.com).
@@ -692,6 +706,11 @@ class BrokerRestSource(ShadowDataSource):
         # Ver had_last_fetch_error(): flag que distingue "fetch_snapshot()
         # tuvo que resignarse al cache" de "el refresh en vivo funciono".
         self._last_fetch_had_error: bool = False
+        # Ver _refresh_near_the_money_quotes(): throttle propio, mas lento
+        # que el poll principal (2s) - las puntas de opciones no necesitan
+        # refrescarse tan seguido, y esto acota cuantas veces por minuto se
+        # dispara una tanda de requests individuales contra IOL.
+        self._last_individual_quote_refresh_at: float = 0.0
 
     def had_last_fetch_error(self) -> bool:
         return self._last_fetch_had_error
@@ -860,6 +879,121 @@ class BrokerRestSource(ShadowDataSource):
         )
         return candidates
 
+    def _refresh_near_the_money_quotes(self) -> None:
+        """
+        Refresca via GET INDIVIDUAL (no el batch de arriba) las puntas de
+        las opciones dentro de una banda de moneyness alrededor del ultimo
+        spot conocido.
+
+        HALLAZGO REAL (2026-09-01, corriendo diagnose_iol_puntas.py contra
+        una cuenta real en horario de rueda - ver seguimiento de la
+        auditoria): el endpoint de CADENA (`/Titulos/GGAL/Opciones`)
+        devuelve 'puntas': null para el 100% de los ~174 registros
+        SIEMPRE, incluso para una opcion con una operacion reciente
+        (ultimoPrecio=0.45, "GFGV4200SE") - o sea, no es que las opciones
+        sean ilíquidas, ese endpoint especifico simplemente no trae
+        profundidad de mercado. El endpoint INDIVIDUAL por simbolo (el
+        mismo `_titulos_url(simbolo, "Cotizacion")` que ya se usa arriba
+        para el SUBYACENTE) SI trae 'puntas' pobladas para el MISMO
+        simbolo en el MISMO instante - confirmado contra la cuenta real.
+
+        Sin este metodo, `valid_quotes` en run_bot.py siempre queda vacio
+        (ver EntryScanDiagnostics/"Disponibilidad de cotizaciones") y la
+        estrategia jamas puede evaluar ninguna señal, sin importar los
+        umbrales configurados.
+
+        Pedir las ~104 opciones individualmente en CADA poll (cada ~2s, ver
+        run_bot.recompute_cycle) no es viable: arriesga empeorar los
+        timeouts/503 que ya se observan contra la API de IOL. Por eso:
+            - Se restringe a una banda de moneyness alrededor del spot
+              (BrokerRestConfig.individual_quote_moneyness_band_pct) - las
+              UNICAS opciones que la estrategia puede llegar a usar de
+              verdad (entradas: LongFirstConfig.moneyness_band_pct=0.15;
+              wings de spread: un poco mas alla del strike largo - de ahi
+              el margen extra hasta 0.20).
+            - Tope duro de simbolos por refresh (individual_quote_max_symbols)
+              como valvula de seguridad adicional.
+            - Throttle PROPIO, mas lento que el poll principal
+              (individual_quote_min_refresh_interval_seconds) - las puntas
+              de opciones no necesitan ser mas frescas que esto para una
+              estrategia semanal.
+            - En PARALELO, con un pool de threads DEDICADO (no el pool
+              compartido de http_utils, dimensionado para 1-2 llamadas por
+              poll) para no bloquear el ciclo entero esperando cada simbolo
+              en secuencia.
+        Si un simbolo puntual falla (timeout/error), se conserva la ultima
+        punta conocida de ese simbolo en _quote_cache (mismo criterio
+        "freeze, no starve" que el resto de la fuente) - una falla
+        individual no aborta el refresh de los demas.
+        """
+        now = time.time()
+        if (now - self._last_individual_quote_refresh_at) < self._cfg.individual_quote_min_refresh_interval_seconds:
+            return
+        if not self._universe:
+            return
+
+        cfg_i = SETTINGS.instruments
+        spot_quote = self._quote_cache.get(cfg_i.underlying_symbol)
+        if spot_quote is None:
+            return
+        reference_spot = spot_quote.last_price if spot_quote.last_price and spot_quote.last_price > 0 else None
+        if reference_spot is None and spot_quote.bid > 0 and spot_quote.ask > 0:
+            reference_spot = (spot_quote.bid + spot_quote.ask) / 2.0
+        if reference_spot is None or reference_spot <= 0:
+            return
+
+        band = self._cfg.individual_quote_moneyness_band_pct
+        scored: List[Tuple[float, str]] = []
+        for symbol, _option_type, strike, _expiry in self._universe:
+            if strike is None or strike <= 0:
+                continue
+            log_moneyness = abs(math.log(strike / reference_spot))
+            if log_moneyness <= band:
+                scored.append((log_moneyness, symbol))
+        if not scored:
+            return
+        scored.sort(key=lambda item: item[0])
+        symbols_to_refresh = [symbol for _lm, symbol in scored[: self._cfg.individual_quote_max_symbols]]
+
+        if not self._login():
+            return
+        self._last_individual_quote_refresh_at = now
+        headers = {"Authorization": f"Bearer {self._token}"}
+        timeout = self._cfg.individual_quote_timeout_seconds
+
+        def _fetch_one(symbol: str):
+            return http_get_json(self._titulos_url(symbol, "Cotizacion"), timeout=timeout, headers=headers)
+
+        futures = {
+            _INDIVIDUAL_QUOTE_EXECUTOR.submit(_fetch_one, symbol): symbol
+            for symbol in symbols_to_refresh
+        }
+        ok_count = 0
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=timeout + 10.0):
+                symbol = futures[future]
+                try:
+                    data = future.result()
+                    self._quote_cache[symbol] = self._parse_quote_record(symbol, data)
+                    ok_count += 1
+                except Exception as exc:
+                    logger.debug(
+                        "BrokerRestSource: fallo la punta individual de %s (%s); se mantiene el ultimo "
+                        "dato conocido de ese simbolo.", symbol, exc,
+                    )
+        except concurrent.futures.TimeoutError:
+            logger.warning(
+                "BrokerRestSource: timeout global (%.0fs) refrescando puntas individuales - %d/%d "
+                "completadas antes del corte; el resto sigue en curso en background y se descarta.",
+                timeout + 10.0, ok_count, len(symbols_to_refresh),
+            )
+
+        logger.info(
+            "BrokerRestSource: puntas individuales refrescadas para %d/%d opciones cercanas al spot "
+            "(banda |log(K/S)|<=%.2f, spot ref=%.2f).",
+            ok_count, len(symbols_to_refresh), band, reference_spot,
+        )
+
     def fetch_snapshot(self) -> Tuple[Optional[RawQuote], Dict[str, RawQuote]]:
         cfg_i = SETTINGS.instruments
         # Se resetea en cada llamada: had_last_fetch_error() debe reflejar
@@ -874,8 +1008,15 @@ class BrokerRestSource(ShadowDataSource):
 
         # La cadena ENTERA de opciones se refresca en UN SOLO request (el
         # mismo endpoint de bootstrap trae la cotizacion embebida por
-        # opcion) - confirmado contra una cuenta real: no hace falta (ni
-        # conviene) pedir cada simbolo por separado en cada poll.
+        # opcion) - PERO (CORRECCION 2026-09-01, ver
+        # _refresh_near_the_money_quotes() mas abajo): se confirmo contra
+        # una cuenta real en horario de rueda que este endpoint de CADENA
+        # nunca trae 'puntas' pobladas (siempre null, para el 100% de los
+        # registros, incluso para una opcion con operaciones recientes) -
+        # solo sirve para ultimoPrecio/volumenNominal/descubrir el universo
+        # de simbolos, NO para el book. Se mantiene igual (es barato: 1
+        # solo request) y se complementa abajo con puntas individuales
+        # reales para las opciones cercanas al spot.
         try:
             options = self._authed_get(self._titulos_url(cfg_i.underlying_symbol, "Opciones"))
             for rec in options or []:
@@ -888,6 +1029,15 @@ class BrokerRestSource(ShadowDataSource):
         except Exception as exc:
             logger.warning("BrokerRestSource.fetch_snapshot(): fallo al refrescar la cadena de opciones (%s).", exc)
             self._last_fetch_had_error = True
+
+        # Puntas REALES por opcion (ver _refresh_near_the_money_quotes()):
+        # complementa (sobreescribe en _quote_cache) las entradas de arriba
+        # para las opciones cercanas al spot, unicas que la estrategia
+        # puede llegar a usar. Con su propio throttle (mas lento que este
+        # poll) y su propio pool de threads - una falla aca NO cuenta como
+        # error de este fetch_snapshot() (no es la fuente primaria de spot/
+        # cadena, es un complemento best-effort).
+        self._refresh_near_the_money_quotes()
 
         # NOTA (BUG REAL CORREGIDO, ver had_last_fetch_error() y el
         # seguimiento de la auditoria del 2026-09-01): spot_quote/

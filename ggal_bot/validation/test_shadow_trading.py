@@ -408,6 +408,108 @@ def test_broker_rest_source_fetch_snapshot_refreshes_whole_chain_in_one_request(
         mod.BrokerRestSource._login = original_login
 
 
+def test_broker_rest_source_refreshes_near_the_money_quotes_individually():
+    """
+    HALLAZGO REAL 2026-09-01 (ver diagnose_iol_puntas.py corrido contra una
+    cuenta real en horario de rueda, y el docstring de
+    _refresh_near_the_money_quotes()): el endpoint de CADENA nunca trae
+    'puntas' pobladas (siempre null, incluso con ultimoPrecio>0) - solo el
+    endpoint INDIVIDUAL por simbolo las trae reales. Este test confirma
+    que fetch_snapshot() ahora pide individualmente SOLO las opciones
+    dentro de la banda de moneyness alrededor del spot (aca: la de strike
+    igual al spot), dejando la que esta MUY lejos (strike muy por encima)
+    tal cual vino del batch (sin punta) - para no pedir de mas.
+    """
+    import ggal_bot.data.live_shadow_feed as mod
+
+    original_login = mod.BrokerRestSource._login
+    mod.BrokerRestSource._login = lambda self: True
+    original_http_get_json = mod.http_get_json
+    individual_calls = []
+    underlying = SETTINGS.instruments.underlying_symbol
+
+    def fake_http_get_json(url, timeout, headers=None):  # noqa: ARG001
+        if url.endswith(f"/{underlying}/Cotizacion"):
+            return {"ultimoPrecio": 7000.0, "puntas": []}
+        if url.endswith("/Opciones"):
+            return [
+                {
+                    "cotizacion": {"ultimoPrecio": 5.0, "puntas": None},
+                    "tipoOpcion": "Call", "simbolo": "GFGC7000SE", "fechaVencimiento": "2026-09-18T15:30:00",
+                },
+                {
+                    "cotizacion": {"ultimoPrecio": 0.0, "puntas": None},
+                    "tipoOpcion": "Call", "simbolo": "GFGC20000SE", "fechaVencimiento": "2026-09-18T15:30:00",
+                },
+            ]
+        # Unico caso restante: endpoint INDIVIDUAL por simbolo de OPCION
+        # (no el subyacente, no la cadena) - la lejana (20000, muy fuera
+        # de la banda de moneyness) jamas deberia llegar aca.
+        individual_calls.append(url)
+        assert url.endswith("/GFGC7000SE/Cotizacion"), f"pidio de mas una opcion fuera de banda: {url}"
+        return {"ultimoPrecio": 5.0, "puntas": [
+            {"precioCompra": 4.8, "cantidadCompra": 10, "precioVenta": 5.2, "cantidadVenta": 8},
+        ]}
+
+    mod.http_get_json = fake_http_get_json
+    try:
+        source = mod.BrokerRestSource()
+        source.bootstrap()
+        spot, options = source.fetch_snapshot()
+        assert spot is not None and spot.last_price == 7000.0
+        assert len(individual_calls) == 1
+        assert options["GFGC7000SE"].bid == 4.8 and options["GFGC7000SE"].ask == 5.2
+        # Fuera de banda: se queda con lo que vino del batch (sin punta, tal cual IOL lo devuelve ahi).
+        assert options["GFGC20000SE"].bid == 0.0 and options["GFGC20000SE"].ask == 0.0
+    finally:
+        mod.http_get_json = original_http_get_json
+        mod.BrokerRestSource._login = original_login
+
+
+def test_broker_rest_source_near_the_money_refresh_is_throttled():
+    """
+    _refresh_near_the_money_quotes() no debe disparar una tanda de
+    requests individuales en CADA poll (cada ~2s) - ver
+    individual_quote_min_refresh_interval_seconds: un segundo
+    fetch_snapshot() inmediato despues del primero NO debe repetir las
+    llamadas individuales (se sigue sirviendo lo ya cacheado).
+    """
+    import ggal_bot.data.live_shadow_feed as mod
+
+    original_login = mod.BrokerRestSource._login
+    mod.BrokerRestSource._login = lambda self: True
+    original_http_get_json = mod.http_get_json
+    individual_calls = []
+    underlying = SETTINGS.instruments.underlying_symbol
+
+    def fake_http_get_json(url, timeout, headers=None):  # noqa: ARG001
+        if url.endswith(f"/{underlying}/Cotizacion"):
+            return {"ultimoPrecio": 7000.0, "puntas": []}
+        if url.endswith("/Opciones"):
+            return [
+                {
+                    "cotizacion": {"ultimoPrecio": 5.0, "puntas": None},
+                    "tipoOpcion": "Call", "simbolo": "GFGC7000SE", "fechaVencimiento": "2026-09-18T15:30:00",
+                },
+            ]
+        individual_calls.append(url)
+        return {"ultimoPrecio": 5.0, "puntas": [
+            {"precioCompra": 4.8, "cantidadCompra": 10, "precioVenta": 5.2, "cantidadVenta": 8},
+        ]}
+
+    mod.http_get_json = fake_http_get_json
+    try:
+        source = mod.BrokerRestSource()
+        source.bootstrap()
+        source.fetch_snapshot()
+        assert len(individual_calls) == 1
+        source.fetch_snapshot()  # inmediatamente despues: throttle debe impedir un segundo refresh
+        assert len(individual_calls) == 1
+    finally:
+        mod.http_get_json = original_http_get_json
+        mod.BrokerRestSource._login = original_login
+
+
 def test_broker_rest_source_bootstrap_precarga_el_cache_de_cotizaciones():
     """bootstrap() debe aprovechar la 'cotizacion' embebida en /Opciones para precargar el cache, sin esperar a poll()."""
     import ggal_bot.data.live_shadow_feed as mod
@@ -762,6 +864,8 @@ ALL_TESTS = [
     test_broker_rest_source_parse_option_record_rejects_record_without_symbol,
     test_broker_rest_source_parse_quote_record_matches_confirmed_iol_schema,
     test_broker_rest_source_fetch_snapshot_refreshes_whole_chain_in_one_request,
+    test_broker_rest_source_refreshes_near_the_money_quotes_individually,
+    test_broker_rest_source_near_the_money_refresh_is_throttled,
     test_broker_rest_source_bootstrap_precarga_el_cache_de_cotizaciones,
     test_live_shadow_feed_respects_explicit_source_priority_order,
     test_live_shadow_feed_ignores_unknown_source_name_in_priority,
