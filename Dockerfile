@@ -5,6 +5,11 @@
 #   dependencias de build-a-exe (requirements-build.txt, PyInstaller) y del
 #   dashboard (requirements-dashboard.txt, Streamlit) NO hacen falta para
 #   correr el bot en un contenedor Linux y se dejan afuera a proposito.
+#   Para correr el Dashboard (dashboard/app.py) como SERVICIO APARTE en
+#   Northflank -viendo en vivo las operaciones que ejecuta este bot- ver
+#   Dockerfile.dashboard, que SI instala Streamlit y comparte, via un mismo
+#   volumen persistente de Northflank montado en ambos servicios, las
+#   carpetas logs/ y state/ que este Dockerfile deja mencionadas abajo.
 # - NO se copia ningun .env real ni credenciales a la imagen (ver
 #   .dockerignore): en Northflank las variables de entorno / secrets se
 #   inyectan en runtime como variables de entorno del proceso, y config.py
