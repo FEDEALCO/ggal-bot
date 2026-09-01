@@ -164,6 +164,19 @@ class GgalOptionsBot:
 
         self.delta_hedger = DeltaHedgingEngine(delta_band=SETTINGS.risk.delta_band)
 
+        # A pedido explicito del usuario (2026-09-01, ver
+        # RiskConfig.enable_delta_hedge / GGAL_BOT_ENABLE_DELTA_HEDGE): con
+        # este flag en false, _maybe_hedge() no dispara NINGUNA orden sobre
+        # el subyacente/futuro - el bot opera solo opciones. Se valida y
+        # loguea UNA sola vez aca, no en cada ciclo.
+        if not SETTINGS.risk.enable_delta_hedge:
+            logger.warning(
+                "Delta-hedging DESACTIVADO por config (GGAL_BOT_ENABLE_DELTA_HEDGE=false): el bot "
+                "NUNCA va a operar el subyacente/futuro de GGAL para neutralizar delta, sin importar "
+                "cuanto delta direccional acumule la cartera de opciones - a pedido explicito del "
+                "usuario, no hay ningun tope de reemplazo que bloquee nuevas entradas por esto."
+            )
+
         # -- Ejecucion -----------------------------------------------------
         self.mm_engine = MarketMakingEngine(
             tick_size=SETTINGS.execution.tick_size,
@@ -999,7 +1012,14 @@ class GgalOptionsBot:
         que el bot creia tener. En modo real (no shadow) esto habria sido
         una posicion direccional descontrolada con dinero real. Ver
         test_execution_pipeline.py, test_maybe_hedge_records_fill_so_delta_reflects_the_hedge.
+
+        A pedido explicito del usuario (2026-09-01, ver RiskConfig.
+        enable_delta_hedge / GGAL_BOT_ENABLE_DELTA_HEDGE): si el delta-hedging
+        esta desactivado por config, este metodo no hace absolutamente nada -
+        ni siquiera evalua needs_hedge() - el bot opera solo opciones.
         """
+        if not SETTINGS.risk.enable_delta_hedge:
+            return
         if not self.delta_hedger.needs_hedge(totals["delta"]):
             return
         if self._spot_book is None:

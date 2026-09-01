@@ -306,6 +306,50 @@ def test_maybe_hedge_records_fill_so_delta_reflects_the_hedge():
         SETTINGS.shadow.enabled = original_enabled
 
 
+def test_maybe_hedge_does_nothing_when_delta_hedge_disabled():
+    """
+    Feature nueva (2026-09-01, a pedido explicito del usuario -
+    RiskConfig.enable_delta_hedge / GGAL_BOT_ENABLE_DELTA_HEDGE): el usuario
+    encontro en el dashboard una posicion de delta-hedge sobre el subyacente
+    (MERV - XMEV - GGAL - 24hs) y pidio explicitamente que el bot opere
+    UNICAMENTE opciones - eligiendo ademas, de forma explicita, NO agregar
+    ningun tope/limite de reemplazo que bloquee nuevas entradas por delta
+    agregado. Con enable_delta_hedge=False, _maybe_hedge() no debe generar
+    NINGUNA posicion sobre el subyacente, sin importar cuanto exceda la
+    banda el delta total - ni siquiera debe llamar a needs_hedge().
+    """
+    original_enabled = SETTINGS.shadow.enabled
+    original_hedge_enabled = SETTINGS.risk.enable_delta_hedge
+    SETTINGS.shadow.enabled = True
+    SETTINGS.risk.enable_delta_hedge = False
+    try:
+        bot = GgalOptionsBot()
+        # Mismo delta muy fuera de banda que en
+        # test_maybe_hedge_records_fill_so_delta_reflects_the_hedge (500 vs.
+        # banda=150) - sin el flag desactivado, esto SI dispararia una cobertura.
+        bot.portfolio.add(Position(
+            symbol="GFGC5200O", quantity=10, multiplier=100.0,
+            greeks_per_unit={"delta": 0.5, "gamma": 0.01, "vega": 5.0, "theta": -1.0},
+        ))
+        bot._spot_book = OrderBookSnapshot(
+            SETTINGS.instruments.contado_ticker, bid=5199.0, ask=5201.0, bid_size=500, ask_size=500,
+        )
+
+        totals = bot.portfolio.total_greeks()
+        assert totals["delta"] == 500.0
+        bot._maybe_hedge(totals, spot=5200.0)
+
+        hedge_positions = [p for p in bot.portfolio.positions if p.symbol == SETTINGS.instruments.contado_ticker]
+        assert hedge_positions == [], "con enable_delta_hedge=False no deberia abrirse ninguna posicion del subyacente"
+
+        # El delta total sigue exactamente igual (nada lo neutralizo).
+        totals_after = bot.portfolio.total_greeks()
+        assert totals_after["delta"] == 500.0
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+        SETTINGS.risk.enable_delta_hedge = original_hedge_enabled
+
+
 def test_capital_available_ars_excludes_delta_hedge_underlying_position():
     """
     La posicion del subyacente que deja el delta-hedger (greeks_per_unit=None)
@@ -442,6 +486,7 @@ ALL_TESTS = [
     test_business_days_between_excludes_weekends,
     test_act_on_signal_does_not_reenter_same_symbol_across_cycles_in_shadow_mode,
     test_maybe_hedge_records_fill_so_delta_reflects_the_hedge,
+    test_maybe_hedge_does_nothing_when_delta_hedge_disabled,
     test_capital_available_ars_excludes_delta_hedge_underlying_position,
     test_on_book_update_stamps_spot_last_update_at,
     test_is_market_data_stale_false_before_any_update,

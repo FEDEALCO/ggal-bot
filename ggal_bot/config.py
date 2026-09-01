@@ -298,6 +298,14 @@ class RiskConfig:
     # delta_band = umbral de delta-neutralidad: acciones equivalentes de GGAL
     # que el portafolio puede acumular antes de disparar un rehedge automatico.
     delta_band: float = _env_float("GGAL_BOT_DELTA_NEUTRAL_THRESHOLD", 150.0)
+    # A pedido explicito del usuario (2026-09-01, ver run_bot.py._maybe_hedge):
+    # apaga por completo el rehedge automatico contra el subyacente/futuro -
+    # el bot pasa a operar UNICAMENTE opciones, sin ninguna orden sobre GGAL
+    # contado/futuro. Deliberadamente SIN ningun tope/limite de reemplazo que
+    # bloquee nuevas entradas por delta agregado (decision explicita del
+    # usuario, no un default nuevo): el delta de la cartera de opciones queda
+    # sin ningun control automatico mientras este flag este en false.
+    enable_delta_hedge: bool = _env_bool("GGAL_BOT_ENABLE_DELTA_HEDGE", True)
     max_vega_total: float = 5000.0       # $ por punto de vol (1 vol point = 0.01 de IV)
     max_gamma_total: float = 2000.0      # $ por (punto de movimiento de GGAL)^2
     max_spread_relative: float = 0.05    # spread relativo maximo para considerar operable
