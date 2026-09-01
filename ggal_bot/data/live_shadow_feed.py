@@ -926,20 +926,65 @@ class BrokerRestSource(ShadowDataSource):
         "freeze, no starve" que el resto de la fuente) - una falla
         individual no aborta el refresh de los demas.
         """
+        # BUG REAL CORREGIDO (2026-09-01, ver seguimiento de la auditoria):
+        # este metodo se llama SIN try/except desde fetch_snapshot(), que a
+        # su vez es invocado por LiveShadowFeed.poll() a traves de
+        # _safe_call() - _safe_call() atrapa la excepcion, si, pero al
+        # nivel de TODO fetch_snapshot(): una excepcion aca (ej. self.
+        # _login() relanzando un error de red del POST /token, algo real y
+        # esperable dado que la API de IOL viene devolviendo 503
+        # intermitentes) tira a la basura el spot_quote/option_quotes que
+        # esa MISMA llamada ya habia conseguido bien mas arriba (la cadena/
+        # el subyacente), degradando un refresco parcialmente exitoso a
+        # "nada" - mucho peor que simplemente no tener puntas individuales
+        # este ciclo. Por eso TODO el cuerpo (salvo el throttle, que no
+        # hace ningun I/O) queda blindado con un try/except amplio: esto es
+        # un complemento best-effort, nunca debe poder degradar el
+        # resultado de fetch_snapshot().
         now = time.time()
         if (now - self._last_individual_quote_refresh_at) < self._cfg.individual_quote_min_refresh_interval_seconds:
             return
+        try:
+            self._refresh_near_the_money_quotes_unsafe(now)
+        except Exception as exc:  # noqa: BLE001 - ver comentario de arriba: nunca debe propagar
+            logger.warning(
+                "BrokerRestSource: fallo el refresco de puntas individuales cercanas al spot (%s) - "
+                "se sigue sirviendo lo ya cacheado de esas opciones (mismo criterio 'freeze, no starve' "
+                "que el resto de la fuente).", exc,
+            )
+
+    def _refresh_near_the_money_quotes_unsafe(self, now: float) -> None:
+        """
+        Cuerpo real de _refresh_near_the_money_quotes() - ver esa funcion
+        para el porque del wrapper.
+
+        Cada "return" temprano de aca abajo loguea a INFO antes de salir
+        (2026-09-01: el primer rollout de este metodo NUNCA llego a la
+        linea final de "puntas individuales refrescadas" y, sin ningun log
+        en los retornos tempranos, fue imposible saber por cual de ellos
+        estaba saliendo - no volver a quedar a ciegas asi).
+        """
         if not self._universe:
+            logger.info("BrokerRestSource: refresco de puntas individuales pospuesto (universo aun vacio).")
             return
 
         cfg_i = SETTINGS.instruments
         spot_quote = self._quote_cache.get(cfg_i.underlying_symbol)
         if spot_quote is None:
+            logger.info(
+                "BrokerRestSource: refresco de puntas individuales pospuesto (todavia no hay ningun spot "
+                "de %s cacheado - el primer fetch del subyacente aun no tuvo exito).", cfg_i.underlying_symbol,
+            )
             return
         reference_spot = spot_quote.last_price if spot_quote.last_price and spot_quote.last_price > 0 else None
         if reference_spot is None and spot_quote.bid > 0 and spot_quote.ask > 0:
             reference_spot = (spot_quote.bid + spot_quote.ask) / 2.0
         if reference_spot is None or reference_spot <= 0:
+            logger.info(
+                "BrokerRestSource: refresco de puntas individuales pospuesto (spot de %s cacheado pero sin "
+                "precio de referencia utilizable: last_price=%r, bid=%r, ask=%r).",
+                cfg_i.underlying_symbol, spot_quote.last_price, spot_quote.bid, spot_quote.ask,
+            )
             return
 
         band = self._cfg.individual_quote_moneyness_band_pct
@@ -951,11 +996,17 @@ class BrokerRestSource(ShadowDataSource):
             if log_moneyness <= band:
                 scored.append((log_moneyness, symbol))
         if not scored:
+            logger.info(
+                "BrokerRestSource: ninguna opcion del universo (%d candidatas) cae dentro de la banda de "
+                "moneyness |log(K/S)|<=%.2f alrededor del spot ref=%.2f.",
+                len(self._universe), band, reference_spot,
+            )
             return
         scored.sort(key=lambda item: item[0])
         symbols_to_refresh = [symbol for _lm, symbol in scored[: self._cfg.individual_quote_max_symbols]]
 
         if not self._login():
+            logger.info("BrokerRestSource: refresco de puntas individuales pospuesto (fallo la autenticacion).")
             return
         self._last_individual_quote_refresh_at = now
         headers = {"Authorization": f"Bearer {self._token}"}
