@@ -471,6 +471,36 @@ class _AlwaysFailingSource(ShadowDataSource):
         return True
 
 
+class _CachedButSoftFailingSource(ShadowDataSource):
+    """
+    Doble de prueba (BUG REAL CORREGIDO, ver seguimiento de auditoria del
+    2026-09-01): simula el comportamiento real de BrokerRestSource cuando el
+    refresh en vivo falla pero el cache sigue sirviendo el ultimo dato
+    conocido - a diferencia de _AlwaysFailingSource (que devuelve
+    None/vacio), esta fuente SIEMPRE devuelve datos no vacios via
+    fetch_snapshot(), pero reporta had_last_fetch_error()==True. Antes del
+    fix, LiveShadowFeed.poll() solo miraba "spot_quote is None and not
+    option_quotes" para contar fallos, asi que una fuente asi jamas hacia
+    avanzar _consecutive_failures pese a fallar en cada poll - exactamente
+    el hueco que se vio en produccion (>1 hora de fallos de refresh de la
+    cadena de opciones sin que el failover se disparara una sola vez).
+    """
+
+    def bootstrap(self):
+        return [("GFGC4200SE", OptionType.CALL, 4200.0, date(2026, 9, 18))]
+
+    def fetch_snapshot(self):
+        spot = RawQuote(symbol="GGAL", bid=7000.0, ask=7010.0, bid_size=100, ask_size=100)
+        option = RawQuote(symbol="GFGC4200SE", bid=0.40, ask=0.50, bid_size=100, ask_size=100)
+        return spot, {"GFGC4200SE": option}
+
+    def is_available(self):
+        return True
+
+    def had_last_fetch_error(self):
+        return True
+
+
 def test_live_shadow_feed_failover_switches_source_after_consecutive_failures():
     """
     No debe conmutar tras un unico poll fallido (ver
@@ -503,6 +533,100 @@ def test_live_shadow_feed_failover_switches_source_after_consecutive_failures():
             mod._SOURCE_FACTORIES.update(original_factories)
     finally:
         SETTINGS.shadow.source_failure_threshold = original_threshold
+
+
+def test_live_shadow_feed_failover_counts_soft_errors_even_when_cached_data_keeps_flowing():
+    """
+    BUG REAL CORREGIDO (ver ShadowDataSource.had_last_fetch_error() y
+    seguimiento de auditoria del 2026-09-01): una fuente que sigue
+    devolviendo datos cacheados no vacios pero cuyo refresh en vivo esta
+    fallando de forma sostenida (el comportamiento real de BrokerRestSource,
+    ver _CachedButSoftFailingSource) DEBE hacer avanzar
+    _consecutive_failures y disparar el failover al llegar al umbral -
+    antes de este fix, "spot_quote is None and not option_quotes" nunca era
+    cierto para una fuente asi, y el failover quedaba ciego para siempre.
+    """
+    original_threshold = SETTINGS.shadow.source_failure_threshold
+    SETTINGS.shadow.source_failure_threshold = 2
+    try:
+        feed = LiveShadowFeed(on_book_update=lambda *_: None)
+        feed._priority = ("soft-failing", "mock")
+        feed._source = _CachedButSoftFailingSource()
+        feed._source_index = 0
+        feed._consecutive_failures = 0
+        chain = OptionChain()
+        feed._option_chain = chain
+
+        import ggal_bot.data.live_shadow_feed as mod
+        original_factories = dict(mod._SOURCE_FACTORIES)
+        mod._SOURCE_FACTORIES["soft-failing"] = _CachedButSoftFailingSource
+        try:
+            feed.poll(chain)
+            # 1er poll con error suave: todavia no alcanza el umbral, pero
+            # los datos cacheados igual se despachan (freeze, no starve).
+            assert isinstance(feed._source, _CachedButSoftFailingSource)
+            assert feed._consecutive_failures == 1
+
+            feed.poll(chain)
+            # 2do error suave consecutivo: alcanza el umbral -> conmuta,
+            # pese a que fetch_snapshot() NUNCA devolvio spot/opciones vacios.
+            assert isinstance(feed._source, MockReplaySource)
+        finally:
+            mod._SOURCE_FACTORIES.clear()
+            mod._SOURCE_FACTORIES.update(original_factories)
+    finally:
+        SETTINGS.shadow.source_failure_threshold = original_threshold
+
+
+def test_broker_rest_source_fetch_snapshot_flags_soft_error_but_keeps_serving_cache():
+    """
+    BUG REAL CORREGIDO: cuando el refresh en vivo falla (timeout, 500,
+    proxy caido), fetch_snapshot() debe seguir devolviendo el ultimo dato
+    cacheado (comportamiento pre-existente, "freeze no starve") Y ADEMAS
+    marcar had_last_fetch_error()=True para que LiveShadowFeed.poll() pueda
+    contarlo como un fallo real, algo que antes era invisible para el
+    contador de failover.
+    """
+    import ggal_bot.data.live_shadow_feed as mod
+
+    original_login = mod.BrokerRestSource._login
+    mod.BrokerRestSource._login = lambda self: True
+    original_http_get_json = mod.http_get_json
+
+    state = {"fail": False}
+
+    def fake_http_get_json(url, timeout, headers=None):  # noqa: ARG001
+        if state["fail"]:
+            raise RuntimeError("Read timed out (simulado)")
+        if url.endswith("/Cotizacion"):
+            return {"ultimoPrecio": 7070.0, "puntas": []}
+        return [{
+            "cotizacion": {"ultimoPrecio": 0.45, "puntas": [
+                {"precioCompra": 0.40, "cantidadCompra": 100, "precioVenta": 0.50, "cantidadVenta": 100},
+            ]},
+            "tipoOpcion": "Call", "simbolo": "GFGC4200SE", "fechaVencimiento": "2026-09-18T15:30:00",
+        }]
+
+    mod.http_get_json = fake_http_get_json
+    try:
+        source = mod.BrokerRestSource()
+
+        spot, options = source.fetch_snapshot()
+        assert spot is not None and "GFGC4200SE" in options
+        assert source.had_last_fetch_error() is False
+
+        state["fail"] = True
+        spot2, options2 = source.fetch_snapshot()
+        # Cache-replay: los datos siguen siendo los mismos de la ultima vez
+        # que el refresh funciono, no None/vacio.
+        assert spot2 is not None and spot2.last_price == 7070.0
+        assert "GFGC4200SE" in options2
+        # Pero ahora SI queda marcado el error suave, para que el failover
+        # pueda enterarse.
+        assert source.had_last_fetch_error() is True
+    finally:
+        mod.http_get_json = original_http_get_json
+        mod.BrokerRestSource._login = original_login
 
 
 def test_live_shadow_feed_advance_to_next_source_falls_back_to_mock_when_priority_exhausted():
@@ -642,6 +766,8 @@ ALL_TESTS = [
     test_live_shadow_feed_respects_explicit_source_priority_order,
     test_live_shadow_feed_ignores_unknown_source_name_in_priority,
     test_live_shadow_feed_failover_switches_source_after_consecutive_failures,
+    test_live_shadow_feed_failover_counts_soft_errors_even_when_cached_data_keeps_flowing,
+    test_broker_rest_source_fetch_snapshot_flags_soft_error_but_keeps_serving_cache,
     test_live_shadow_feed_advance_to_next_source_falls_back_to_mock_when_priority_exhausted,
     test_order_gateway_shadow_mode_fills_immediately_at_reference_price,
     test_order_gateway_shadow_mode_logs_fill_to_audit_csv,

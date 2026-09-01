@@ -444,6 +444,23 @@ class GgalOptionsBot:
                 # TechnicalSnapshot que `trend`, inyectado igual que `trend`
                 # en scan_entry_signals() - ver docstring de ese metodo.
                 momentum_shift = snapshot.momentum_shift
+                # BUG REAL CORREGIDO (ver seguimiento de auditoria del
+                # 2026-09-01, incidente en produccion: data912 tiro
+                # SSLEOFError en el endpoint de velas historicas y el motor
+                # cayo a SyntheticDailyBarsSource - ver
+                # data/technical_analysis.py): un trend calculado sobre
+                # barras 100% inventadas NO puede gatillar ni confirmar
+                # entradas. Antes snapshot.data_source solo se logueaba sin
+                # afectar el filtro direccional - una racha de mala suerte
+                # con data912 podia hacer que el bot tomara una direccion de
+                # entrada basada en un grafico ficticio. Se degrada a
+                # NEUTRAL, el mismo estado conservador que ya se usa cuando
+                # el refresh de tendencia tira una excepcion (ver except mas
+                # abajo), y se apaga el Momentum Shift Override (calculado
+                # sobre las mismas barras sinteticas).
+                if snapshot.data_source == "synthetic":
+                    trend = Trend.NEUTRAL.value
+                    momentum_shift = None
                 # refresh() devuelve el MISMO objeto (misma identidad) mientras
                 # el cache siga vigente (ver refresh_interval_seconds, tipicamente
                 # 1h) - se loguea solo cuando cambia la instancia (o sea, cuando
@@ -454,6 +471,12 @@ class GgalOptionsBot:
                         "Tendencia 1D GGAL: %s (%s) [fuente=%s, velas=%d]",
                         trend, snapshot.reason, snapshot.data_source, snapshot.bars_used,
                     )
+                    if snapshot.data_source == "synthetic":
+                        logger.warning(
+                            "Tendencia 1D calculada sobre datos SINTETICOS (data912 no disponible o "
+                            "insuficiente) - se fuerza a NEUTRAL este ciclo y NO se usa para gatillar "
+                            "ni confirmar entradas ni completar spreads."
+                        )
                     if momentum_shift:
                         logger.info(
                             "Momentum Shift detectado: %s - se relaja el bloqueo del tipo de opcion contrario "

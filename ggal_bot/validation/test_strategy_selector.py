@@ -38,6 +38,7 @@ from ggal_bot.validation import _shadow_audit_isolation  # noqa: F401
 
 from ggal_bot.config import SETTINGS
 from ggal_bot.data.option_chain import OptionQuote, OrderBookSnapshot
+from ggal_bot.data.technical_analysis import TechnicalSnapshot, Trend
 from ggal_bot.models.black_scholes import OptionType
 from ggal_bot.portfolio.portfolio import Position
 from ggal_bot.strategy.vol_arbitrage import VolatilityArbitrageStrategy
@@ -417,6 +418,82 @@ def test_weekly_asymmetric_cycle_excludes_stale_option_quote_from_entry_scan():
         SETTINGS.risk.max_option_quote_staleness_seconds = original_option_staleness
 
 
+def test_weekly_asymmetric_cycle_forces_neutral_when_technical_snapshot_is_synthetic():
+    """
+    BUG REAL CORREGIDO (ver seguimiento de auditoria del 2026-09-01,
+    incidente en produccion: data912 tiro un SSLEOFError en el endpoint de
+    velas historicas y TechnicalAnalysisEngine cayo a
+    SyntheticDailyBarsSource): un TechnicalSnapshot con
+    data_source="synthetic" NO debe poder gatillar/confirmar entradas -
+    antes de este fix, snapshot.data_source solo se logueaba y una
+    tendencia BULLISH/BEARISH calculada sobre barras 100% inventadas se
+    inyectaba en scan_entry_signals() exactamente igual que una real.
+
+    Se verifica interceptando la llamada real a
+    WeeklyAsymmetricStrategy.scan_entry_signals() (en vez de armar un
+    escenario de entrada completo) para confirmar que el `trend` y
+    `momentum_shift` efectivamente inyectados son NEUTRAL/None pese a que
+    el snapshot crudo del motor tecnico diga BULLISH con un momentum shift.
+    """
+    original_strategy = SETTINGS.strategy.active
+    original_shadow = SETTINGS.shadow.enabled
+    original_ta_enabled = SETTINGS.technical_analysis.enabled
+    SETTINGS.strategy.active = "weekly_asymmetric"
+    SETTINGS.shadow.enabled = True
+    SETTINGS.technical_analysis.enabled = True
+    try:
+        bot = GgalOptionsBot()
+        spot = 5200.0
+
+        def smile_iv(strike: float) -> float:
+            x = math.log(strike / spot)
+            return 0.45 + 6.0 * x * x
+
+        for k in [4700, 4900, 5000, 5100, 5300, 5400, 5500, 5700]:
+            q = _quote(f"GFGC{k}O", k, smile_iv(k), spot, days_biz=3)
+            bot.option_chain.upsert_quote(q)
+            bot._recent_volumes[q.symbol] = 1000.0
+
+        synthetic_snapshot = TechnicalSnapshot(
+            as_of=date(2026, 9, 1), bars_used=200, last_close=7000.0,
+            ema_fast=6800.0, ema_slow=6500.0, rsi_value=65.0, adx_value=30.0,
+            plus_di=25.0, minus_di=10.0, macd_line=50.0, macd_signal=20.0, macd_histogram=30.0,
+            trend=Trend.BULLISH, reason="dislocacion sintetica", data_source="synthetic",
+            momentum_shift="BULLISH_REVERSAL",
+        )
+
+        class _FakeTechnicalEngine:
+            def refresh(self, now=None):  # noqa: ARG002
+                return synthetic_snapshot
+
+        bot.technical_engine = _FakeTechnicalEngine()
+
+        captured = {}
+        original_scan_entry_signals = bot.strategy.scan_entry_signals
+
+        def spy_scan_entry_signals(surface, recent_volumes, trend=None, momentum_shift=None, **kwargs):
+            captured["trend"] = trend
+            captured["momentum_shift"] = momentum_shift
+            return original_scan_entry_signals(
+                surface, recent_volumes, trend=trend, momentum_shift=momentum_shift, **kwargs
+            )
+
+        bot.strategy.scan_entry_signals = spy_scan_entry_signals
+        try:
+            bot._run_weekly_asymmetric_cycle(spot)
+        finally:
+            bot.strategy.scan_entry_signals = original_scan_entry_signals
+
+        assert captured["trend"] == Trend.NEUTRAL.value, (
+            f"esperaba NEUTRAL (snapshot sintetico degradado), se inyecto: {captured['trend']!r}"
+        )
+        assert captured["momentum_shift"] is None
+    finally:
+        SETTINGS.strategy.active = original_strategy
+        SETTINGS.shadow.enabled = original_shadow
+        SETTINGS.technical_analysis.enabled = original_ta_enabled
+
+
 ALL_TESTS = [
     test_default_weekly_asymmetric_wires_strategy_and_position_sizer,
     test_vol_arbitrage_selection_leaves_position_sizer_unset,
@@ -426,6 +503,7 @@ ALL_TESTS = [
     test_weekly_asymmetric_cycle_skips_entries_and_spreads_when_market_data_stale,
     test_on_book_update_uses_book_as_of_not_dispatch_time_for_staleness,
     test_weekly_asymmetric_cycle_excludes_stale_option_quote_from_entry_scan,
+    test_weekly_asymmetric_cycle_forces_neutral_when_technical_snapshot_is_synthetic,
 ]
 
 

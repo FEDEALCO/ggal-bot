@@ -191,6 +191,24 @@ class ShadowDataSource:
         """
         return True
 
+    def had_last_fetch_error(self) -> bool:
+        """
+        Señaliza si el ULTIMO fetch_snapshot() tuvo algun error de refresh
+        que "spot_quote is None and not option_quotes" NO puede detectar
+        (BUG REAL CORREGIDO, ver seguimiento de la auditoria y el incidente
+        de proxy/timeouts de 2026-09-01 en produccion: LiveShadowFeed.poll()
+        solo contaba como fallo un poll con AMBOS spot y opciones vacios,
+        pero BrokerRestSource sigue devolviendo el ultimo valor cacheado de
+        _quote_cache cuando el refresh en vivo falla - ver su docstring y el
+        de RawQuote.as_of - asi que un refresh de la cadena de opciones que
+        falla de forma sostenida nunca hacia avanzar _consecutive_failures y
+        el failover a la siguiente fuente en source_priority() jamas se
+        disparaba pese a fallar durante mas de una hora seguida).
+        Default: False (fuentes que no tienen este modo de fallo parcial,
+        como MockReplaySource, no necesitan sobreescribir esto).
+        """
+        return False
+
     def subscribe(self, tickers: List[str]) -> None:
         """
         Hook opcional para fuentes que necesitan una suscripcion real (ej.
@@ -671,6 +689,12 @@ class BrokerRestSource(ShadowDataSource):
         self._token_obtained_at: Optional[float] = None
         self._universe: List[Tuple[str, OptionType, float, date]] = []
         self._quote_cache: Dict[str, RawQuote] = {}
+        # Ver had_last_fetch_error(): flag que distingue "fetch_snapshot()
+        # tuvo que resignarse al cache" de "el refresh en vivo funciono".
+        self._last_fetch_had_error: bool = False
+
+    def had_last_fetch_error(self) -> bool:
+        return self._last_fetch_had_error
 
     def is_available(self) -> bool:
         if not self._cfg.username or not self._cfg.password:
@@ -838,11 +862,15 @@ class BrokerRestSource(ShadowDataSource):
 
     def fetch_snapshot(self) -> Tuple[Optional[RawQuote], Dict[str, RawQuote]]:
         cfg_i = SETTINGS.instruments
+        # Se resetea en cada llamada: had_last_fetch_error() debe reflejar
+        # SOLO este poll, no un fallo viejo ya recuperado.
+        self._last_fetch_had_error = False
         try:
             data = self._authed_get(self._titulos_url(cfg_i.underlying_symbol, "Cotizacion"))
             self._quote_cache[cfg_i.underlying_symbol] = self._parse_quote_record(cfg_i.underlying_symbol, data)
         except Exception as exc:
             logger.warning("BrokerRestSource.fetch_snapshot(): fallo la cotizacion del subyacente (%s).", exc)
+            self._last_fetch_had_error = True
 
         # La cadena ENTERA de opciones se refresca en UN SOLO request (el
         # mismo endpoint de bootstrap trae la cotizacion embebida por
@@ -859,7 +887,18 @@ class BrokerRestSource(ShadowDataSource):
                     self._quote_cache[symbol] = self._parse_quote_record(symbol, quote_rec)
         except Exception as exc:
             logger.warning("BrokerRestSource.fetch_snapshot(): fallo al refrescar la cadena de opciones (%s).", exc)
+            self._last_fetch_had_error = True
 
+        # NOTA (BUG REAL CORREGIDO, ver had_last_fetch_error() y el
+        # seguimiento de la auditoria del 2026-09-01): spot_quote/
+        # option_quotes se siguen devolviendo desde _quote_cache aunque haya
+        # habido un error arriba - a proposito, es el comportamiento de
+        # "freeze, no starve" ya establecido (las puntas conocidas siguen
+        # disponibles para salidas/hedge). Lo que cambia es que ahora
+        # had_last_fetch_error() le permite a LiveShadowFeed.poll() SABER
+        # que este resultado viene de cache y no de un refresh exitoso, para
+        # que el contador de failover no quede ciego a fallos parciales
+        # sostenidos.
         spot_quote = self._quote_cache.get(cfg_i.underlying_symbol)
         option_quotes = {s: q for s, q in self._quote_cache.items() if s != cfg_i.underlying_symbol}
         return spot_quote, option_quotes
@@ -1144,8 +1183,23 @@ class LiveShadowFeed:
         spot_quote, option_quotes = self._safe_call(
             self._source.fetch_snapshot, default=(None, {}), label=f"{type(self._source).__name__}.fetch_snapshot()",
         )
+        # BUG REAL CORREGIDO (ver ShadowDataSource.had_last_fetch_error() y
+        # BrokerRestSource.fetch_snapshot(): seguimiento de la auditoria del
+        # 2026-09-01 en produccion): antes solo "spot_quote is None and not
+        # option_quotes" contaba como fallo para el failover, pero
+        # BrokerRestSource sigue devolviendo el ultimo dato cacheado cuando
+        # el refresh en vivo falla, asi que ese chequeo casi nunca detectaba
+        # un problema real (se vio en produccion: >1 hora de fallos
+        # sostenidos de refresh de la cadena de opciones sin que el failover
+        # se disparara ni una vez). had_last_fetch_error() cierra ese hueco
+        # sin cambiar el comportamiento de las fuentes que no lo necesitan
+        # (default False en ShadowDataSource).
+        had_soft_error = self._safe_call(
+            self._source.had_last_fetch_error, default=False,
+            label=f"{type(self._source).__name__}.had_last_fetch_error()",
+        )
 
-        if spot_quote is None and not option_quotes:
+        if (spot_quote is None and not option_quotes) or had_soft_error:
             self._consecutive_failures += 1
             if self._consecutive_failures >= SETTINGS.shadow.source_failure_threshold:
                 if self._advance_to_next_source():
