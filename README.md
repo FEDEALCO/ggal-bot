@@ -573,6 +573,11 @@ pisen entre si, cada posicion queda marcada con `Position.strategy_tag` (`None`/
 - `GgalOptionsBot._capital_available_ars(strategy_tag)` calcula el capital comprometido
   **por separado** para cada estrategia — el pool de capital de una nunca reduce el de
   la otra.
+- `GgalOptionsBot._act_on_entry_signal(strategy_tag, risk_manager=...)` evalua el techo
+  de riesgo de Griegas contra `Portfolio.greeks_for_strategy_tag(strategy_tag)` (**solo**
+  las Griegas de esa estrategia) y contra el `RiskManager` propio de esa estrategia
+  (`self.risk_manager` para weekly_asymmetric/vol_arbitrage, `self.scalping_risk_manager`
+  para scalping) — ver subseccion "Interaccion con el techo de Griegas" mas abajo.
 - La unica guarda **compartida** (deliberadamente) es "no abrir dos posiciones sobre la
   misma base a la vez" (`_position_quantity`), independientemente de que estrategia la
   pida.
@@ -591,6 +596,7 @@ pisen entre si, cada posicion queda marcada con `Position.strategy_tag` (`None`/
 | Spreads (Bull Call/Bear Put) | si (`scan_spread_completion_signals`) | **no** — solo Long Call/Long Put desnudas, deliberadamente mas simple |
 | Capital | `GGAL_BOT_MAX_CAPITAL_ARS` (pool propio) | `GGAL_BOT_SCALPING_MAX_CAPITAL_ARS` (pool propio, separado) |
 | Concurrencia | sin limite explicito de posiciones simultaneas | `GGAL_BOT_SCALPING_MAX_CONCURRENT_POSITIONS` — reparte el capital en mas trades de menor tamaño |
+| Techo de riesgo de Griegas | `GGAL_BOT_MAX_VEGA_TOTAL`/`GGAL_BOT_MAX_GAMMA_TOTAL` (`RiskManager` propio) | `GGAL_BOT_SCALPING_MAX_VEGA_TOTAL`/`GGAL_BOT_SCALPING_MAX_GAMMA_TOTAL` (`RiskManager` propio, separado — ver abajo) |
 
 ### Velas intradia sintetizadas en memoria (`ggal_bot/data/intraday_bars.py`)
 
@@ -634,14 +640,53 @@ expiracion puede operar cada estrategia. Ver
 `test_broker_rest_source_near_the_money_refresh_includes_forced_expiry_plus_nearest_when_scalping_enabled`
 en `test_shadow_trading.py`.
 
+### Interaccion con el techo de Griegas (BUG REAL corregido, confirmado en produccion)
+
+**Sintoma observado en produccion (2026-09-03)**: con `GGAL_BOT_ENABLE_SCALPING=true` ya
+activo en GGALBOT, el log mostraba repetidos `LIMITE EXCEDIDO: vega_ok | totales={...
+'vega': 9550.13 ...}` (por encima del default `GGAL_BOT_MAX_VEGA_TOTAL=5000.0`) junto con
+`Señal <simbolo> descartada: la cuenta ya excede limites de riesgo.` para bases del
+vencimiento forzado de `weekly_asymmetric` — y **ninguna** señal `[Scalping ...]` habia
+abierto posicion propia todavia, pese a que la deteccion de tendencia intradia si estaba
+corriendo (`Tendencia intradia SCALPING (5m/15m, ...)` presente en el log).
+
+**Causa raiz**: a diferencia del capital (aislado desde el primer commit de este modulo,
+ver arriba), el techo de riesgo de Griegas SI estaba compartido — `ScalpingStrategy` se
+instanciaba con el mismo `self.risk_manager` de `weekly_asymmetric`/`vol_arbitrage`, y
+`_act_on_entry_signal()` evaluaba `should_halt_new_positions()` contra
+`self.portfolio.total_greeks()`, es decir la exposicion de la cuenta **entera**. Un book
+de `weekly_asymmetric` que ya rompia su propio techo bloqueaba tambien cualquier entrada
+nueva de scalping (y viceversa), aunque esa otra estrategia no tuviera ninguna posicion
+propia abierta — el aislamiento por `strategy_tag` que ya regia capital y salidas no
+alcanzaba al gate de riesgo.
+
+**Correccion**: `Portfolio.greeks_for_strategy_tag(strategy_tag)` (contraparte de
+`total_greeks()`, filtra por `Position.strategy_tag` igual que `_capital_available_ars`)
+mas un `RiskManager`/`RiskLimits` **propio** para scalping
+(`GgalOptionsBot.scalping_risk_manager`, techos `GGAL_BOT_SCALPING_MAX_VEGA_TOTAL`/
+`GGAL_BOT_SCALPING_MAX_GAMMA_TOTAL` — ver `.env.example`), pasado tanto a
+`ScalpingStrategy(...)` como a `_act_on_entry_signal(..., risk_manager=
+self.scalping_risk_manager)` en `_run_scalping_cycle()`. El piso de liquidez de punta
+(spread/tamaño de libro/volumen) sigue siendo compartido a proposito (mide calidad de
+mercado de la cotizacion, no presupuesto de cartera). De paso, `_act_on_signal()` (el
+camino de entrada de `vol_arbitrage`, que nunca marca `strategy_tag` explicito) se ajusto
+para evaluarse contra `greeks_for_strategy_tag("weekly_asymmetric")` — la convencion ya
+existente para posiciones sin marca — en vez de la cuenta entera, por la misma razon: no
+deberia verse bloqueado por un book de scalping corriendo en paralelo. Ver
+`test_bot_act_on_entry_signal_scalping_not_blocked_by_weekly_asymmetric_vega_breach`,
+`test_bot_act_on_entry_signal_weekly_asymmetric_not_blocked_by_scalping_vega_breach` y
+`test_bot_act_on_entry_signal_scalping_still_blocked_by_its_own_vega_breach` en
+`test_scalping_mode.py` (esta ultima prueba que el aislamiento no elimina el techo de
+scalping contra su PROPIO book, solo lo separa del de la otra estrategia).
+
 ### Como activarlo
 
 Ver la seccion completa de variables en `.env.example` (bloque
 `GGAL_BOT_ENABLE_SCALPING`). Con el flag apagado (default), no hace falta tocar ninguna
 otra variable — el bot se comporta exactamente igual que antes de este modulo. Tests:
-`ggal_bot/validation/test_scalping_mode.py` (40 tests: aislamiento entre estrategias,
-agregador de velas intradia, tracker de reversion de IV, exits de `RiskManager`, filtro
-de profundidad de ASK, wiring en `run_bot.py`).
+`ggal_bot/validation/test_scalping_mode.py` (45 tests: aislamiento entre estrategias
+—capital y Griegas—, agregador de velas intradia, tracker de reversion de IV, exits de
+`RiskManager`, filtro de profundidad de ASK, wiring en `run_bot.py`).
 
 ## Estrategia elegida: Hybrid Trend-Aligned Skew Reversion (razonamiento de diseño)
 
@@ -775,7 +820,7 @@ Esto corre paridad put-call, convergencia del solver de IV, deteccion de disloca
 de smile, limites de riesgo y delta-hedger — todo con datos sinteticos, sin necesitar
 conexion a mercado. Si algo falla aca, **no correr `run_bot.py` contra mercado real**.
 
-Suite completa (230 tests, 10 archivos — incluye ejecucion/shadow (multi-fuente,
+Suite completa (235 tests, 10 archivos — incluye ejecucion/shadow (multi-fuente,
 failover e IOL/BrokerRestSource con esquema confirmado incluidos)/dashboard/Long-First/
 seleccion de estrategia/Analisis Tecnico (incluido Momentum Shift)/microestructura/
 guardia de staleness de datos/timeout de pared real/modo Scalping ADITIVO):

@@ -84,3 +84,28 @@ class Portfolio:
             for k in bucket:
                 bucket[k] += c[k]
         return out
+
+    def greeks_for_strategy_tag(self, strategy_tag: str) -> Dict[str, float]:
+        """
+        Griegas totales de SOLO las posiciones marcadas con `strategy_tag`
+        (ver Position.strategy_tag y config.ScalpingConfig) - contraparte de
+        `total_greeks()` (que suma TODA la cartera, sin distinguir
+        estrategia) usada por run_bot.py:_greeks_for_strategy() para darle a
+        cada estrategia (weekly_asymmetric/vol_arbitrage vs. scalping) su
+        propio techo de riesgo de Griegas, aislado, de forma simetrica a
+        como ya funciona el capital (`_capital_available_ars`).
+
+        Una posicion sin marca (`strategy_tag is None`, toda posicion
+        abierta antes de que este campo existiera, incluida cualquier
+        posicion viva de produccion previa a este cambio) cuenta como
+        "weekly_asymmetric", preservando el comportamiento exacto de antes
+        de este metodo para ese caso.
+        """
+        totals = {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0}
+        for pos in self.positions:
+            if (pos.strategy_tag or "weekly_asymmetric") != strategy_tag:
+                continue
+            c = pos.contribution()
+            for k in totals:
+                totals[k] += c[k]
+        return totals

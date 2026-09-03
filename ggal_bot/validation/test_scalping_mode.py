@@ -61,7 +61,8 @@ from ggal_bot.models.volatility_surface import VolatilitySurface
 from ggal_bot.portfolio.portfolio import Portfolio, Position
 from ggal_bot.risk.risk_manager import RiskLimits, RiskManager
 from ggal_bot.strategy.scalping import ScalpingStrategy
-from ggal_bot.strategy.weekly_asymmetric import WeeklyAsymmetricStrategy
+from ggal_bot.strategy.weekly_asymmetric import EntrySignal, WeeklyAsymmetricStrategy
+from run_bot import GgalOptionsBot
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +657,176 @@ def test_bot_capital_available_ars_pools_are_independent():
         SETTINGS.scalping.enabled = original_enabled
 
 
+# ---------------------------------------------------------------------------
+# AISLAMIENTO del techo de riesgo de Griegas (CORRECCION 2026-09-03, ver
+# comentario largo junto a ScalpingConfig.max_vega_total/max_gamma_total en
+# config.py y README "Interaccion con el techo de Griegas"): antes de esta
+# correccion, scalping y weekly_asymmetric/vol_arbitrage compartian el
+# MISMO RiskManager, evaluado contra self.portfolio.total_greeks() (la
+# cuenta ENTERA) - un book de una estrategia que ya excedia el techo
+# bloqueaba tambien las entradas de la OTRA, aunque esta ultima no tuviera
+# ninguna posicion propia abierta (confirmado en produccion: vega=9550.13
+# > RiskConfig.max_vega_total=5000.0 bloqueando entradas de ambas
+# estrategias por igual). Estos tests prueban que, con
+# Portfolio.greeks_for_strategy_tag() + self.scalping_risk_manager +
+# _act_on_entry_signal(risk_manager=...), cada estrategia queda sujeta
+# UNICAMENTE a su propio book y su propio techo.
+# ---------------------------------------------------------------------------
+
+def test_portfolio_greeks_for_strategy_tag_isolates_vega_by_tag():
+    now = datetime(2026, 9, 3, 12, 0, tzinfo=timezone.utc)
+    portfolio = Portfolio()
+    # vega por posicion = quantity * multiplier * greeks_per_unit["vega"]
+    portfolio.add(Position(
+        symbol="SCALP1", quantity=10, multiplier=100, entry_price=100.0, entry_time=now,
+        greeks_per_unit={"vega": 1.0}, strategy_tag="scalping",
+    ))
+    portfolio.add(Position(
+        symbol="WEEKLY1", quantity=50, multiplier=100, entry_price=100.0, entry_time=now,
+        greeks_per_unit={"vega": 2.0}, strategy_tag="weekly_asymmetric",
+    ))
+    portfolio.add(Position(
+        symbol="UNTAGGED1", quantity=5, multiplier=100, entry_price=100.0, entry_time=now,
+        greeks_per_unit={"vega": 3.0}, strategy_tag=None,
+    ))
+
+    scalping_totals = portfolio.greeks_for_strategy_tag("scalping")
+    weekly_totals = portfolio.greeks_for_strategy_tag("weekly_asymmetric")
+
+    assert scalping_totals["vega"] == 10 * 100 * 1.0
+    # UNTAGGED1 (strategy_tag=None) cuenta como "weekly_asymmetric" por
+    # convencion (ver Position.strategy_tag) - debe sumarse junto a WEEKLY1.
+    assert weekly_totals["vega"] == (50 * 100 * 2.0) + (5 * 100 * 3.0)
+    # La suma total de ambos pools (sin superposicion) debe coincidir con
+    # total_greeks() sobre toda la cartera.
+    assert scalping_totals["vega"] + weekly_totals["vega"] == portfolio.total_greeks()["vega"]
+
+
+def test_bot_scalping_has_own_risk_manager_isolated_from_primary():
+    original_enabled = SETTINGS.scalping.enabled
+    SETTINGS.scalping.enabled = True
+    try:
+        bot = GgalOptionsBot()
+        assert bot.scalping_risk_manager is not None
+        assert bot.scalping_risk_manager is not bot.risk_manager
+        assert bot.scalping_strategy.risk_manager is bot.scalping_risk_manager
+    finally:
+        SETTINGS.scalping.enabled = original_enabled
+
+
+def test_bot_act_on_entry_signal_scalping_not_blocked_by_weekly_asymmetric_vega_breach():
+    original_enabled = SETTINGS.scalping.enabled
+    original_shadow = SETTINGS.shadow.enabled
+    SETTINGS.scalping.enabled = True
+    # SETTINGS.shadow.enabled=True: fill sincronico (ver order_gateway.py.send),
+    # necesario para que _act_on_entry_signal() agregue la Position en el
+    # mismo llamado (ver test_execution_pipeline.py, mismo patron).
+    SETTINGS.shadow.enabled = True
+    try:
+        bot = GgalOptionsBot()
+
+        # Libro de weekly_asymmetric bien por encima del techo COMPARTIDO de
+        # RiskConfig.max_vega_total (5000.0 default): 100 * 100 * 1.0 = 10000.
+        bot.portfolio.add(Position(
+            symbol="WEEKLY_HEAVY", quantity=100, multiplier=100,
+            entry_price=100.0, entry_time=datetime.now(timezone.utc) - timedelta(days=1),
+            greeks_per_unit={"delta": 0.5, "gamma": 0.01, "vega": 1.0, "theta": -1.0},
+            expiry=date(2026, 9, 4), strategy_tag="weekly_asymmetric",
+        ))
+        # Confirma la premisa: la cuenta ENTERA (vista compartida) esta en
+        # breach - si _act_on_entry_signal siguiera usando
+        # self.portfolio.total_greeks()/self.risk_manager, la entrada de
+        # abajo NUNCA se abriria.
+        assert bot.risk_manager.should_halt_new_positions(bot.portfolio.total_greeks())
+
+        new_quote = _quote("GFSCALP1", 6600.0, 0.30, 6600.0, 1, bid=95.0, ask=105.0,
+                            greeks={"delta": 0.5, "gamma": 0.01, "vega": 1.0, "theta": -1.0})
+        bot.option_chain.upsert_quote(new_quote)
+        signal = EntrySignal(
+            symbol="GFSCALP1", option_type=OptionType.CALL, premium_reference=new_quote.book.mid,
+        )
+        bot._act_on_entry_signal(
+            signal, spot=6600.0, strategy_tag="scalping",
+            position_sizer=bot.scalping_position_sizer, risk_manager=bot.scalping_risk_manager,
+        )
+
+        assert bot._position_quantity("GFSCALP1") > 0
+    finally:
+        SETTINGS.scalping.enabled = original_enabled
+        SETTINGS.shadow.enabled = original_shadow
+
+
+def test_bot_act_on_entry_signal_weekly_asymmetric_not_blocked_by_scalping_vega_breach():
+    original_enabled = SETTINGS.scalping.enabled
+    original_shadow = SETTINGS.shadow.enabled
+    SETTINGS.scalping.enabled = True
+    SETTINGS.shadow.enabled = True
+    try:
+        bot = GgalOptionsBot()
+
+        # Libro de scalping bien por encima de SU PROPIO techo
+        # (ScalpingConfig.max_vega_total, default 3000.0): 50 * 100 * 1.0 = 5000.
+        bot.portfolio.add(Position(
+            symbol="SCALP_HEAVY", quantity=50, multiplier=100,
+            entry_price=100.0, entry_time=datetime.now(timezone.utc) - timedelta(minutes=5),
+            greeks_per_unit={"delta": 0.5, "gamma": 0.01, "vega": 1.0, "theta": -1.0},
+            expiry=date(2026, 9, 4), strategy_tag="scalping",
+        ))
+        assert bot.scalping_risk_manager.should_halt_new_positions(
+            bot.portfolio.greeks_for_strategy_tag("scalping")
+        )
+
+        new_quote = _quote("GFWEEKLY1", 6600.0, 0.30, 6600.0, 5, bid=95.0, ask=105.0,
+                            greeks={"delta": 0.5, "gamma": 0.01, "vega": 1.0, "theta": -1.0})
+        bot.option_chain.upsert_quote(new_quote)
+        signal = EntrySignal(
+            symbol="GFWEEKLY1", option_type=OptionType.CALL, premium_reference=new_quote.book.mid,
+        )
+        # Sin overrides: usa self.risk_manager/self.position_sizer (default
+        # de weekly_asymmetric), que NO deberian verse afectados por el
+        # book de scalping de arriba.
+        bot._act_on_entry_signal(signal, spot=6600.0, strategy_tag="weekly_asymmetric")
+
+        assert bot._position_quantity("GFWEEKLY1") > 0
+    finally:
+        SETTINGS.scalping.enabled = original_enabled
+        SETTINGS.shadow.enabled = original_shadow
+
+
+def test_bot_act_on_entry_signal_scalping_still_blocked_by_its_own_vega_breach():
+    original_enabled = SETTINGS.scalping.enabled
+    SETTINGS.scalping.enabled = True
+    try:
+        bot = GgalOptionsBot()
+
+        # Libro de scalping bien por encima de SU PROPIO techo (50 * 100 *
+        # 1.0 = 5000 > ScalpingConfig.max_vega_total=3000.0 default) - esta
+        # vez la entrada NUEVA tambien es de scalping, asi que SI debe
+        # bloquearse: el aislamiento no debe convertirse en "scalping nunca
+        # se frena".
+        bot.portfolio.add(Position(
+            symbol="SCALP_HEAVY", quantity=50, multiplier=100,
+            entry_price=100.0, entry_time=datetime.now(timezone.utc) - timedelta(minutes=5),
+            greeks_per_unit={"delta": 0.5, "gamma": 0.01, "vega": 1.0, "theta": -1.0},
+            expiry=date(2026, 9, 4), strategy_tag="scalping",
+        ))
+
+        new_quote = _quote("GFSCALP2", 6600.0, 0.30, 6600.0, 1, bid=95.0, ask=105.0,
+                            greeks={"delta": 0.5, "gamma": 0.01, "vega": 1.0, "theta": -1.0})
+        bot.option_chain.upsert_quote(new_quote)
+        signal = EntrySignal(
+            symbol="GFSCALP2", option_type=OptionType.CALL, premium_reference=new_quote.book.mid,
+        )
+        bot._act_on_entry_signal(
+            signal, spot=6600.0, strategy_tag="scalping",
+            position_sizer=bot.scalping_position_sizer, risk_manager=bot.scalping_risk_manager,
+        )
+
+        assert bot._position_quantity("GFSCALP2") == 0
+    finally:
+        SETTINGS.scalping.enabled = original_enabled
+
+
 ALL_TESTS = [
     test_passes_min_ask_depth_blocks_below_floor,
     test_passes_min_ask_depth_allows_at_or_above_floor,
@@ -697,6 +868,11 @@ ALL_TESTS = [
     test_bot_scalping_disabled_by_default_wires_nothing,
     test_bot_scalping_enabled_wires_independent_strategy_and_sizer,
     test_bot_capital_available_ars_pools_are_independent,
+    test_portfolio_greeks_for_strategy_tag_isolates_vega_by_tag,
+    test_bot_scalping_has_own_risk_manager_isolated_from_primary,
+    test_bot_act_on_entry_signal_scalping_not_blocked_by_weekly_asymmetric_vega_breach,
+    test_bot_act_on_entry_signal_weekly_asymmetric_not_blocked_by_scalping_vega_breach,
+    test_bot_act_on_entry_signal_scalping_still_blocked_by_its_own_vega_breach,
 ]
 
 
