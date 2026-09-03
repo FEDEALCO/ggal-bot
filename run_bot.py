@@ -54,7 +54,9 @@ from ggal_bot.execution.order_gateway import (
 from ggal_bot.strategy.delta_hedger import DeltaHedgingEngine
 from ggal_bot.strategy.vol_arbitrage import VolatilityArbitrageStrategy
 from ggal_bot.strategy.weekly_asymmetric import EntryScanDiagnostics, WeeklyAsymmetricStrategy
+from ggal_bot.strategy.scalping import ScalpingStrategy
 from ggal_bot.data.technical_analysis import TechnicalAnalysisEngine, Trend
+from ggal_bot.data.intraday_bars import MultiTimeframeIntradayEngine
 from ggal_bot.state_writer import StateWriter
 
 logging.basicConfig(
@@ -175,6 +177,48 @@ class GgalOptionsBot:
                 "NUNCA va a operar el subyacente/futuro de GGAL para neutralizar delta, sin importar "
                 "cuanto delta direccional acumule la cartera de opciones - a pedido explicito del "
                 "usuario, no hay ningun tope de reemplazo que bloquee nuevas entradas por esto."
+            )
+
+        # -- Modo Scalping Intradia (ADITIVO, ver config.ScalpingConfig) -------
+        # DECISION DE ARQUITECTURA (leer el comentario largo junto a
+        # ScalpingConfig en config.py antes de tocar esto): a pedido
+        # EXPLICITO del usuario (2026-09-03, "Modo nuevo aparte, octubre
+        # sigue como esta"), este modo NO reemplaza a self.strategy/
+        # self.active_strategy_name de arriba - corre SIEMPRE DESPUES,
+        # como un modulo bolt-on completamente independiente, gateado por
+        # su PROPIO flag (SETTINGS.scalping.enabled /
+        # GGAL_BOT_ENABLE_SCALPING, default False). Con el flag apagado
+        # (default), nada de este bloque tiene ningun efecto: la posicion
+        # de Octubre bajo weekly_asymmetric sigue gestionada exactamente
+        # igual que antes de este modulo, linea por linea.
+        self.scalping_enabled = SETTINGS.scalping.enabled
+        self.scalping_strategy: Optional[ScalpingStrategy] = None
+        self.scalping_position_sizer: Optional[PositionSizer] = None
+        self.intraday_engine: Optional[MultiTimeframeIntradayEngine] = None
+        self._scalping_last_ta_snapshot_logged = None
+        self._scalping_max_positions_logged = False
+        if self.scalping_enabled:
+            self.scalping_strategy = ScalpingStrategy(self.risk_manager, config=SETTINGS.scalping)
+            # Sizer/capital PROPIOS y SEPARADOS del de weekly_asymmetric/
+            # vol_arbitrage (ver PositionSizer, que ya soporta overrides por
+            # instancia) - ver ScalpingConfig.max_capital_ars/
+            # max_risk_pct_per_trade/max_concurrent_positions.
+            self.scalping_position_sizer = PositionSizer(
+                max_capital_ars=SETTINGS.scalping.max_capital_ars,
+                max_risk_pct_per_trade=SETTINGS.scalping.max_risk_pct_per_trade,
+                min_contracts=SETTINGS.scalping.min_contracts_per_trade,
+            )
+            self.intraday_engine = MultiTimeframeIntradayEngine(config=SETTINGS.scalping)
+            logger.warning(
+                "Modo SCALPING intradia ACTIVADO (GGAL_BOT_ENABLE_SCALPING=true), como modulo "
+                "ADITIVO junto a la estrategia principal '%s': opera sus PROPIAS posiciones "
+                "(Position.strategy_tag='scalping'), con su propio capital asignado "
+                "(GGAL_BOT_SCALPING_MAX_CAPITAL_ARS=$ %.2f, hasta %d posiciones concurrentes) y sus "
+                "propias reglas de entrada/salida (horizonte en minutos, cierre EOD %s, reversion de "
+                "IV) - NO modifica ni gestiona ninguna posicion de weekly_asymmetric/vol_arbitrage.",
+                self.active_strategy_name, SETTINGS.scalping.max_capital_ars,
+                SETTINGS.scalping.max_concurrent_positions,
+                SETTINGS.scalping.eod_close_time if SETTINGS.scalping.eod_close_enabled else "DESACTIVADO",
             )
 
         # -- Ejecucion -----------------------------------------------------
@@ -378,6 +422,14 @@ class GgalOptionsBot:
             all_signals = self._run_vol_arbitrage_cycle(spot)
         else:
             all_signals = self._run_weekly_asymmetric_cycle(spot)
+
+        # Modulo ADITIVO de Scalping Intradia (ver ScalpingConfig/
+        # GGAL_BOT_ENABLE_SCALPING y el comentario largo en __init__):
+        # corre SIEMPRE DESPUES de la estrategia principal de arriba,
+        # nunca en su lugar - con el flag apagado (default) esta llamada
+        # es un no-op completo.
+        if self.scalping_enabled:
+            all_signals.extend(self._run_scalping_cycle(spot))
 
         totals = self.portfolio.total_greeks()
         if self.risk_manager.should_halt_new_positions(totals):
@@ -748,33 +800,159 @@ class GgalOptionsBot:
 
         return all_signals
 
+    def _run_scalping_cycle(self, spot: float) -> List[object]:
+        """
+        Ciclo del modulo ADITIVO de Scalping Intradia (ver ScalpingConfig/
+        GGAL_BOT_ENABLE_SCALPING) - se llama SIEMPRE DESPUES del ciclo de
+        la estrategia principal (ver recompute_cycle()), nunca en su lugar.
+        Estructura de DOS pasos (deliberadamente SIN paso de spreads: este
+        modo opera unicamente Long Call/Long Put desnudas de alta rotacion,
+        ver docstring de strategy/scalping.py:ScalpingStrategy):
+
+            0) Tendencia intradia MULTI-TIMEFRAME (5m/15m por defecto, ver
+               data/intraday_bars.py:MultiTimeframeIntradayEngine): se
+               alimenta con el spot de ESTE MISMO ciclo (misma fuente que
+               ya usa el resto del bot, no una fuente de datos nueva) y se
+               refresca con su propio cache corto (ScalpingConfig.
+               refresh_interval_seconds, tipicamente 30s).
+            1) SALIDAS primero (ScalpingStrategy.build_exit_signals): Stop
+               Loss/Take Profit ajustados, horizonte de holding en MINUTOS,
+               cierre obligatorio de Fin de Dia (EOD) y salida por
+               reversion de la dislocacion de IV que motivo la entrada.
+            2) ENTRADAS nuevas, respetando el tope de posiciones
+               concurrentes (ScalpingConfig.max_concurrent_positions) para
+               repartir el capital asignado en mas trades de menor tamaño.
+
+        Todas las posiciones que abre este ciclo quedan marcadas
+        `Position.strategy_tag="scalping"` (ver portfolio/portfolio.py) -
+        esa marca es la que mantiene esta gestion completamente aislada de
+        weekly_asymmetric/vol_arbitrage (ver ScalpingStrategy.
+        build_exit_signals y WeeklyAsymmetricStrategy.build_exit_signals,
+        que solo procesan las posiciones marcadas con su propio tag).
+        """
+        assert self.scalping_strategy is not None and self.intraday_engine is not None
+        now = datetime.now(timezone.utc)
+        all_signals: List[object] = []
+
+        # -- 0) Tendencia intradia multi-timeframe -------------------------------
+        self.intraday_engine.on_tick(now, spot)
+        snapshot = self.intraday_engine.refresh(now=now)
+        trend = snapshot.combined_trend
+        if snapshot is not self._scalping_last_ta_snapshot_logged:
+            logger.info(
+                "Tendencia intradia SCALPING (%dm/%dm, %s): %s [5m=%s (%s barras), 15m=%s (%s barras)]",
+                SETTINGS.scalping.fast_bar_interval_minutes, SETTINGS.scalping.slow_bar_interval_minutes,
+                "requiere acuerdo" if snapshot.require_agreement else "solo timeframe rapido",
+                trend, snapshot.fast.trend.value, snapshot.fast.bars_used,
+                snapshot.slow.trend.value, snapshot.slow.bars_used,
+            )
+            self._scalping_last_ta_snapshot_logged = snapshot
+
+        # -- 1) Salidas primero ---------------------------------------------------
+        current_prices = {
+            q.symbol: q.book.mid for q in self.option_chain.all_quotes()
+            if q.book.bid > 0 and q.book.ask > 0
+        }
+        exit_signals = self.scalping_strategy.build_exit_signals(self.portfolio, current_prices, now)
+        all_signals.extend(exit_signals)
+        for ex in exit_signals:
+            logger.info("Salida [Scalping]: %s %s x%.2f - %s", ex.action, ex.symbol, ex.quantity, ex.reason)
+            self._act_on_exit_signal(ex, spot, strategy_tag="scalping")
+
+        # -- Guardia de staleness de datos de mercado (mismo criterio que -------
+        # weekly_asymmetric - ver RiskConfig.max_market_data_staleness_seconds):
+        # las salidas de arriba ya se procesaron con la ultima punta conocida,
+        # pero no se abre exposicion nueva contra un spot desactualizado.
+        if self._is_market_data_stale(now):
+            return all_signals
+
+        # -- Tope de posiciones concurrentes --------------------------------------
+        open_scalping_positions = sum(
+            1 for p in self.portfolio.positions
+            if p.quantity > 0 and p.greeks_per_unit is not None and p.strategy_tag == "scalping"
+        )
+        if open_scalping_positions >= SETTINGS.scalping.max_concurrent_positions:
+            if not self._scalping_max_positions_logged:
+                logger.info(
+                    "Scalping: tope de posiciones concurrentes alcanzado (%d/%d) - no se evaluan "
+                    "entradas nuevas hasta que se libere un cupo (por una salida).",
+                    open_scalping_positions, SETTINGS.scalping.max_concurrent_positions,
+                )
+                self._scalping_max_positions_logged = True
+            return all_signals
+        self._scalping_max_positions_logged = False
+
+        # -- 2) Entradas nuevas ----------------------------------------------------
+        for expiry, quotes in self.option_chain.quotes_by_expiry().items():
+            if open_scalping_positions >= SETTINGS.scalping.max_concurrent_positions:
+                break
+            is_stale_threshold = SETTINGS.risk.max_option_quote_staleness_seconds
+            valid_quotes = [q for q in quotes if q.iv is not None and not q.book.is_stale(is_stale_threshold)]
+            if len(valid_quotes) < 3:
+                continue
+            surface = VolatilitySurface(valid_quotes)
+            order_books = {q.symbol: q.book for q in valid_quotes}
+            entry_signals = self.scalping_strategy.scan_entry_signals(
+                surface, self._recent_volumes, order_books, trend=trend, now=now,
+            )
+            for es in entry_signals:
+                if open_scalping_positions >= SETTINGS.scalping.max_concurrent_positions:
+                    break
+                logger.info(
+                    "Señal [Scalping %s]: %s %s (%.2f vol pts, score conv.=%.4f) - %s",
+                    expiry, es.action, es.symbol, es.iv_dislocation_vol_points, es.convexity_score, es.reason,
+                )
+                before_qty = self._position_quantity(es.symbol)
+                self._act_on_entry_signal(
+                    es, spot, strategy_tag="scalping", position_sizer=self.scalping_position_sizer,
+                )
+                if self._position_quantity(es.symbol) != before_qty:
+                    open_scalping_positions += 1
+                all_signals.append(es)
+
+        return all_signals
+
     def _position_quantity(self, symbol: str) -> float:
         """Posicion neta (signed) actualmente registrada en self.portfolio para `symbol`."""
         return sum(p.quantity for p in self.portfolio.positions if p.symbol == symbol)
 
-    def _capital_available_ars(self) -> float:
+    def _capital_available_ars(self, strategy_tag: str = "weekly_asymmetric") -> float:
         """
-        Capital libre para nuevas entradas bajo el modo Long-First: el techo
-        configurado (`LongFirstConfig.max_capital_ars`) menos lo ya
-        comprometido en posiciones LARGAS DE OPCIONES abiertas, valuado a su
-        propio precio de ENTRADA (no a mercado - ver risk/position_sizer.py,
-        que dimensiona contra capital comprometido, no contra PnL flotante).
-        Nunca negativo.
+        Capital libre para nuevas entradas de la estrategia `strategy_tag`:
+        el techo configurado para ESA estrategia (`LongFirstConfig.
+        max_capital_ars` para "weekly_asymmetric", `ScalpingConfig.
+        max_capital_ars` para "scalping" - ver portfolio.Position.
+        strategy_tag y el modulo ADITIVO de Scalping en config.ScalpingConfig)
+        menos lo ya comprometido en posiciones LARGAS DE OPCIONES abiertas
+        CON ESA MISMA MARCA, valuado a su propio precio de ENTRADA (no a
+        mercado - ver risk/position_sizer.py, que dimensiona contra capital
+        comprometido, no contra PnL flotante). Nunca negativo.
+
+        Cada estrategia tiene su PROPIO pool de capital, completamente
+        separado: una posicion de scalping nunca reduce el capital
+        disponible para weekly_asymmetric y viceversa - una posicion sin
+        marca (`strategy_tag is None`, toda posicion abierta antes de que
+        este parametro existiera, incluida la de Octubre en produccion)
+        cuenta como "weekly_asymmetric", preservando el comportamiento
+        exacto de antes de este parametro para el llamador que no lo pasa.
 
         Se excluye explicitamente la posicion del subyacente que deja el
         delta-hedger (ver _maybe_hedge(): `greeks_per_unit is None` es la
         marca de "esto es el subyacente, no una opcion" - ver
-        portfolio.Position). El presupuesto de capital de este modo es para
+        portfolio.Position). El presupuesto de capital de cada modo es para
         comprar CONVEXIDAD (opciones), no para la cobertura de delta, que es
-        una decision de riesgo separada y no deberia competir por el mismo
-        presupuesto ni reducir el sizing de la proxima señal de entrada.
+        una decision de riesgo separada (global, sobre el delta TOTAL de la
+        cuenta) y no deberia competir por el mismo presupuesto ni reducir el
+        sizing de la proxima señal de entrada de ninguna estrategia.
         """
+        cfg = SETTINGS.long_first if strategy_tag == "weekly_asymmetric" else SETTINGS.scalping
         committed = sum(
             pos.quantity * (pos.entry_price or 0.0) * pos.multiplier
             for pos in self.portfolio.positions
             if pos.quantity > 0 and pos.entry_price is not None and pos.greeks_per_unit is not None
+            and (pos.strategy_tag or "weekly_asymmetric") == strategy_tag
         )
-        return max(0.0, SETTINGS.long_first.max_capital_ars - committed)
+        return max(0.0, cfg.max_capital_ars - committed)
 
     def _option_chain_snapshot(self) -> List[Dict]:
         """
@@ -881,19 +1059,24 @@ class GgalOptionsBot:
                 entry_price=state.avg_fill_price, entry_time=datetime.now(timezone.utc),
             ))
 
-    def _act_on_exit_signal(self, signal, spot: float) -> None:
+    def _act_on_exit_signal(self, signal, spot: float, strategy_tag: str = "weekly_asymmetric") -> None:
         """
         Cierra (sell_to_close) la posicion larga que disparo la señal de
-        salida (ver risk.risk_manager.RiskManager.evaluate_position_exit,
-        unica fuente de verdad de "cuando cerrar" bajo el modo Long-First).
+        salida (ver risk.risk_manager.RiskManager.evaluate_position_exit /
+        evaluate_scalping_exit, unica fuente de verdad de "cuando cerrar"
+        bajo cada modo). `strategy_tag`: solo se vacian posiciones marcadas
+        con este tag (ver portfolio.Position.strategy_tag) - defensivo, ya
+        que en la practica solo existe UN lote abierto por simbolo en todo
+        el bot (ver Guarda 2 de _act_on_entry_signal), de una sola
+        estrategia a la vez.
 
         Igual que _act_on_signal()/_act_on_entry_signal() (modo
-        vol_arbitrage y weekly_asymmetric respectivamente), este metodo
-        asume a lo sumo un lote abierto por base (sin pyramideo - la Guarda
-        2 de _act_on_entry_signal() es la que sostiene esa invariante en
-        este mismo modo): por eso, tras el fill, alcanza con vaciar a 0
-        todas las posiciones largas de ese simbolo, sin necesitar trackear
-        que lote especifico genero la señal.
+        vol_arbitrage y weekly_asymmetric/scalping respectivamente), este
+        metodo asume a lo sumo un lote abierto por base (sin pyramideo - la
+        Guarda 2 de _act_on_entry_signal() es la que sostiene esa
+        invariante): por eso, tras el fill, alcanza con vaciar a 0 todas
+        las posiciones largas marcadas de ese simbolo, sin necesitar
+        trackear que lote especifico genero la señal.
         """
         quote = self.option_chain.get(signal.symbol)
         if quote is None or quote.book.bid <= 0 or quote.book.ask <= 0:
@@ -911,17 +1094,29 @@ class GgalOptionsBot:
 
         if state.status is OrderStatus.FILLED:
             for pos in self.portfolio.positions:
-                if pos.symbol == signal.symbol and pos.quantity > 0:
+                if pos.symbol == signal.symbol and pos.quantity > 0 and (pos.strategy_tag or "weekly_asymmetric") == strategy_tag:
                     pos.quantity = 0.0
 
-    def _act_on_entry_signal(self, signal, spot: float) -> None:
+    def _act_on_entry_signal(
+        self, signal, spot: float, strategy_tag: str = "weekly_asymmetric",
+        position_sizer: Optional[PositionSizer] = None,
+    ) -> None:
         """
-        Compra (buy_to_open) la EntrySignal de WeeklyAsymmetricStrategy,
-        dimensionando la cantidad de contratos via risk/position_sizer.py
-        contra el capital disponible (ver _capital_available_ars()) en vez
-        de un tamaño fijo. Mismas guardas anti-reentrada que _act_on_signal
-        (modo vol_arbitrage): no duplicar sobre una orden en vigilancia ni
-        sobre una posicion ya abierta en esa base.
+        Compra (buy_to_open) la EntrySignal (de WeeklyAsymmetricStrategy o
+        de ScalpingStrategy - ambas producen el mismo dataclass EntrySignal,
+        ver strategy/weekly_asymmetric.py), dimensionando la cantidad de
+        contratos via risk/position_sizer.py contra el capital disponible
+        de `strategy_tag` (ver _capital_available_ars()) en vez de un
+        tamaño fijo. Mismas guardas anti-reentrada que _act_on_signal (modo
+        vol_arbitrage): no duplicar sobre una orden en vigilancia ni sobre
+        una posicion ya abierta en esa base.
+
+        `position_sizer`: instancia a usar (ver run_bot.py.__init__:
+        self.position_sizer para weekly_asymmetric, self.
+        scalping_position_sizer para scalping - cada estrategia tiene el
+        suyo, con su propio capital/riesgo por trade). Si se omite, cae a
+        `self.position_sizer` (comportamiento identico al de antes de este
+        parametro, para cualquier llamador que no lo pase).
         """
         quote = self.option_chain.get(signal.symbol)
         if quote is None or quote.book.bid <= 0 or quote.book.ask <= 0:
@@ -932,7 +1127,10 @@ class GgalOptionsBot:
             logger.debug("Señal %s ignorada: ya hay una orden en vigilancia sobre esa base.", signal.symbol)
             return
 
-        # Guarda 2: ya existe una posicion abierta sobre esta base (sin pyramideo).
+        # Guarda 2: ya existe una posicion abierta sobre esta base (sin
+        # pyramideo) - GLOBAL a todo el bot, no solo a `strategy_tag`: dos
+        # estrategias distintas nunca deben terminar con posiciones
+        # simultaneas sobre la MISMA base.
         if self._position_quantity(signal.symbol) != 0:
             logger.debug("Señal %s ignorada: ya existe una posicion abierta sobre esa base.", signal.symbol)
             return
@@ -942,9 +1140,10 @@ class GgalOptionsBot:
             logger.info("Señal %s descartada: la cuenta ya excede limites de riesgo.", signal.symbol)
             return
 
-        sizing = self.position_sizer.compute_contracts(
+        sizer = position_sizer if position_sizer is not None else self.position_sizer
+        sizing = sizer.compute_contracts(
             premium_price=signal.premium_reference,
-            capital_available_ars=self._capital_available_ars(),
+            capital_available_ars=self._capital_available_ars(strategy_tag),
         )
         if not sizing.is_tradeable:
             logger.info("Señal %s descartada por sizing (%s).", signal.symbol, sizing.rejected_reason)
@@ -961,6 +1160,7 @@ class GgalOptionsBot:
                 multiplier=SETTINGS.instruments.option_multiplier,
                 greeks_per_unit=quote.greeks, expiry=quote.expiry,
                 entry_price=state.avg_fill_price, entry_time=datetime.now(timezone.utc),
+                strategy_tag=strategy_tag,
             ))
 
     def _act_on_spread_completion_signal(self, signal, spot: float) -> None:

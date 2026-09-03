@@ -576,6 +576,163 @@ class LongFirstConfig:
 
 
 # ---------------------------------------------------------------------------
+# Modo "Scalping Intradia y Trading Semanal de Corto Plazo" (a pedido
+# explicito del usuario, 2026-09-03 - ver strategy/scalping.py,
+# data/intraday_bars.py, data/iv_mean_reversion.py).
+#
+# DECISION DE ARQUITECTURA DELIBERADA (leer antes de tocar este bloque o
+# GGAL_BOT_ACTIVE_STRATEGY): este modo NO es un valor mas de
+# StrategyConfig.active/VALID_STRATEGIES de mas abajo. El usuario pidio
+# explicitamente que fuera "un modo nuevo aparte" que deje la posicion viva
+# de Octubre bajo weekly_asymmetric (GGAL_BOT_FORCE_EXPIRY=2026-10-16)
+# "como esta". Como run_bot.py.GgalOptionsBot solo instancia UNA estrategia
+# principal segun StrategyConfig.active (ver mas abajo), agregar "scalping"
+# ahi REEMPLAZARIA a weekly_asymmetric por completo - apagando la gestion
+# de esa posicion de Octubre (Stop Loss/Take Profit/horizonte semanal/
+# guardia de fin de semana dejarian de evaluarse). En cambio, este modo es
+# un modulo ADITIVO gateado por su PROPIO flag independiente (`enabled`
+# abajo / GGAL_BOT_ENABLE_SCALPING, default False): cuando esta prendido,
+# GgalOptionsBot corre self._run_scalping_cycle() SIEMPRE DESPUES del ciclo
+# de la estrategia principal (sea weekly_asymmetric o vol_arbitrage), en la
+# MISMA recompute_cycle(), con su propio capital (max_capital_ars abajo,
+# pool SEPARADO del de LongFirstConfig), su propio position sizer, sus
+# propias posiciones (marcadas Position.strategy_tag="scalping" - ver
+# portfolio/portfolio.py) y sus propias reglas de entrada/salida. Con
+# GGAL_BOT_ENABLE_SCALPING sin setear (default False), absolutamente nada
+# de este bloque tiene ningun efecto - el bot se comporta exactamente igual
+# que antes de este modulo.
+#
+# Reutiliza WeeklyAsymmetricStrategy.scan_entry_signals() por COMPOSICION
+# (no herencia) para el escaneo de entradas - ver strategy/scalping.py -
+# por eso varios campos de aca abajo tienen deliberadamente el MISMO nombre
+# que sus equivalentes en LongFirstConfig (smile_threshold_vol_points,
+# moneyness_band_pct, max_holding_business_days, enable_obi_filter,
+# min_obi_for_entry, require_level_confirmation, level_threshold_vol_points):
+# ese metodo ya es generico/inyectable (no depende de LongFirstConfig en
+# particular, solo de esos nombres de atributo en self.cfg), asi que no
+# hace falta duplicar esa logica de filtrado.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ScalpingConfig:
+    # Interruptor maestro (ver nota de arquitectura arriba): modulo ADITIVO,
+    # apagado por defecto.
+    enabled: bool = _env_bool("GGAL_BOT_ENABLE_SCALPING", False)
+
+    # --- Capital y sizing dinamico (pool SEPARADO del de weekly_asymmetric -
+    # ver run_bot.py:_capital_available_ars()/PositionSizer): mismo capital
+    # total que weekly_asymmetric ($1.000.000 ARS por defecto) pero
+    # repartido en MAS trades de MENOR tamaño (max_risk_pct_per_trade mas
+    # chico que el 20% default de LongFirstConfig) para poder sostener
+    # varias posiciones de scalping concurrentes sin concentrar todo el
+    # capital en una sola - ver max_concurrent_positions abajo.
+    max_capital_ars: float = _env_float("GGAL_BOT_SCALPING_MAX_CAPITAL_ARS", 1_000_000.0)
+    max_risk_pct_per_trade: float = _env_float("GGAL_BOT_SCALPING_MAX_RISK_PCT_PER_TRADE", 0.08)
+    min_contracts_per_trade: int = _env_int("GGAL_BOT_SCALPING_MIN_CONTRACTS_PER_TRADE", 1)
+    max_concurrent_positions: int = _env_int("GGAL_BOT_SCALPING_MAX_CONCURRENT_POSITIONS", 6)
+
+    # --- Filtro de entrada (mismos nombres de atributo que LongFirstConfig -
+    # ver nota de arriba) ---
+    smile_threshold_vol_points: float = _env_float("GGAL_BOT_SCALPING_SMILE_THRESHOLD", 2.0)
+    moneyness_band_pct: float = _env_float("GGAL_BOT_SCALPING_MONEYNESS_BAND_PCT", 0.10)
+    # Horizonte de ELEGIBILIDAD de entrada (dias habiles al vencimiento) -
+    # NO confundir con el horizonte de SALIDA (max_holding_minutes abajo,
+    # en minutos): esto solo filtra que bases se consideran para abrir
+    # (bases de vencimiento muy lejano no sirven para scalping de alta
+    # convexidad), la decision de CUANDO cerrar una posicion ya abierta es
+    # enteramente independiente y se mide en minutos.
+    max_holding_business_days: int = _env_int("GGAL_BOT_SCALPING_MAX_HOLDING_BUSINESS_DAYS", 3)
+    require_level_confirmation: bool = _env_bool("GGAL_BOT_SCALPING_REQUIRE_LEVEL_CONFIRMATION", False)
+    level_threshold_vol_points: float = _env_float("GGAL_BOT_SCALPING_LEVEL_THRESHOLD", 5.0)
+    enable_obi_filter: bool = _env_bool("GGAL_BOT_SCALPING_ENABLE_OBI_FILTER", True)
+    # Mas exigente que el -0.30 default de weekly_asymmetric
+    # (LongFirstConfig.min_obi_for_entry): un scalp de minutos tolera MENOS
+    # desbalance vendedor que uno semanal, porque no hay tiempo de "esperar
+    # a que el libro se acomode" dentro del horizonte de la posicion.
+    min_obi_for_entry: float = _env_float("GGAL_BOT_SCALPING_MIN_OBI_FOR_ENTRY", -0.15)
+
+    # --- Profundidad minima de punta vendedora (ver models/microstructure.py.
+    # passes_min_ask_depth) - requerimiento NUEVO especifico de scalping:
+    # "garantizar fill inmediato" contra un tamaño de ASK razonable, mas
+    # estricto que el OBI de arriba (que solo mira el desbalance RELATIVO,
+    # no el tamaño ABSOLUTO de la punta que la orden va a levantar).
+    enable_min_ask_depth_filter: bool = _env_bool("GGAL_BOT_SCALPING_ENABLE_MIN_ASK_DEPTH_FILTER", True)
+    min_ask_size_for_entry: float = _env_float("GGAL_BOT_SCALPING_MIN_ASK_SIZE", 30.0)
+
+    # --- Salida forzada sobre la PRIMA (ver risk.risk_manager.RiskManager.
+    # evaluate_scalping_exit) - umbrales mas ajustados que weekly_asymmetric
+    # (LongFirstConfig.stop_loss_pct=50%/take_profit_pct=100%): un scalp que
+    # se mueve en contra o a favor lo hace rapido, no hace falta tolerar
+    # tanto rango.
+    stop_loss_pct: float = _env_float("GGAL_BOT_SCALPING_STOP_LOSS_PCT", 0.25)
+    take_profit_pct: float = _env_float("GGAL_BOT_SCALPING_TAKE_PROFIT_PCT", 0.35)
+
+    # --- Horizonte ACELERADO de salida, en MINUTOS (la diferencia central
+    # respecto de weekly_asymmetric, que usa dias habiles) ---
+    max_holding_minutes: float = _env_float("GGAL_BOT_SCALPING_MAX_HOLDING_MINUTES", 120.0)
+    # Cierre preventivo por FALTA DE PROGRESO: si a los `progress_check_minutes`
+    # de abierta la posicion todavia no alcanzo `min_progress_pnl_pct` de
+    # ganancia sobre la prima, se cierra - la tesis de scalping es "moverse
+    # rapido o salir", no sostener una posicion sin señal de que la
+    # dislocacion se esta corrigiendo en la direccion esperada.
+    progress_check_minutes: float = _env_float("GGAL_BOT_SCALPING_PROGRESS_CHECK_MINUTES", 30.0)
+    min_progress_pnl_pct: float = _env_float("GGAL_BOT_SCALPING_MIN_PROGRESS_PNL_PCT", 0.05)
+
+    # --- Cierre obligatorio de Fin de Dia (EOD), en horario de Argentina
+    # (ART = UTC-3 todo el año, sin horario de verano desde 2009 - no se
+    # usa zoneinfo/pytz a proposito solo para esto, ver RiskManager.
+    # _is_past_eod) - NUNCA se sostiene una posicion de scalping durante la
+    # noche/fin de semana, a diferencia de weekly_asymmetric (que sostiene
+    # posiciones varios dias por diseño, con su propia guardia de fin de
+    # semana separada, ver LongFirstConfig.weekend_theta_guard_enabled).
+    eod_close_enabled: bool = _env_bool("GGAL_BOT_SCALPING_EOD_CLOSE_ENABLED", True)
+    eod_close_time: str = _env_str("GGAL_BOT_SCALPING_EOD_CLOSE_TIME", "16:50")
+    eod_timezone_offset_hours: float = _env_float("GGAL_BOT_SCALPING_EOD_TZ_OFFSET_HOURS", -3.0)
+
+    # --- Reversion de IV en alta frecuencia (ver data/iv_mean_reversion.py):
+    # salida ADICIONAL (no reemplaza las de arriba) para cuando la
+    # dislocacion de smile que motivo la entrada ya se corrigio hacia el
+    # comportamiento reciente de esa base en particular (z-score de la
+    # propia serie de dislocaciones, no un umbral fijo en vol points).
+    enable_iv_mean_reversion_exit: bool = _env_bool("GGAL_BOT_SCALPING_ENABLE_IV_REVERSION_EXIT", True)
+    iv_reversion_window_seconds: float = _env_float("GGAL_BOT_SCALPING_IV_REVERSION_WINDOW_SECONDS", 1800.0)
+    iv_reversion_min_samples: int = _env_int("GGAL_BOT_SCALPING_IV_REVERSION_MIN_SAMPLES", 10)
+    iv_reversion_exit_zscore: float = _env_float("GGAL_BOT_SCALPING_IV_REVERSION_EXIT_ZSCORE", 0.5)
+
+    # --- Analisis Tecnico intradia MULTI-TIMEFRAME (ver data/intraday_bars.py,
+    # que REUSA compute_technical_snapshot() de data/technical_analysis.py
+    # sin forkearlo - ver ese modulo). Dos timeframes (rapido/lento, 5m/15m
+    # por defecto) en vez del unico grafico 1D de TechnicalAnalysisConfig;
+    # periodos de indicador mas cortos/rapidos, calibrados para velas de
+    # minutos en vez de diarias. require_multi_timeframe_agreement exige
+    # que AMBOS timeframes coincidan antes de habilitar una direccion (si
+    # no coinciden, NEUTRAL - el estado mas conservador).
+    fast_bar_interval_minutes: int = _env_int("GGAL_BOT_SCALPING_FAST_BAR_MINUTES", 5)
+    slow_bar_interval_minutes: int = _env_int("GGAL_BOT_SCALPING_SLOW_BAR_MINUTES", 15)
+    require_multi_timeframe_agreement: bool = _env_bool("GGAL_BOT_SCALPING_REQUIRE_MTF_AGREEMENT", True)
+    max_bars_retained: int = _env_int("GGAL_BOT_SCALPING_MAX_BARS_RETAINED", 300)
+    refresh_interval_seconds: float = _env_float("GGAL_BOT_SCALPING_TA_REFRESH_SECONDS", 30.0)
+    min_bars_required: int = _env_int("GGAL_BOT_SCALPING_TA_MIN_BARS", 25)
+    ema_fast_period: int = _env_int("GGAL_BOT_SCALPING_TA_EMA_FAST", 9)
+    ema_slow_period: int = _env_int("GGAL_BOT_SCALPING_TA_EMA_SLOW", 21)
+    rsi_period: int = _env_int("GGAL_BOT_SCALPING_TA_RSI_PERIOD", 9)
+    adx_period: int = _env_int("GGAL_BOT_SCALPING_TA_ADX_PERIOD", 9)
+    macd_fast_period: int = _env_int("GGAL_BOT_SCALPING_TA_MACD_FAST", 6)
+    macd_slow_period: int = _env_int("GGAL_BOT_SCALPING_TA_MACD_SLOW", 13)
+    macd_signal_period: int = _env_int("GGAL_BOT_SCALPING_TA_MACD_SIGNAL", 5)
+    adx_trend_threshold: float = _env_float("GGAL_BOT_SCALPING_TA_ADX_THRESHOLD", 15.0)
+    # Momentum Shift interno del snapshot intradia (informativo/logging por
+    # ahora - ver data/intraday_bars.py; distinto del Momentum Shift Override
+    # de TechnicalAnalysisConfig que SI consume WeeklyAsymmetricStrategy.
+    # scan_entry_signals() via SETTINGS.technical_analysis, compartido con
+    # weekly_asymmetric a proposito por ser solo un multiplicador de umbral
+    # generico, no algo especifico de velas diarias).
+    enable_momentum_shift_override: bool = _env_bool("GGAL_BOT_SCALPING_TA_ENABLE_MOMENTUM_OVERRIDE", False)
+    momentum_shift_lookback_bars: int = _env_int("GGAL_BOT_SCALPING_TA_MOMENTUM_LOOKBACK_BARS", 3)
+    momentum_shift_rsi_delta: float = _env_float("GGAL_BOT_SCALPING_TA_MOMENTUM_RSI_DELTA", 10.0)
+
+
+# ---------------------------------------------------------------------------
 # Selector de estrategia activa (ver run_bot.py: GgalOptionsBot.__init__ y
 # recompute_cycle() ramifican todo el ciclo segun este valor)
 # ---------------------------------------------------------------------------
@@ -699,6 +856,7 @@ class Settings:
     long_first: LongFirstConfig = field(default_factory=LongFirstConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     technical_analysis: TechnicalAnalysisConfig = field(default_factory=TechnicalAnalysisConfig)
+    scalping: ScalpingConfig = field(default_factory=ScalpingConfig)
 
 
 SETTINGS = Settings()
