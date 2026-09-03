@@ -102,7 +102,7 @@ def _parse_ts(ts: str) -> datetime:
 def fetch_logs(
     token: str, project_id: str, service_id: str,
     start: datetime, end: datetime, log_type: str = "runtime",
-    page_line_limit: int = 2000,
+    page_line_limit: int = 1000,  # tope maximo real de la API (ver main(): 2000 daba 400)
 ) -> list[dict]:
     """
     Trae TODOS los logs entre start y end, paginando hacia adelante (la API
@@ -184,8 +184,24 @@ def main() -> None:
     parser.add_argument("--type", default="runtime", help="Tipo de log de Northflank (default: runtime). Otros: build, deploy, ingress, mesh, cdn, backup, restore.")
     parser.add_argument("--output", default=None, help="Archivo de salida (default: auto-generado con timestamp).")
     parser.add_argument("--grep", default=None, help="Solo guarda lineas cuyo texto matchee este regex (ej. 'ERROR|WARNING').")
-    parser.add_argument("--line-limit", type=int, default=2000, help="Lineas por pagina de la API (default: 2000).")
+    parser.add_argument(
+        "--line-limit", type=int, default=1000,
+        help="Lineas por pagina de la API (default y tope maximo real de la API: 1000).",
+    )
     args = parser.parse_args()
+
+    # BUG REAL CORREGIDO (reportado por el usuario: la API de Northflank
+    # devolvia 400 - "lineLimit must be less than or equal to 1000"): el
+    # default anterior (2000) ya superaba el tope real de la API, y un
+    # --line-limit pasado a mano tambien podia superarlo. Se corrige el
+    # default a 1000 y se aclara ademas con un tope defensivo aca, para que
+    # un valor invalido nunca llegue a pisar el error 400 de nuevo.
+    if args.line_limit > 1000:
+        print(
+            f"--line-limit={args.line_limit} supera el maximo real de la API de Northflank (1000) - "
+            "se usa 1000.", file=sys.stderr,
+        )
+        args.line_limit = 1000
 
     token = os.getenv("NORTHFLANK_API_TOKEN", "")
     project_id = os.getenv("NORTHFLANK_PROJECT_ID", "")
