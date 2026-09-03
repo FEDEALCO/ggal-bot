@@ -1031,8 +1031,26 @@ class BrokerRestSource(ShadowDataSource):
         # a seguir regalandole presupuesto a vencimientos que el resto del
         # bot (ver run_bot.py y WeeklyAsymmetricStrategy.
         # scan_spread_completion_signals) ya ignora por completo.
+        #
+        # AMPLIACION (2026-09-03, ver config.ScalpingConfig - modulo ADITIVO):
+        # esa premisa ("el resto del bot ya ignora cualquier otro
+        # vencimiento") dejo de ser cierta cuando el modo Scalping esta
+        # activo (SETTINGS.scalping.enabled) - ese modulo corre SIEMPRE,
+        # ademas de weekly_asymmetric, y deliberadamente NO respeta
+        # forced_expiry (busca sus propias bases de corto plazo, ver
+        # run_bot.py._run_scalping_cycle/ScalpingConfig.max_holding_business_days).
+        # Si se le siguiera dedicando el 100% del cupo al vencimiento
+        # forzado en ese caso, el Scalping jamas tendria bid/ask fresco en
+        # ninguna otra expiracion y no podria generar NINGUNA señal. Con
+        # Scalping activo, se amplia a la UNION de [forced_expiry] + las
+        # `expiries_ahead` mas proximas - weekly_asymmetric sigue mirando
+        # UNICAMENTE forced_expiry para sus propias señales (esto solo
+        # cambia que expiraciones tienen cotizacion individual fresca
+        # disponible, no que expiracion puede operar cada estrategia). Con
+        # Scalping apagado (default), el comportamiento es EXACTAMENTE el
+        # de antes de este agregado.
         forced_expiry = SETTINGS.instruments.forced_expiry_date()
-        if forced_expiry is not None:
+        if forced_expiry is not None and not SETTINGS.scalping.enabled:
             relevant_expiries = [forced_expiry] if forced_expiry in by_expiry else []
             if not relevant_expiries:
                 logger.info(
@@ -1042,6 +1060,15 @@ class BrokerRestSource(ShadowDataSource):
                     forced_expiry.isoformat(), reference_spot,
                 )
                 return
+        elif forced_expiry is not None and SETTINGS.scalping.enabled:
+            nearest = sorted(by_expiry.keys())[: max(1, SETTINGS.instruments.expiries_ahead)]
+            relevant_expiries = sorted(set(nearest) | ({forced_expiry} if forced_expiry in by_expiry else set()))
+            logger.debug(
+                "BrokerRestSource: Scalping activo - cupo de puntas individuales repartido entre "
+                "vencimiento forzado (%s, para weekly_asymmetric) y las %d expiraciones mas proximas "
+                "(%s, para scalping).", forced_expiry.isoformat(), SETTINGS.instruments.expiries_ahead,
+                ", ".join(e.isoformat() for e in nearest),
+            )
         else:
             relevant_expiries = sorted(by_expiry.keys())[: max(1, SETTINGS.instruments.expiries_ahead)]
         per_expiry_budget = max(1, self._cfg.individual_quote_max_symbols // len(relevant_expiries))

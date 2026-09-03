@@ -616,6 +616,24 @@ mispricing que motivo la entrada ya se corrigio hacia el comportamiento reciente
 base en particular, sin esperar a que Stop Loss/Take Profit/horizonte lo fuercen por
 otro motivo.
 
+### Interaccion con `GGAL_BOT_FORCE_EXPIRY` (importante si activas Scalping en un
+servicio que ya tiene un vencimiento forzado)
+
+`BrokerRestSource._refresh_near_the_money_quotes_unsafe()` (fuente `broker_rest`/IOL, ver
+`ggal_bot/data/live_shadow_feed.py`) reparte un cupo LIMITADO de refrescos individuales de
+bid/ask entre las expiraciones relevantes. Con `GGAL_BOT_FORCE_EXPIRY` seteado y Scalping
+**apagado**, ese cupo se dedica ENTERO al vencimiento forzado (comportamiento sin cambios
+respecto de antes de este modulo). Con Scalping **activo**, esa regla se amplia
+automaticamente a la UNION de `[vencimiento forzado]` + las `expiries_ahead` expiraciones
+mas proximas — si no fuera asi, el Scalping (que deliberadamente no respeta
+`GGAL_BOT_FORCE_EXPIRY`, busca sus propias bases de corto plazo) nunca tendria bid/ask
+fresco en ninguna expiracion y no podria generar ninguna señal. `weekly_asymmetric` sigue
+mirando UNICAMENTE el vencimiento forzado para sus propias señales — este cambio solo
+afecta que expiraciones tienen cotizacion individual fresca disponible, nunca que
+expiracion puede operar cada estrategia. Ver
+`test_broker_rest_source_near_the_money_refresh_includes_forced_expiry_plus_nearest_when_scalping_enabled`
+en `test_shadow_trading.py`.
+
 ### Como activarlo
 
 Ver la seccion completa de variables en `.env.example` (bloque
@@ -757,7 +775,7 @@ Esto corre paridad put-call, convergencia del solver de IV, deteccion de disloca
 de smile, limites de riesgo y delta-hedger — todo con datos sinteticos, sin necesitar
 conexion a mercado. Si algo falla aca, **no correr `run_bot.py` contra mercado real**.
 
-Suite completa (229 tests, 10 archivos — incluye ejecucion/shadow (multi-fuente,
+Suite completa (230 tests, 10 archivos — incluye ejecucion/shadow (multi-fuente,
 failover e IOL/BrokerRestSource con esquema confirmado incluidos)/dashboard/Long-First/
 seleccion de estrategia/Analisis Tecnico (incluido Momentum Shift)/microestructura/
 guardia de staleness de datos/timeout de pared real/modo Scalping ADITIVO):
