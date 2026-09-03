@@ -52,10 +52,11 @@ GGAL BOT/
     ├── strategy/
     │   ├── delta_hedger.py       # rebalanceo de delta (contado/futuro)
     │   ├── vol_arbitrage.py      # deteccion de descalibres de smile (modo delta-neutral)
-    │   └── weekly_asymmetric.py  # modo "Long-First / Weekly Asymmetric" (ver seccion propia abajo)
+    │   ├── weekly_asymmetric.py  # modo "Long-First / Weekly Asymmetric" (ver seccion propia abajo)
+    │   └── scalping.py           # modo "Scalping Intradia" ADITIVO (ver seccion propia abajo)
     ├── risk/
-    │   ├── risk_manager.py       # limites de vega/gamma, filtros de liquidez, exits del modo Long-First
-    │   └── position_sizer.py     # sizing dinamico por capital para el modo Long-First
+    │   ├── risk_manager.py       # limites de vega/gamma, filtros de liquidez, exits de Long-First y Scalping
+    │   └── position_sizer.py     # sizing dinamico por capital (reusado por Long-First y Scalping)
     └── validation/
         ├── test_quant_engine.py       # tests de sanity sin broker real
         ├── test_execution_pipeline.py # gateway, mid-price exec, delta-hedger, bootstrap
@@ -64,8 +65,9 @@ GGAL BOT/
         ├── test_long_first_mode.py    # sizing, exits y señales del modo Long-First / Weekly Asymmetric
         ├── test_strategy_selector.py  # seleccion de estrategia en run_bot.py y orden salidas-antes-que-entradas
         ├── test_technical_analysis.py # indicadores, clasificacion de tendencia y cache del filtro 1D
-        ├── test_microstructure.py     # Order Book Imbalance en aislamiento
-        └── test_http_utils.py         # timeout de pared real para las llamadas REST a data912.com
+        ├── test_microstructure.py     # Order Book Imbalance y profundidad minima de ASK
+        ├── test_http_utils.py         # timeout de pared real para las llamadas REST a data912.com
+        └── test_scalping_mode.py      # modo Scalping ADITIVO: velas intradia, reversion de IV, exits, aislamiento
 ```
 
 ## Shadow Trading / Live Replay (probar la logica sin arriesgar capital)
@@ -535,6 +537,94 @@ Puntos importantes de diseño:
   sobre un BULLISH/BEARISH todavia vigente; el mecanismo sigue siendo util como
   gatillo explicito y auditable, pero no hay que esperar que dispare en cada reversion.
 
+## Modo "Scalping Intradia y Trading Semanal de Corto Plazo" (ADITIVO)
+
+A pedido explicito del usuario (2026-09-03), se agrego un modo de scalping intradia
+para el mismo universo de opciones de GGAL. **Decision de arquitectura central, leer
+antes de tocar `GGAL_BOT_ACTIVE_STRATEGY` o este modulo**: este modo **no** es un valor
+mas de `GGAL_BOT_ACTIVE_STRATEGY` (que sigue aceptando unicamente `weekly_asymmetric` o
+`vol_arbitrage`, mutuamente excluyentes entre si). En cambio, es un modulo **bolt-on**
+gateado por su propio flag independiente, `GGAL_BOT_ENABLE_SCALPING` (default `false`):
+cuando esta prendido, `GgalOptionsBot._run_scalping_cycle()` corre **siempre despues**
+del ciclo de la estrategia principal, en la **misma** `recompute_cycle()`, con su propio
+capital, sus propias posiciones y sus propias reglas — nunca en lugar de la estrategia
+principal.
+
+El motivo de esta decision: si "scalping" fuera un valor mas del selector de estrategia,
+activarlo **reemplazaria** a `weekly_asymmetric` por completo, apagando la gestion (Stop
+Loss/Take Profit/horizonte semanal/guardia de fin de semana) de cualquier posicion ya
+abierta bajo ese modo — en particular, la posicion viva con vencimiento forzado
+(`GGAL_BOT_FORCE_EXPIRY`) que ya pueda existir en produccion. Con el diseño bolt-on, esa
+posicion sigue gestionada exactamente igual, linea por linea, este o no activado el
+scalping.
+
+### Aislamiento entre estrategias (`Position.strategy_tag`)
+
+Ambos modos comparten el mismo `Portfolio` (y por lo tanto el mismo calculo de griegas
+totales/delta-hedge, que es correctamente **global** a toda la cuenta). Para que nunca se
+pisen entre si, cada posicion queda marcada con `Position.strategy_tag` (`None`/
+`"weekly_asymmetric"` para el modo original, `"scalping"` para este modo nuevo):
+
+- `WeeklyAsymmetricStrategy.build_exit_signals()`/`scan_spread_completion_signals()`
+  **solo** evaluan/cierran posiciones marcadas `"weekly_asymmetric"` (o sin marca, el
+  caso de toda posicion abierta antes de que este campo existiera).
+- `ScalpingStrategy.build_exit_signals()` **solo** evalua/cierra posiciones marcadas
+  `"scalping"`.
+- `GgalOptionsBot._capital_available_ars(strategy_tag)` calcula el capital comprometido
+  **por separado** para cada estrategia — el pool de capital de una nunca reduce el de
+  la otra.
+- La unica guarda **compartida** (deliberadamente) es "no abrir dos posiciones sobre la
+  misma base a la vez" (`_position_quantity`), independientemente de que estrategia la
+  pida.
+
+### Diferencias respecto de Long-First / Weekly Asymmetric
+
+| | Weekly Asymmetric | Scalping (nuevo) |
+|---|---|---|
+| Horizonte de **elegibilidad** de entrada | `GGAL_BOT_MAX_HOLDING_BUSINESS_DAYS` (dias habiles) | `GGAL_BOT_SCALPING_MAX_HOLDING_BUSINESS_DAYS` (dias habiles, mas corto) |
+| Horizonte de **salida** de una posicion abierta | mismo horizonte semanal + guardia de fin de semana | `GGAL_BOT_SCALPING_MAX_HOLDING_MINUTES` — **minutos**, no dias |
+| Tendencia direccional | Analisis Tecnico 1D (EMA/RSI/MACD/ADX diario) | Multi-timeframe intradia (5m/15m por defecto, ver abajo) — exige acuerdo entre ambos timeframes |
+| Cierre de Fin de Dia | no aplica (sostiene posiciones varios dias por diseño) | obligatorio, `GGAL_BOT_SCALPING_EOD_CLOSE_TIME` (hora ART) |
+| Salida por falta de progreso | no existe | si: `GGAL_BOT_SCALPING_PROGRESS_CHECK_MINUTES`/`GGAL_BOT_SCALPING_MIN_PROGRESS_PNL_PCT` |
+| Salida por reversion de IV | no existe (solo compresion de vega) | si: z-score de la dislocacion propia de cada base, ver abajo |
+| Filtro de microestructura | Order Book Imbalance | OBI + profundidad minima de ASK (`GGAL_BOT_SCALPING_MIN_ASK_SIZE`) |
+| Spreads (Bull Call/Bear Put) | si (`scan_spread_completion_signals`) | **no** — solo Long Call/Long Put desnudas, deliberadamente mas simple |
+| Capital | `GGAL_BOT_MAX_CAPITAL_ARS` (pool propio) | `GGAL_BOT_SCALPING_MAX_CAPITAL_ARS` (pool propio, separado) |
+| Concurrencia | sin limite explicito de posiciones simultaneas | `GGAL_BOT_SCALPING_MAX_CONCURRENT_POSITIONS` — reparte el capital en mas trades de menor tamaño |
+
+### Velas intradia sintetizadas en memoria (`ggal_bot/data/intraday_bars.py`)
+
+Ninguna fuente disponible (data912.com, IOL/BrokerRestSource) expone velas intradia de
+GGAL — solo velas diarias y puntas en vivo. `IntradayBarAggregator` arma velas OHLC de
+`N` minutos **localmente**, alimentado con el mismo spot que el bot ya consume cada
+ciclo (no hace falta tick-by-tick real: la cadencia de ~2-5s del bot entra comoda en un
+bucket de 5+ minutos). Reutiliza el dataclass `DailyBar` y `compute_technical_snapshot()`
+de `data/technical_analysis.py` **sin modificarlos** — ver el docstring de ese modulo
+para el porque es seguro (ninguna de las dos piezas depende de que `bar_date` sea unico).
+`MultiTimeframeIntradayEngine` corre dos aggregators (rapido/lento) y solo confirma una
+direccion si ambos timeframes coinciden (`GGAL_BOT_SCALPING_REQUIRE_MTF_AGREEMENT`) —
+si no, NEUTRAL.
+
+### Reversion de IV en alta frecuencia (`ggal_bot/data/iv_mean_reversion.py`)
+
+Ademas del umbral fijo de dislocacion de smile (heredado de
+`WeeklyAsymmetricStrategy.scan_entry_signals`, reusado por composicion — ver
+`ScalpingStrategy`), `IVMeanReversionTracker` mantiene una ventana rodante de la
+dislocacion de **cada base individual** y calcula su z-score. La salida
+`scalping_iv_mean_reversion` dispara cuando ese z-score vuelve a acercarse a 0: la
+mispricing que motivo la entrada ya se corrigio hacia el comportamiento reciente de esa
+base en particular, sin esperar a que Stop Loss/Take Profit/horizonte lo fuercen por
+otro motivo.
+
+### Como activarlo
+
+Ver la seccion completa de variables en `.env.example` (bloque
+`GGAL_BOT_ENABLE_SCALPING`). Con el flag apagado (default), no hace falta tocar ninguna
+otra variable — el bot se comporta exactamente igual que antes de este modulo. Tests:
+`ggal_bot/validation/test_scalping_mode.py` (40 tests: aislamiento entre estrategias,
+agregador de velas intradia, tracker de reversion de IV, exits de `RiskManager`, filtro
+de profundidad de ASK, wiring en `run_bot.py`).
+
 ## Estrategia elegida: Hybrid Trend-Aligned Skew Reversion (razonamiento de diseño)
 
 Esta seccion documenta la decision de arquitectura detras de la estrategia activa por
@@ -667,13 +757,13 @@ Esto corre paridad put-call, convergencia del solver de IV, deteccion de disloca
 de smile, limites de riesgo y delta-hedger — todo con datos sinteticos, sin necesitar
 conexion a mercado. Si algo falla aca, **no correr `run_bot.py` contra mercado real**.
 
-Suite completa (172 tests, 9 archivos — incluye ejecucion/shadow (multi-fuente,
+Suite completa (229 tests, 10 archivos — incluye ejecucion/shadow (multi-fuente,
 failover e IOL/BrokerRestSource con esquema confirmado incluidos)/dashboard/Long-First/
 seleccion de estrategia/Analisis Tecnico (incluido Momentum Shift)/microestructura/
-guardia de staleness de datos/timeout de pared real):
+guardia de staleness de datos/timeout de pared real/modo Scalping ADITIVO):
 
 ```bash
-for f in test_quant_engine test_execution_pipeline test_shadow_trading test_dashboard_pnl test_long_first_mode test_strategy_selector test_technical_analysis test_microstructure test_http_utils; do
+for f in test_quant_engine test_execution_pipeline test_shadow_trading test_dashboard_pnl test_long_first_mode test_strategy_selector test_technical_analysis test_microstructure test_http_utils test_scalping_mode; do
   python -m ggal_bot.validation.$f
 done
 ```

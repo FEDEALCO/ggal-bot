@@ -360,7 +360,7 @@ class WeeklyAsymmetricStrategy:
     def scan_spread_completion_signals(
         self, option_chain: OptionChain, portfolio: Portfolio, trend: str = Trend.NEUTRAL.value,
         max_quote_age_seconds: Optional[float] = None, now: Optional[float] = None,
-        forced_expiry: Optional[date] = None,
+        forced_expiry: Optional[date] = None, strategy_tag: str = "weekly_asymmetric",
     ) -> List[SpreadCompletionSignal]:
         """
         `trend`: misma lectura inyectada que scan_entry_signals(). Bajo
@@ -395,6 +395,16 @@ class WeeklyAsymmetricStrategy:
         larga confirmada ni como candidata a wing) - mismo criterio que el
         filtro equivalente en run_bot.py:_run_weekly_asymmetric_cycle para
         entradas nuevas. Default None = sin filtro (compatible hacia atras).
+
+        `strategy_tag` (ver portfolio.Position.strategy_tag y el modo
+        Scalping ADITIVO en config.ScalpingConfig): solo se consideran
+        posiciones largas confirmadas con esta marca (una posicion sin
+        marca, es decir `None`, cuenta como "weekly_asymmetric" - mismo
+        criterio que _confirmed_long_quantity) - evita que este metodo
+        arme una pata corta sobre una base cuya larga en realidad la abrio
+        el modo Scalping bajo sus propias reglas. Default
+        "weekly_asymmetric" preserva el comportamiento previo a este
+        parametro para cualquier llamador que no lo pase.
         """
         if not self.cfg.enable_spread_completion:
             return []
@@ -416,7 +426,7 @@ class WeeklyAsymmetricStrategy:
             if allowed_option_type is not None and quote.option_type is not allowed_option_type:
                 continue  # filtro direccional tecnico: no se agrega exposicion contraria a la tendencia vigente
 
-            long_qty = self._confirmed_long_quantity(portfolio, quote.symbol)
+            long_qty = self._confirmed_long_quantity(portfolio, quote.symbol, strategy_tag=strategy_tag)
             if long_qty <= 0:
                 # Invariante central de este modulo: sin una posicion larga
                 # ya confirmada en el portafolio para ESTA base especifica,
@@ -439,9 +449,19 @@ class WeeklyAsymmetricStrategy:
         return signals
 
     @staticmethod
-    def _confirmed_long_quantity(portfolio: Portfolio, symbol: str) -> float:
-        """Suma solo exposicion LARGA (quantity > 0) de `symbol` - nunca cuenta posiciones cortas."""
-        return sum(p.quantity for p in portfolio.positions if p.symbol == symbol and p.quantity > 0)
+    def _confirmed_long_quantity(portfolio: Portfolio, symbol: str, strategy_tag: str = "weekly_asymmetric") -> float:
+        """
+        Suma solo exposicion LARGA (quantity > 0) de `symbol` con la marca
+        `strategy_tag` - nunca cuenta posiciones cortas ni posiciones
+        abiertas por OTRA estrategia (ver portfolio.Position.strategy_tag y
+        el modo Scalping ADITIVO en config.ScalpingConfig). Una posicion sin
+        marca (`strategy_tag is None`, el caso de toda posicion abierta
+        antes de que este campo existiera) cuenta como "weekly_asymmetric".
+        """
+        return sum(
+            p.quantity for p in portfolio.positions
+            if p.symbol == symbol and p.quantity > 0 and (p.strategy_tag or "weekly_asymmetric") == strategy_tag
+        )
 
     @staticmethod
     def _find_wing_quote(
@@ -489,6 +509,7 @@ class WeeklyAsymmetricStrategy:
     def build_exit_signals(
         self, portfolio: Portfolio, current_prices: Dict[str, float], now: datetime,
         current_greeks: Optional[Dict[str, Dict[str, float]]] = None,
+        strategy_tag: str = "weekly_asymmetric",
     ) -> List[ExitSignal]:
         """
         `current_prices`: mid vigente por simbolo (ej. desde el
@@ -500,10 +521,24 @@ class WeeklyAsymmetricStrategy:
         (ver risk_manager.evaluate_vega_decay_exit); sin este argumento, esa
         salida simplemente no se evalua (comportamiento identico al de
         antes de agregarla).
+
+        `strategy_tag` (ver portfolio.Position.strategy_tag y el modo
+        Scalping ADITIVO en config.ScalpingConfig): este metodo UNICAMENTE
+        evalua/cierra posiciones marcadas con este tag (una posicion sin
+        marca cuenta como "weekly_asymmetric") - nunca toca una posicion
+        abierta por el modo Scalping (que tiene su propio
+        ScalpingStrategy.build_exit_signals, con reglas de salida
+        completamente distintas: minutos en vez de dias habiles, cierre
+        EOD, reversion de IV). Default "weekly_asymmetric" preserva el
+        comportamiento previo a este parametro para cualquier llamador que
+        no lo pase - incluida la posicion de Octubre en produccion, que no
+        tiene esta marca poblada.
         """
         cfg = self.cfg
         signals: List[ExitSignal] = []
         for position in portfolio.positions:
+            if (position.strategy_tag or "weekly_asymmetric") != strategy_tag:
+                continue  # posicion de OTRA estrategia (ej. Scalping) - no se toca aca
             if position.quantity <= 0:
                 continue  # long-only: no hay pata corta propia que gestionar aca
             if position.entry_price is None or position.entry_time is None or position.expiry is None:

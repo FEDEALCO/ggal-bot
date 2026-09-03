@@ -15,7 +15,7 @@ por run_bot.py).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, Optional
 
 from ggal_bot.data.option_chain import OrderBookSnapshot
@@ -166,3 +166,90 @@ class RiskManager:
         if ratio <= decay_ratio_threshold:
             return "vega_theta_decay"
         return None
+
+    # -----------------------------------------------------------------------
+    # Modo Scalping Intradia (ver config.ScalpingConfig y
+    # strategy/scalping.py:ScalpingStrategy) - modulo ADITIVO, ver la nota
+    # de arquitectura en config.py junto a ScalpingConfig. Equivalente de
+    # evaluate_position_exit()/evaluate_vega_decay_exit() de arriba, pero
+    # para posiciones de scalping: mismas dos primeras reglas (Stop
+    # Loss/Take Profit sobre la PRIMA), horizonte de holding en MINUTOS (no
+    # dias habiles), un cierre preventivo por FALTA DE PROGRESO, y un
+    # cierre OBLIGATORIO de Fin de Dia (EOD) en horario de Argentina -
+    # ninguna posicion de scalping se sostiene de un dia para el otro.
+    # -----------------------------------------------------------------------
+
+    def evaluate_scalping_exit(
+        self,
+        entry_price: Optional[float],
+        current_price: Optional[float],
+        entry_time: datetime,
+        now: datetime,
+        expiry: date,  # noqa: ARG002 - se recibe por simetria con evaluate_position_exit; el horizonte de scalping no depende del vencimiento (ver max_holding_minutes)
+        stop_loss_pct: float,
+        take_profit_pct: float,
+        max_holding_minutes: float,
+        min_progress_pnl_pct: float,
+        progress_check_minutes: float,
+        eod_close_enabled: bool = True,
+        eod_close_time: str = "16:50",
+        eod_timezone_offset_hours: float = -3.0,
+    ) -> Optional[str]:
+        """
+        Devuelve "scalping_stop_loss" | "scalping_take_profit" |
+        "scalping_horizon_expired" | "scalping_no_progress" |
+        "scalping_eod_close", o None si ninguna regla dispara todavia.
+
+        Orden de evaluacion: Stop Loss/Take Profit primero (mismo criterio
+        de PnL% sobre la prima que evaluate_position_exit), despues
+        horizonte acelerado (`max_holding_minutes`) y falta de progreso
+        (`min_progress_pnl_pct` no alcanzado a los `progress_check_minutes`
+        de abierta - "moverse rapido o salir", la tesis central de
+        scalping), y por ultimo el cierre EOD. El cierre EOD es el UNICO
+        que se evalua incluso sin `current_price` disponible (es una
+        guardia de HORARIO, no de PnL - no tiene sentido dejar de forzarlo
+        solo porque no hay una cotizacion fresca en este instante).
+        """
+        if entry_price is None or entry_price <= 0 or current_price is None:
+            if eod_close_enabled and self._is_past_eod(now, eod_close_time, eod_timezone_offset_hours):
+                return "scalping_eod_close"
+            return None
+
+        pnl_pct = (current_price - entry_price) / entry_price
+
+        if pnl_pct <= -abs(stop_loss_pct):
+            return "scalping_stop_loss"
+        if pnl_pct >= abs(take_profit_pct):
+            return "scalping_take_profit"
+
+        minutes_held = (now - entry_time).total_seconds() / 60.0
+        if minutes_held >= max_holding_minutes:
+            return "scalping_horizon_expired"
+        if minutes_held >= progress_check_minutes and pnl_pct < min_progress_pnl_pct:
+            return "scalping_no_progress"
+
+        if eod_close_enabled and self._is_past_eod(now, eod_close_time, eod_timezone_offset_hours):
+            return "scalping_eod_close"
+
+        return None
+
+    @staticmethod
+    def _is_past_eod(now: datetime, eod_close_time: str, tz_offset_hours: float) -> bool:
+        """
+        True si `now` (tz-aware, tipicamente UTC) ya paso la hora de cierre
+        configurada EN HORARIO DE ARGENTINA (ver ScalpingConfig.
+        eod_timezone_offset_hours, default -3.0 = ART todo el año, sin
+        horario de verano desde 2009 - se usa un offset fijo simple en vez
+        de zoneinfo/pytz a proposito, solo para esto no vale agregar esa
+        dependencia). Formato de `eod_close_time`: "HH:MM" (24hs). Un
+        formato invalido se trata de forma conservadora como "todavia no
+        paso el cierre" (un typo de config nunca debe forzar un cierre
+        inesperado).
+        """
+        try:
+            hour_str, minute_str = eod_close_time.split(":")
+            eod_hour, eod_minute = int(hour_str), int(minute_str)
+        except (ValueError, AttributeError):
+            return False
+        local_now = now.astimezone(timezone(timedelta(hours=tz_offset_hours)))
+        return (local_now.hour, local_now.minute) >= (eod_hour, eod_minute)

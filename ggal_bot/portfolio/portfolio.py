@@ -31,6 +31,20 @@ class Position:
     entry_price: Optional[float] = None
     entry_time: Optional[datetime] = None
 
+    # Marca de que ESTRATEGIA abrio esta posicion (ver config.ScalpingConfig
+    # y strategy/scalping.py): None (default, compatibilidad hacia atras)
+    # se trata como "weekly_asymmetric" en todos los puntos que filtran por
+    # esta marca (ver strategy/weekly_asymmetric.py:build_exit_signals/
+    # _confirmed_long_quantity y run_bot.py:_capital_available_ars) - asi,
+    # ninguna posicion abierta ANTES de que este campo existiera (incluida
+    # la posicion de Octubre en produccion) cambia de dueño por este
+    # agregado. El modo Scalping (aditivo, ver config.ScalpingConfig) marca
+    # sus propias posiciones con "scalping" para mantenerlas completamente
+    # aisladas de weekly_asymmetric/vol_arbitrage: cada estrategia evalua y
+    # cierra UNICAMENTE las posiciones con su propia marca (o sin marca,
+    # para "weekly_asymmetric"), nunca las de otra.
+    strategy_tag: Optional[str] = None
+
     def contribution(self) -> Dict[str, float]:
         qty_mult = self.quantity * self.multiplier
         if self.greeks_per_unit is None:

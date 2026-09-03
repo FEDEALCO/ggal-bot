@@ -56,3 +56,23 @@ def passes_obi_filter(book: "OrderBookSnapshot", min_obi: float) -> bool:
     casos); min_obi=-1.0 nunca bloquea nada (rango completo de OBI).
     """
     return order_book_imbalance(book) >= min_obi
+
+
+def passes_min_ask_depth(book: "OrderBookSnapshot", min_ask_size: float) -> bool:
+    """
+    True si el tamaño de la punta VENDEDORA (ask_size) alcanza el minimo
+    configurado - requerimiento especifico del modo Scalping (ver
+    config.ScalpingConfig.min_ask_size_for_entry): a diferencia de
+    passes_obi_filter() (que solo mira el DESBALANCE RELATIVO entre bid y
+    ask), esto exige un tamaño ABSOLUTO minimo en la punta que la orden de
+    compra va a levantar - "profundidad minima para garantizar fill
+    inmediato" (ver requerimiento funcional), pensado para un modo de alta
+    rotacion donde un fill parcial/lento invalida la tesis de la señal
+    entera antes de completarse.
+
+    Un ask_size=0 (libro sin punta vendedora vigente) SIEMPRE falla este
+    filtro, a diferencia de order_book_imbalance() (que trata 0/0 como
+    neutral) - aca la ausencia de punta vendedora es exactamente el caso
+    que se quiere bloquear (no hay contra quien ejecutar la compra).
+    """
+    return book.ask_size >= min_ask_size
