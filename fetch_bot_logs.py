@@ -99,21 +99,58 @@ def _parse_ts(ts: str) -> datetime:
         return datetime.fromisoformat(ts.split(".")[0] + "+00:00")
 
 
-def fetch_logs(
+MAX_RETRIES_PER_PAGE = 5
+REQUEST_TIMEOUT_SECONDS = 60  # ver _request_page_with_retries(): antes 30s, insuficiente en la practica
+
+
+def _request_page_with_retries(url: str, headers: dict, params: dict) -> "requests.Response":
+    """
+    BUG REAL CORREGIDO (reportado por el usuario: ReadTimeoutError a mitad
+    de una descarga larga - ya habia traido 49 paginas/49.000 lineas
+    exitosamente antes de que UNA sola pagina tardara mas de 30s en
+    responder y tirara abajo TODO el script sin guardar nada de lo ya
+    traido). Se reintenta cada pagina individualmente con backoff
+    exponencial ante timeouts/errores de conexion (no ante errores 4xx de
+    la API en si, esos no se solucionan reintentando) antes de darse por
+    vencido. El timeout por request tambien subio de 30s a 60s: una
+    ventana de 48hs con miles de lineas puede tardar mas en armarse del
+    lado de Northflank de lo que tarda una consulta chica.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_RETRIES_PER_PAGE + 1):
+        try:
+            return requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            if attempt == MAX_RETRIES_PER_PAGE:
+                break
+            wait_s = min(2 ** attempt, 30)
+            print(
+                f"  fallo de red ({exc.__class__.__name__}) en el intento {attempt}/{MAX_RETRIES_PER_PAGE} - "
+                f"reintentando en {wait_s}s...", file=sys.stderr,
+            )
+            time.sleep(wait_s)
+    assert last_exc is not None
+    raise last_exc
+
+
+def iter_log_pages(
     token: str, project_id: str, service_id: str,
     start: datetime, end: datetime, log_type: str = "runtime",
     page_line_limit: int = 1000,  # tope maximo real de la API (ver main(): 2000 daba 400)
-) -> list[dict]:
+):
     """
-    Trae TODOS los logs entre start y end, paginando hacia adelante (la API
-    de Northflank no documenta un cursor - se pagina avanzando el
+    Generador que trae los logs entre start y end, paginando hacia adelante
+    (la API de Northflank no documenta un cursor - se pagina avanzando el
     startTime al timestamp del ultimo log recibido en cada tanda, hasta
-    que una tanda vuelve vacia o mas corta que el limite de pagina).
+    que una tanda vuelve vacia o mas corta que el limite de pagina), y
+    entrega (yield) cada tanda apenas llega - para que quien lo consuma
+    (ver main()) pueda ir escribiendo a disco de forma incremental en vez
+    de acumular todo en memoria hasta el final.
     """
     url = f"{API_BASE}/projects/{project_id}/services/{service_id}/logs"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    all_entries: list[dict] = []
     cursor = start
     page = 0
     while cursor < end:
@@ -126,7 +163,7 @@ def fetch_logs(
             "direction": "forward",
             "lineLimit": page_line_limit,
         }
-        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        resp = _request_page_with_retries(url, headers, params)
         if resp.status_code == 401:
             print(
                 "Error 401 (no autorizado): el NORTHFLANK_API_TOKEN es invalido, expiro, o no "
@@ -159,7 +196,7 @@ def fetch_logs(
         if not batch:
             break
 
-        all_entries.extend(batch)
+        yield batch
 
         last_ts = _parse_ts(batch[-1]["ts"])
         next_cursor = last_ts + timedelta(milliseconds=1)
@@ -174,8 +211,6 @@ def fetch_logs(
             break  # ultima tanda: vino mas corta que el limite de pagina
 
         time.sleep(0.15)  # cortesia con el rate limit (1000 req/hora)
-
-    return all_entries
 
 
 def main() -> None:
@@ -225,23 +260,50 @@ def main() -> None:
     end = datetime.now(timezone.utc)
     start = end - timedelta(hours=args.hours)
 
-    print(f"Trayendo logs tipo='{args.type}' desde {_iso(start)} hasta {_iso(end)}...", file=sys.stderr)
-    entries = fetch_logs(token, project_id, service_id, start, end, log_type=args.type, page_line_limit=args.line_limit)
-
+    grep_pattern = None
     if args.grep:
         import re
-        pattern = re.compile(args.grep)
-        entries = [e for e in entries if pattern.search(e.get("log", ""))]
+        grep_pattern = re.compile(args.grep)
 
     output_path = Path(args.output) if args.output else Path(
         f"northflank_logs_{args.hours:g}h_{end.strftime('%Y%m%dT%H%M%SZ')}.log"
     )
-    with output_path.open("w", encoding="utf-8") as f:
-        for e in entries:
-            f.write(f"{e.get('ts', '')} {e.get('log', '')}\n")
+
+    print(f"Trayendo logs tipo='{args.type}' desde {_iso(start)} hasta {_iso(end)}...", file=sys.stderr)
+
+    # Escritura INCREMENTAL (ver iter_log_pages()): cada tanda se vuelca al
+    # archivo de salida apenas llega, en vez de acumular todo en memoria y
+    # escribir recien al final - asi, si una descarga larga se corta a
+    # mitad de camino (ver _request_page_with_retries()), lo ya traido
+    # queda guardado en vez de perderse por completo.
+    written = 0
+    last_ts_written = None
+    try:
+        with output_path.open("w", encoding="utf-8") as f:
+            for batch in iter_log_pages(
+                token, project_id, service_id, start, end,
+                log_type=args.type, page_line_limit=args.line_limit,
+            ):
+                for e in batch:
+                    text = e.get("log", "")
+                    if grep_pattern and not grep_pattern.search(text):
+                        continue
+                    f.write(f"{e.get('ts', '')} {text}\n")
+                    written += 1
+                last_ts_written = batch[-1].get("ts")
+                f.flush()
+    except requests.exceptions.RequestException as exc:
+        print(
+            f"\nSe corto la descarga por un error de red ({exc.__class__.__name__}) despues de agotar "
+            f"los reintentos. Lo ya traido SI quedo guardado: {written} lineas en {output_path.resolve()} "
+            f"(hasta aproximadamente {last_ts_written or 'el inicio de la ventana'}). Volve a correr el "
+            f"script - Northflank suele responder bien al segundo intento ante una caida transitoria.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     print(
-        f"\nListo: {len(entries)} lineas guardadas en {output_path.resolve()} "
+        f"\nListo: {written} lineas guardadas en {output_path.resolve()} "
         f"(ventana: {args.hours:g}hs, tipo={args.type}).", file=sys.stderr,
     )
 
