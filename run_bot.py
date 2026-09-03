@@ -194,11 +194,42 @@ class GgalOptionsBot:
         self.scalping_enabled = SETTINGS.scalping.enabled
         self.scalping_strategy: Optional[ScalpingStrategy] = None
         self.scalping_position_sizer: Optional[PositionSizer] = None
+        self.scalping_risk_manager: Optional[RiskManager] = None
         self.intraday_engine: Optional[MultiTimeframeIntradayEngine] = None
         self._scalping_last_ta_snapshot_logged = None
         self._scalping_max_positions_logged = False
         if self.scalping_enabled:
-            self.scalping_strategy = ScalpingStrategy(self.risk_manager, config=SETTINGS.scalping)
+            # CORRECCION (2026-09-03, ver comentario largo junto a
+            # ScalpingConfig.max_vega_total/max_gamma_total en config.py y
+            # README "Interaccion con el techo de Griegas"): scalping tiene
+            # su PROPIO RiskManager/RiskLimits, NO el self.risk_manager
+            # compartido con weekly_asymmetric/vol_arbitrage. Antes de esta
+            # correccion, un book de weekly_asymmetric que ya excedia el
+            # techo de vega/gamma (evaluado sobre self.portfolio.
+            # total_greeks(), es decir la cuenta ENTERA) bloqueaba tambien
+            # cualquier entrada nueva de scalping via should_halt_new_
+            # positions(), aunque scalping no tuviera ninguna posicion
+            # propia abierta - se confirmo en produccion (vega=9550.13 >
+            # RiskConfig.max_vega_total=5000.0 bloqueando entradas de
+            # ambas estrategias por igual). Con este RiskManager separado,
+            # evaluado solo contra las Griegas de posiciones con
+            # strategy_tag="scalping" (ver _greeks_for_strategy() /
+            # _act_on_entry_signal(risk_manager=...) mas abajo), cada
+            # estrategia queda sujeta unicamente a su propio techo, igual
+            # que ya ocurria con el capital.
+            self.scalping_risk_manager = RiskManager(RiskLimits(
+                max_vega_total=SETTINGS.scalping.max_vega_total,
+                max_gamma_total=SETTINGS.scalping.max_gamma_total,
+                # El piso de liquidez de punta (spread/tamaño de libro/
+                # volumen diario) SI se comparte: mide calidad de mercado
+                # de la cotizacion en si, no presupuesto de cartera de una
+                # estrategia particular - no hay razon para que scalping
+                # tolere una punta de peor calidad que weekly_asymmetric.
+                max_spread_relative=SETTINGS.risk.max_spread_relative,
+                min_book_size=SETTINGS.risk.min_book_size,
+                min_daily_volume=SETTINGS.risk.min_daily_volume,
+            ))
+            self.scalping_strategy = ScalpingStrategy(self.scalping_risk_manager, config=SETTINGS.scalping)
             # Sizer/capital PROPIOS y SEPARADOS del de weekly_asymmetric/
             # vol_arbitrage (ver PositionSizer, que ya soporta overrides por
             # instancia) - ver ScalpingConfig.max_capital_ars/
@@ -905,6 +936,7 @@ class GgalOptionsBot:
                 before_qty = self._position_quantity(es.symbol)
                 self._act_on_entry_signal(
                     es, spot, strategy_tag="scalping", position_sizer=self.scalping_position_sizer,
+                    risk_manager=self.scalping_risk_manager,
                 )
                 if self._position_quantity(es.symbol) != before_qty:
                     open_scalping_positions += 1
@@ -1021,9 +1053,20 @@ class GgalOptionsBot:
             logger.debug("Señal %s ignorada: ya existe una posicion abierta sobre esa base.", signal.symbol)
             return
 
-        totals = self.portfolio.total_greeks()
+        # AISLAMIENTO por strategy_tag (ver Portfolio.greeks_for_strategy_tag
+        # y el mismo fix aplicado a _act_on_entry_signal mas abajo, 2026-09-
+        # 03): las posiciones de este metodo nunca llevan strategy_tag
+        # explicito (quedan en None, ver Position.add() mas abajo), que por
+        # convencion se trata como "weekly_asymmetric" en todo el resto del
+        # bot (ver Position.strategy_tag) - se evalua consistente con eso,
+        # para que un book de scalping corriendo en paralelo (bolt-on, ver
+        # ScalpingConfig) no bloquee entradas de vol_arbitrage ni viceversa.
+        totals = self.portfolio.greeks_for_strategy_tag("weekly_asymmetric")
         if self.risk_manager.should_halt_new_positions(totals):
-            logger.info("Señal %s descartada: la cuenta ya excede limites de riesgo.", signal.symbol)
+            logger.info(
+                "Señal %s descartada: la cartera de '%s' ya excede sus limites de riesgo (Griegas: %s).",
+                signal.symbol, self.active_strategy_name, totals,
+            )
             return
 
         side = OrderSide.SELL if signal.action == "sell" else OrderSide.BUY
@@ -1100,6 +1143,7 @@ class GgalOptionsBot:
     def _act_on_entry_signal(
         self, signal, spot: float, strategy_tag: str = "weekly_asymmetric",
         position_sizer: Optional[PositionSizer] = None,
+        risk_manager: Optional[RiskManager] = None,
     ) -> None:
         """
         Compra (buy_to_open) la EntrySignal (de WeeklyAsymmetricStrategy o
@@ -1117,6 +1161,23 @@ class GgalOptionsBot:
         suyo, con su propio capital/riesgo por trade). Si se omite, cae a
         `self.position_sizer` (comportamiento identico al de antes de este
         parametro, para cualquier llamador que no lo pase).
+
+        `risk_manager`: instancia contra la que se evalua el techo de
+        Griegas de ESTA entrada (ver run_bot.py.__init__: self.risk_manager
+        para weekly_asymmetric/vol_arbitrage, self.scalping_risk_manager
+        para scalping - CORRECCION 2026-09-03, ver comentario largo junto a
+        ScalpingConfig.max_vega_total en config.py: antes de este
+        parametro, todas las estrategias compartian el mismo RiskManager y
+        se evaluaban contra self.portfolio.total_greeks(), es decir la
+        EXPOSICION TOTAL de la cuenta - un book de una estrategia que ya
+        excedia el techo bloqueaba tambien las entradas de la otra, aunque
+        esta ultima no tuviera ninguna posicion propia abierta. Si se
+        omite, cae a `self.risk_manager` (comportamiento identico al de
+        antes de este parametro, para cualquier llamador que no lo pase).
+        Se evalua siempre contra las Griegas de SOLO `strategy_tag` (ver
+        Portfolio.greeks_for_strategy_tag), nunca contra la cuenta entera,
+        para que el aislamiento sea efectivo incluso si dos estrategias
+        terminaran compartiendo el mismo RiskManager.
         """
         quote = self.option_chain.get(signal.symbol)
         if quote is None or quote.book.bid <= 0 or quote.book.ask <= 0:
@@ -1135,9 +1196,13 @@ class GgalOptionsBot:
             logger.debug("Señal %s ignorada: ya existe una posicion abierta sobre esa base.", signal.symbol)
             return
 
-        totals = self.portfolio.total_greeks()
-        if self.risk_manager.should_halt_new_positions(totals):
-            logger.info("Señal %s descartada: la cuenta ya excede limites de riesgo.", signal.symbol)
+        rm = risk_manager if risk_manager is not None else self.risk_manager
+        totals = self.portfolio.greeks_for_strategy_tag(strategy_tag)
+        if rm.should_halt_new_positions(totals):
+            logger.info(
+                "Señal %s descartada: la cartera de '%s' ya excede sus limites de riesgo (Griegas: %s).",
+                signal.symbol, strategy_tag, totals,
+            )
             return
 
         sizer = position_sizer if position_sizer is not None else self.position_sizer

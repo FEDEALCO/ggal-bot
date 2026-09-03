@@ -731,6 +731,40 @@ class ScalpingConfig:
     momentum_shift_lookback_bars: int = _env_int("GGAL_BOT_SCALPING_TA_MOMENTUM_LOOKBACK_BARS", 3)
     momentum_shift_rsi_delta: float = _env_float("GGAL_BOT_SCALPING_TA_MOMENTUM_RSI_DELTA", 10.0)
 
+    # --- Techo de riesgo de Griegas PROPIO de scalping (ver risk/risk_manager.
+    # RiskManager/RiskLimits y run_bot.py:GgalOptionsBot.__init__ ->
+    # self.scalping_risk_manager) ---
+    #
+    # CORRECCION (2026-09-03, ver README "Interaccion con el techo de
+    # Griegas"): originalmente scalping usaba el MISMO RiskManager/
+    # RiskLimits que weekly_asymmetric (self.risk_manager, compartido), y
+    # su gate should_halt_new_positions() se evaluaba contra
+    # self.portfolio.total_greeks() -- es decir, la EXPOSICION TOTAL de la
+    # cuenta, sumando ambas estrategias. Esto rompia el aislamiento por
+    # strategy_tag que ya regia capital (_capital_available_ars) y salidas
+    # (build_exit_signals): en produccion se observo que un libro de
+    # weekly_asymmetric con vega=9550 (por encima del techo default de
+    # RiskConfig.max_vega_total=5000.0) bloqueaba TODAS las entradas
+    # nuevas, incluidas las de scalping, aunque scalping no tuviera
+    # posiciones propias abiertas todavia ("Señal ... descartada: la
+    # cuenta ya excede limites de riesgo." disparado por el book de la
+    # OTRA estrategia).
+    #
+    # La correccion le da a scalping su PROPIO RiskManager/RiskLimits,
+    # evaluado solo contra las Griegas de las posiciones con
+    # strategy_tag="scalping" (ver run_bot.py:_greeks_for_strategy()), de
+    # forma simetrica a como ya funcionaba el capital. Los defaults son
+    # mas chicos que los de weekly_asymmetric (RiskConfig.max_vega_total=
+    # 5000.0/max_gamma_total=2000.0) porque el sizing de scalping es
+    # deliberadamente MENOR por posicion (ver max_risk_pct_per_trade
+    # arriba, 8% vs el 20% default de LongFirstConfig) - un techo propio
+    # mas chico refleja ese capital mas chico por trade, no una tolerancia
+    # de riesgo distinta. El piso de liquidez (spread/book/volumen) sigue
+    # siendo el UNICO compartido (SETTINGS.risk.*), porque mide calidad de
+    # mercado de la punta, no presupuesto de cartera.
+    max_vega_total: float = _env_float("GGAL_BOT_SCALPING_MAX_VEGA_TOTAL", 3000.0)
+    max_gamma_total: float = _env_float("GGAL_BOT_SCALPING_MAX_GAMMA_TOTAL", 1500.0)
+
 
 # ---------------------------------------------------------------------------
 # Selector de estrategia activa (ver run_bot.py: GgalOptionsBot.__init__ y
