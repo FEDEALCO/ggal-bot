@@ -68,11 +68,23 @@ except ImportError:
 # Override solo para tests locales (ver validation/); en uso normal esto
 # siempre apunta a la API real de Northflank.
 API_BASE = os.getenv("NORTHFLANK_API_BASE", "https://api.northflank.com/v1")
-ISO_FMT = "%Y-%m-%dT%H:%M:%S.%fZ"
 
 
 def _iso(dt: datetime) -> str:
-    return dt.strftime(ISO_FMT)[:-3] + "Z"  # milisegundos, no microsegundos
+    """
+    BUG REAL CORREGIDO (reportado por el usuario: la API de Northflank
+    devolvia 400 Bad Request): la version anterior armaba el timestamp
+    recortando los ultimos 3 caracteres del string ya formateado
+    (`strftime("...%f")[: -3]`), asumiendo que eso recortaba de
+    microsegundos (6 digitos) a milisegundos (3 digitos) - pero recortar
+    CARACTERES del string no es lo mismo que recortar DIGITOS: dejaba 4
+    digitos de fraccion de segundo en vez de 3 (ej. "...38.1252Z" en vez
+    de "...38.125Z"), un formato que la API rechazaba. Se arma la fraccion
+    de milisegundos explicitamente a partir de dt.microsecond en vez de
+    recortar el string.
+    """
+    millis = dt.microsecond // 1000
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{millis:03d}Z"
 
 
 def _parse_ts(ts: str) -> datetime:
@@ -133,6 +145,13 @@ def fetch_logs(
             print(f"Rate limit alcanzado, esperando {wait_s:.0f}s...", file=sys.stderr)
             time.sleep(wait_s)
             continue
+        if resp.status_code >= 400:
+            # Se imprime el cuerpo de la respuesta ANTES de levantar la
+            # excepcion: Northflank suele devolver el motivo exacto del
+            # rechazo (ej. un parametro con formato invalido) en el body,
+            # asi que esto deja el error autodiagnosticable sin tener que
+            # ir y venir para pedir mas detalle.
+            print(f"Error {resp.status_code} de la API - cuerpo de la respuesta:\n{resp.text}", file=sys.stderr)
         resp.raise_for_status()
 
         batch = resp.json().get("data", [])
