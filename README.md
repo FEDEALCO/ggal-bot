@@ -754,19 +754,59 @@ iteracion):**
 2. **Salida por compresion de Vega** (`risk_manager.evaluate_vega_decay_exit`,
    `GGAL_BOT_ENABLE_VEGA_DECAY_EXIT` / `GGAL_BOT_VEGA_DECAY_EXIT_RATIO`): la tesis de
    este modo es exposicion a convexidad (gamma/vega), no direccion pura — si el `|vega|`
-   de una posicion ya cayo por debajo de un porcentaje configurable (default 35%) del
-   `|vega|` que tenia al momento de la entrada (comparando siempre contra
-   `Position.greeks_per_unit`, congelado al fill), la tesis que motivo la compra ya se
-   agoto aunque el PnL% de la prima todavia no dispare Stop Loss ni Take Profit. Esto
-   complementa esas reglas — se evalua DESPUES y solo si nada mas disparo ya (ver
-   `test_build_exit_signals_stop_loss_takes_priority_over_vega_decay`) — para no seguir
-   pagando theta por una posicion que dejo de ser la apuesta de convexidad original.
+   de una posicion ya cayo por debajo de un porcentaje configurable (default 20%, ver
+   nota de flexibilizacion mas abajo) del `|vega|` que tenia al momento de la entrada
+   (comparando siempre contra `Position.greeks_per_unit`, congelado al fill), la tesis
+   que motivo la compra ya se agoto aunque el PnL% de la prima todavia no dispare Stop
+   Loss ni Take Profit. Esto complementa esas reglas — se evalua DESPUES y solo si nada
+   mas disparo ya (ver `test_build_exit_signals_stop_loss_takes_priority_over_vega_decay`)
+   — para no seguir pagando theta por una posicion que dejo de ser la apuesta de
+   convexidad original.
 
-Ambas mejoras estan cubiertas por tests dedicados (`test_microstructure.py`, 8 tests;
-mas 8 tests de integracion nuevos en `test_long_first_mode.py`) y son individualmente
-desactivables por config (`enable_obi_filter=false`, `enable_vega_decay_exit=false`)
-para poder aislar su efecto en Shadow Trading antes de confiar en ellas con capital
-real.
+**Tres mejoras adicionales (2026-09-04, a partir del analisis de un export de trades
+real del 01-04/09/2026 — ver seguimiento completo en el historial de commits de ese
+dia):** ese export mostro que las 16 posiciones que quedaron abiertas de un dia para el
+otro perdieron en conjunto -$219.248 (contra +$78.485 de las 56 operaciones resueltas el
+mismo dia), con la peor pata individual en -33.5% sin que el Stop Loss fijo de -50%
+llegara a frenarla a tiempo, y que la salida por compresion de Vega estaba generando
+muchos cierres con PnL bajo apenas unas horas despues de la entrada.
+
+3. **Stop Loss escalonado por dia habil** (`risk_manager.evaluate_position_exit`,
+   `GGAL_BOT_ENABLE_TIERED_STOP_LOSS` / `GGAL_BOT_TIERED_SL_STAGE2_DAY` /
+   `GGAL_BOT_TIERED_SL_STAGE2_PCT` / `GGAL_BOT_TIERED_SL_STAGE3_DAY` /
+   `GGAL_BOT_TIERED_SL_STAGE3_PCT`): en vez de sostener el mismo -50% fijo durante las 5
+   ruedas completas del horizonte semanal, el stop se angosta a medida que pasan los
+   dias habiles desde la entrada (defaults: dias 0-1 → -50% sin cambios, dias 2-3 →
+   -35%, dias ≥4 → -20%) — reduce la cola de perdidas grandes en posiciones multi-dia sin
+   tocar el lado de ganancia (Take Profit +100% nunca se toco en el export analizado; el
+   mejor resultado individual fue +8.82%).
+4. **Toma de ganancia parcial** (`risk_manager.evaluate_partial_profit_take`,
+   `Position.partial_profit_taken`, `GGAL_BOT_ENABLE_PARTIAL_PROFIT_TAKE` /
+   `GGAL_BOT_PARTIAL_PROFIT_TRIGGER_PCT` / `GGAL_BOT_PARTIAL_PROFIT_TAKE_FRACTION`):
+   asegura una fraccion configurable (default 50%) de la posicion apenas el PnL% no
+   realizado supera un umbral (default +15%), en vez de esperar el +100% de Take Profit.
+   Se toma UNA sola vez por posicion (nunca recorta el mismo "runner" en cada ciclo); con
+   menos de 2 contratos no se aplica (no hay fraccion posible que deje un runner). Un
+   cierre TOTAL (Stop Loss/Take Profit/horizonte/guardia de fin de semana/compresion de
+   vega) siempre tiene prioridad sobre esta salida parcial en el mismo ciclo (ver
+   `test_build_exit_signals_partial_profit_take_yields_to_full_close_reason`).
+   `run_bot.py:_act_on_exit_signal` descuenta unicamente la cantidad parcial en vez de
+   vaciar la posicion completa cuando `reason == "partial_profit_take"` — cualquier otro
+   motivo preserva el comportamiento de siempre (vaciar a 0).
+5. **Flexibilizacion de la salida por compresion de Vega** (mismos flags del punto 2,
+   mas `GGAL_BOT_VEGA_DECAY_MIN_HOLDING_HOURS`): el ratio bajo de 0.35 a 0.20 (exige una
+   compresion mas profunda) y se agrego un tiempo minimo de tenencia (default 3hs) antes
+   de que esta salida pueda dispararse en absoluto — el vega de una opcion cercana al
+   dinero puede comprimirse muy rapido con apenas un movimiento del subyacente en las
+   primeras horas de vida de la posicion, sin que la tesis de convexidad haya fallado de
+   verdad todavia.
+
+Todas las mejoras de esta seccion estan cubiertas por tests dedicados (`test_microstructure.py`,
+8 tests; mas 30 tests de integracion nuevos en `test_long_first_mode.py`, incluidos dos a
+nivel `GgalOptionsBot._act_on_exit_signal`) y son individualmente desactivables por
+config (`enable_obi_filter=false`, `enable_vega_decay_exit=false`,
+`enable_tiered_stop_loss=false`, `enable_partial_profit_take=false`) para poder aislar
+su efecto en Shadow Trading antes de confiar en ellas con capital real.
 
 **Disclosure honesto — lo que este diseño NO puede prometer**: "mayor Sharpe Ratio
 posible" es un objetivo de diseño, no un resultado medido. Ninguno de los cambios de

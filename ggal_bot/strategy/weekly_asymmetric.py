@@ -151,7 +151,7 @@ class SpreadCompletionSignal:
 @dataclass
 class ExitSignal:
     symbol: str
-    reason: str            # "stop_loss" | "take_profit" | "weekly_horizon_expired" | "weekend_theta_guard" | "vega_theta_decay"
+    reason: str            # "stop_loss" | "take_profit" | "weekly_horizon_expired" | "weekend_theta_guard" | "vega_theta_decay" | "partial_profit_take"
     action: str = "sell_to_close"
     quantity: float = 0.0
 
@@ -551,6 +551,11 @@ class WeeklyAsymmetricStrategy:
                 stop_loss_pct=cfg.stop_loss_pct, take_profit_pct=cfg.take_profit_pct,
                 max_holding_business_days=cfg.max_holding_business_days,
                 weekend_theta_guard_enabled=cfg.weekend_theta_guard_enabled,
+                enable_tiered_stop_loss=cfg.enable_tiered_stop_loss,
+                tiered_stop_loss_stage2_business_day=cfg.tiered_stop_loss_stage2_business_day,
+                tiered_stop_loss_stage2_pct=cfg.tiered_stop_loss_stage2_pct,
+                tiered_stop_loss_stage3_business_day=cfg.tiered_stop_loss_stage3_business_day,
+                tiered_stop_loss_stage3_pct=cfg.tiered_stop_loss_stage3_pct,
             )
 
             # Salida por compresion de vega (complementa, no reemplaza, lo
@@ -566,8 +571,35 @@ class WeeklyAsymmetricStrategy:
                 reason = self.risk_manager.evaluate_vega_decay_exit(
                     entry_vega=entry_vega, current_vega=current_vega,
                     decay_ratio_threshold=cfg.vega_decay_exit_ratio,
+                    entry_time=position.entry_time, now=now,
+                    min_holding_hours=cfg.vega_decay_min_holding_hours,
                 )
 
             if reason is not None:
                 signals.append(ExitSignal(symbol=position.symbol, reason=reason, quantity=position.quantity))
+                continue
+
+            # Toma de ganancia parcial (complementa, no reemplaza, lo de
+            # arriba): solo se evalua si NADA disparo un cierre total este
+            # ciclo (Stop Loss/Take Profit/horizonte/guardia de fin de
+            # semana/compresion de vega tienen prioridad), si todavia no se
+            # tomo ganancia parcial antes para esta posicion, y si hay al
+            # menos 2 contratos (con 1 solo no hay fraccion posible que deje
+            # un "runner" - ver risk_manager.evaluate_partial_profit_take).
+            if (
+                cfg.enable_partial_profit_take
+                and not position.partial_profit_taken
+                and position.quantity >= 2
+            ):
+                should_take = self.risk_manager.evaluate_partial_profit_take(
+                    entry_price=position.entry_price, current_price=current_price,
+                    already_taken=position.partial_profit_taken,
+                    trigger_pct=cfg.partial_profit_trigger_pct,
+                )
+                if should_take:
+                    partial_qty = math.floor(position.quantity * cfg.partial_profit_take_fraction)
+                    if 0 < partial_qty < position.quantity:
+                        signals.append(ExitSignal(
+                            symbol=position.symbol, reason="partial_profit_take", quantity=partial_qty,
+                        ))
         return signals

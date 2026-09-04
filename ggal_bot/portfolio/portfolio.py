@@ -45,6 +45,18 @@ class Position:
     # para "weekly_asymmetric"), nunca las de otra.
     strategy_tag: Optional[str] = None
 
+    # Toma de ganancia parcial (ver config.LongFirstConfig.
+    # enable_partial_profit_take y risk.risk_manager.RiskManager.
+    # evaluate_partial_profit_take, MEJORA 2026-09-04): True una vez que se
+    # confirmo el fill de la venta parcial (ver run_bot.py:
+    # _act_on_exit_signal) - evita que la misma posicion vuelva a
+    # "recortarse" en cada ciclo mientras el PnL% siga por encima del
+    # umbral (se toma UNA sola vez, el resto queda como "runner"). Default
+    # False por compatibilidad hacia atras: cualquier posicion existente
+    # (incluidas las creadas antes de este campo) nunca tomo ganancia
+    # parcial todavia.
+    partial_profit_taken: bool = False
+
     def contribution(self) -> Dict[str, float]:
         qty_mult = self.quantity * self.multiplier
         if self.greeks_per_unit is None:

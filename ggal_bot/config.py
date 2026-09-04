@@ -541,6 +541,36 @@ class LongFirstConfig:
     stop_loss_pct: float = _env_float("GGAL_BOT_STOP_LOSS_PCT", 0.50)     # -50% de la prima -> cerrar
     take_profit_pct: float = _env_float("GGAL_BOT_TAKE_PROFIT_PCT", 1.00)  # +100% de la prima -> cerrar
 
+    # --- Stop Loss escalonado por dia habil (MEJORA 2026-09-04) ---
+    # Angosta progresivamente stop_loss_pct de arriba a medida que pasan
+    # los dias habiles desde la entrada, en vez de sostener el mismo -50%
+    # fijo durante las 5 ruedas del horizonte semanal completo (ver
+    # risk.risk_manager.RiskManager.evaluate_position_exit para la
+    # justificacion completa, motivada por el analisis del export de
+    # trades del 01-04/09/2026: 16 posiciones multi-dia perdieron hasta
+    # -33.5% sin que el stop fijo de -50% las frenara a tiempo). Default
+    # enabled=True (mejora activa por default; poner en false via env
+    # restaura el stop_loss_pct fijo de siempre).
+    enable_tiered_stop_loss: bool = _env_bool("GGAL_BOT_ENABLE_TIERED_STOP_LOSS", True)
+    tiered_stop_loss_stage2_business_day: int = _env_int("GGAL_BOT_TIERED_SL_STAGE2_DAY", 2)
+    tiered_stop_loss_stage2_pct: float = _env_float("GGAL_BOT_TIERED_SL_STAGE2_PCT", 0.35)
+    tiered_stop_loss_stage3_business_day: int = _env_int("GGAL_BOT_TIERED_SL_STAGE3_DAY", 4)
+    tiered_stop_loss_stage3_pct: float = _env_float("GGAL_BOT_TIERED_SL_STAGE3_PCT", 0.20)
+
+    # --- Toma de ganancia parcial (MEJORA 2026-09-04) ---
+    # Asegura una fraccion de la posicion apenas el PnL% no realizado supera
+    # partial_profit_trigger_pct, en vez de esperar el +100% de Take Profit
+    # (nunca tocado en el export de trades del 01-04/09/2026 - el mejor
+    # resultado individual fue +8.82%). Se toma UNA sola vez por posicion
+    # (ver Position.partial_profit_taken); el resto queda como "runner"
+    # sujeto a las mismas reglas de siempre (ver risk_manager.
+    # evaluate_partial_profit_take y WeeklyAsymmetricStrategy.
+    # build_exit_signals). Con quantity < 2 no se aplica (no hay fraccion
+    # posible que deje un runner).
+    enable_partial_profit_take: bool = _env_bool("GGAL_BOT_ENABLE_PARTIAL_PROFIT_TAKE", True)
+    partial_profit_trigger_pct: float = _env_float("GGAL_BOT_PARTIAL_PROFIT_TRIGGER_PCT", 0.15)
+    partial_profit_take_fraction: float = _env_float("GGAL_BOT_PARTIAL_PROFIT_TAKE_FRACTION", 0.50)
+
     # --- Filtro de entrada: convexidad / moneyness / confirmacion de nivel ---
     smile_threshold_vol_points: float = _env_float("GGAL_BOT_LONGFIRST_SMILE_THRESHOLD", 3.0)
     moneyness_band_pct: float = _env_float("GGAL_BOT_MONEYNESS_BAND_PCT", 0.15)  # |log(K/S)| maximo considerado
@@ -572,7 +602,17 @@ class LongFirstConfig:
     # se cierra para no seguir pagando theta por una posicion que ya no
     # aporta la convexidad que se buscaba.
     enable_vega_decay_exit: bool = _env_bool("GGAL_BOT_ENABLE_VEGA_DECAY_EXIT", True)
-    vega_decay_exit_ratio: float = _env_float("GGAL_BOT_VEGA_DECAY_EXIT_RATIO", 0.35)
+    # FLEXIBILIZADO 2026-09-04 a pedido explicito del usuario: esta salida
+    # estaba generando muchos cierres con PnL bajo (el vega de una opcion
+    # cercana al dinero se comprime rapido con apenas un movimiento del
+    # subyacente en las primeras horas de vida de la posicion, sin que la
+    # tesis de convexidad haya fallado de verdad todavia). Dos cambios:
+    # (1) el ratio bajo de 0.35 a 0.20 (exige una compresion de vega mucho
+    # mas profunda antes de forzar el cierre); (2) un tiempo minimo de
+    # tenencia (vega_decay_min_holding_hours) antes de que esta salida
+    # pueda dispararse en absoluto - ver risk_manager.evaluate_vega_decay_exit.
+    vega_decay_exit_ratio: float = _env_float("GGAL_BOT_VEGA_DECAY_EXIT_RATIO", 0.20)
+    vega_decay_min_holding_hours: float = _env_float("GGAL_BOT_VEGA_DECAY_MIN_HOLDING_HOURS", 3.0)
 
 
 # ---------------------------------------------------------------------------
