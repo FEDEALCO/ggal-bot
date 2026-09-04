@@ -59,11 +59,33 @@ from ggal_bot.data.technical_analysis import TechnicalAnalysisEngine, Trend
 from ggal_bot.data.intraday_bars import MultiTimeframeIntradayEngine
 from ggal_bot.state_writer import StateWriter
 
+def _art_time_converter(seconds: float) -> time.struct_time:
+    """
+    Convierte epoch seconds a hora de Argentina (ART, UTC-3 fijo, sin
+    horario de verano desde 2009 - mismo criterio y mismo offset que
+    risk.risk_manager.RiskManager._is_past_eod, sin agregar una dependencia
+    de zoneinfo/pytz solo para esto) para que %(asctime)s en los logs
+    muestre la hora local de Argentina en vez de la hora del servidor/
+    contenedor (que en Northflank corre en UTC por defecto - ver
+    deploy/). Se asigna como atributo de INSTANCIA del Formatter de abajo
+    (nunca de clase - logging.Formatter.converter, si fuera una funcion
+    Python comun asignada a nivel de clase, se convertiria en metodo ligado
+    y recibiria `self` como primer argumento en vez de los segundos epoch;
+    time.localtime/time.gmtime evitan ese problema en la stdlib solo
+    porque son built-ins de C, no funciones Python).
+    """
+    return time.gmtime(seconds - 3 * 3600)
+
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE, encoding="utf-8")],
 )
+_art_log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+_art_log_formatter.converter = _art_time_converter
+for _handler in logging.root.handlers:
+    _handler.setFormatter(_art_log_formatter)
+
 logger = logging.getLogger("ggal_bot.run_bot")
 
 
@@ -1120,6 +1142,17 @@ class GgalOptionsBot:
         invariante): por eso, tras el fill, alcanza con vaciar a 0 todas
         las posiciones largas marcadas de ese simbolo, sin necesitar
         trackear que lote especifico genero la señal.
+
+        EXCEPCION (MEJORA 2026-09-04, ver risk_manager.
+        evaluate_partial_profit_take): cuando `signal.reason ==
+        "partial_profit_take"` la posicion NO se vacia por completo - se
+        descuenta unicamente `signal.quantity` (la fraccion configurada,
+        ver config.LongFirstConfig.partial_profit_take_fraction) y se marca
+        `Position.partial_profit_taken = True` para que esta salida no
+        vuelva a dispararse sobre el "runner" restante. Cualquier otro
+        motivo de cierre (Stop Loss/Take Profit/horizonte/guardia de fin de
+        semana/compresion de vega, y las salidas de scalping) preserva el
+        comportamiento de siempre: vaciar a 0.
         """
         quote = self.option_chain.get(signal.symbol)
         if quote is None or quote.book.bid <= 0 or quote.book.ask <= 0:
@@ -1136,9 +1169,14 @@ class GgalOptionsBot:
         )
 
         if state.status is OrderStatus.FILLED:
+            is_partial = signal.reason == "partial_profit_take"
             for pos in self.portfolio.positions:
                 if pos.symbol == signal.symbol and pos.quantity > 0 and (pos.strategy_tag or "weekly_asymmetric") == strategy_tag:
-                    pos.quantity = 0.0
+                    if is_partial:
+                        pos.quantity = max(0.0, pos.quantity - signal.quantity)
+                        pos.partial_profit_taken = True
+                    else:
+                        pos.quantity = 0.0
 
     def _act_on_entry_signal(
         self, signal, spot: float, strategy_tag: str = "weekly_asymmetric",

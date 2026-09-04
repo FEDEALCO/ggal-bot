@@ -28,6 +28,13 @@ if __package__ in (None, ""):
 
 from datetime import date, datetime, timedelta, timezone
 
+# Debe importarse ANTES que run_bot/ggal_bot.execution.order_gateway (ver
+# docstring de ese modulo) para redirigir el CSV de auditoria de shadow
+# trading a un path temporal - necesario para los tests de
+# GgalOptionsBot._act_on_exit_signal() de mas abajo (mismo criterio que
+# test_scalping_mode.py).
+from ggal_bot.validation import _shadow_audit_isolation  # noqa: F401
+
 from ggal_bot.config import SETTINGS, LongFirstConfig
 from ggal_bot.data.option_chain import OptionChain, OptionQuote, OrderBookSnapshot
 from ggal_bot.data.technical_analysis import MomentumShift
@@ -37,6 +44,7 @@ from ggal_bot.portfolio.portfolio import Portfolio, Position
 from ggal_bot.risk.position_sizer import PositionSizer
 from ggal_bot.risk.risk_manager import RiskLimits, RiskManager
 from ggal_bot.strategy.weekly_asymmetric import WeeklyAsymmetricStrategy
+from run_bot import GgalOptionsBot
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +85,18 @@ def _default_config(**overrides) -> LongFirstConfig:
         enable_spread_completion=True, spread_wing_moneyness_pct=0.05,
         enable_obi_filter=True, min_obi_for_entry=-0.30,
         enable_vega_decay_exit=True, vega_decay_exit_ratio=0.35,
+        # MEJORAS 2026-09-04: baseline explicitamente "sin efecto" (igual al
+        # comportamiento previo a estas mejoras), independientemente de los
+        # defaults de produccion en config.py (que SI las activan) - asi
+        # ningun test existente que use este helper cambia de resultado;
+        # los tests nuevos de cada mejora las activan explicitamente via
+        # **overrides.
+        enable_tiered_stop_loss=False,
+        tiered_stop_loss_stage2_business_day=2, tiered_stop_loss_stage2_pct=0.35,
+        tiered_stop_loss_stage3_business_day=4, tiered_stop_loss_stage3_pct=0.20,
+        vega_decay_min_holding_hours=0.0,
+        enable_partial_profit_take=False,
+        partial_profit_trigger_pct=0.15, partial_profit_take_fraction=0.50,
     )
     for k, v in overrides.items():
         setattr(cfg, k, v)
@@ -238,6 +258,153 @@ def test_evaluate_vega_decay_exit_sign_agnostic():
     risk_mgr = RiskManager(RiskLimits())
     reason = risk_mgr.evaluate_vega_decay_exit(entry_vega=-10.0, current_vega=-2.0, decay_ratio_threshold=0.35)
     assert reason == "vega_theta_decay"
+
+
+def test_evaluate_vega_decay_exit_blocked_before_min_holding_hours():
+    """
+    FLEXIBILIZACION 2026-09-04: aunque el vega ya se comprimio por debajo
+    del umbral, si la posicion lleva MENOS del tiempo minimo configurado
+    todavia no se fuerza el cierre - le da margen a la posicion para
+    desarrollarse en vez de cortarla con PnL bajo apenas se abrio.
+    """
+    risk_mgr = RiskManager(RiskLimits())
+    entry_time = datetime(2026, 8, 26, 10, 0, tzinfo=timezone.utc)
+    now = entry_time + timedelta(hours=1)  # 1h, por debajo del minimo de 3hs
+    reason = risk_mgr.evaluate_vega_decay_exit(
+        entry_vega=10.0, current_vega=1.0, decay_ratio_threshold=0.20,
+        entry_time=entry_time, now=now, min_holding_hours=3.0,
+    )
+    assert reason is None
+
+
+def test_evaluate_vega_decay_exit_allowed_after_min_holding_hours():
+    """La misma compresion, pero ya paso el tiempo minimo: se dispara normalmente."""
+    risk_mgr = RiskManager(RiskLimits())
+    entry_time = datetime(2026, 8, 26, 10, 0, tzinfo=timezone.utc)
+    now = entry_time + timedelta(hours=4)  # 4h, por encima del minimo de 3hs
+    reason = risk_mgr.evaluate_vega_decay_exit(
+        entry_vega=10.0, current_vega=1.0, decay_ratio_threshold=0.20,
+        entry_time=entry_time, now=now, min_holding_hours=3.0,
+    )
+    assert reason == "vega_theta_decay"
+
+
+def test_evaluate_vega_decay_exit_min_holding_hours_ignored_without_time_args():
+    """Backward-compat: sin entry_time/now (llamador que no los pasa), el gate de tiempo simplemente no aplica."""
+    risk_mgr = RiskManager(RiskLimits())
+    reason = risk_mgr.evaluate_vega_decay_exit(entry_vega=10.0, current_vega=1.0, decay_ratio_threshold=0.20)
+    assert reason == "vega_theta_decay"
+
+
+# ---------------------------------------------------------------------------
+# risk/risk_manager.py: evaluate_position_exit - Stop Loss escalonado por
+# dia habil (MEJORA 2026-09-04, ver docstring de evaluate_position_exit)
+# ---------------------------------------------------------------------------
+
+def test_evaluate_position_exit_tiered_stop_loss_stage1_uses_fixed_pct():
+    """Dias held=1 (< stage2=2): el stop sigue siendo el -50% fijo, -40% todavia no dispara."""
+    risk_mgr = RiskManager(RiskLimits())
+    entry_time = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)  # lunes
+    now = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)         # martes: 1 dia habil despues
+    reason = risk_mgr.evaluate_position_exit(
+        entry_price=100.0, current_price=60.0,  # -40%
+        entry_time=entry_time, now=now, expiry=date(2026, 9, 4),
+        stop_loss_pct=0.50, take_profit_pct=1.00, max_holding_business_days=5,
+        weekend_theta_guard_enabled=False,
+        enable_tiered_stop_loss=True,
+        tiered_stop_loss_stage2_business_day=2, tiered_stop_loss_stage2_pct=0.35,
+        tiered_stop_loss_stage3_business_day=4, tiered_stop_loss_stage3_pct=0.20,
+    )
+    assert reason is None
+
+
+def test_evaluate_position_exit_tiered_stop_loss_stage2_narrows_threshold():
+    """Dias held=2 (>= stage2): el stop se angosta a -35%, -40% ahora si dispara."""
+    risk_mgr = RiskManager(RiskLimits())
+    entry_time = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)  # lunes
+    now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)         # miercoles: 2 dias habiles despues
+    reason = risk_mgr.evaluate_position_exit(
+        entry_price=100.0, current_price=60.0,  # -40%
+        entry_time=entry_time, now=now, expiry=date(2026, 9, 4),
+        stop_loss_pct=0.50, take_profit_pct=1.00, max_holding_business_days=5,
+        weekend_theta_guard_enabled=False,
+        enable_tiered_stop_loss=True,
+        tiered_stop_loss_stage2_business_day=2, tiered_stop_loss_stage2_pct=0.35,
+        tiered_stop_loss_stage3_business_day=4, tiered_stop_loss_stage3_pct=0.20,
+    )
+    assert reason == "stop_loss"
+
+
+def test_evaluate_position_exit_tiered_stop_loss_stage3_narrows_further():
+    """Dias held=4 (>= stage3): el stop se angosta a -20%, una perdida de -25% ya dispara."""
+    risk_mgr = RiskManager(RiskLimits())
+    entry_time = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)  # lunes
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)         # viernes: 4 dias habiles despues
+    reason = risk_mgr.evaluate_position_exit(
+        entry_price=100.0, current_price=75.0,  # -25%
+        entry_time=entry_time, now=now, expiry=date(2026, 9, 4),  # vence otra semana: no interfiere el guardia de viernes
+        stop_loss_pct=0.50, take_profit_pct=1.00, max_holding_business_days=5,
+        weekend_theta_guard_enabled=False,
+        enable_tiered_stop_loss=True,
+        tiered_stop_loss_stage2_business_day=2, tiered_stop_loss_stage2_pct=0.35,
+        tiered_stop_loss_stage3_business_day=4, tiered_stop_loss_stage3_pct=0.20,
+    )
+    assert reason == "stop_loss"
+
+
+def test_evaluate_position_exit_tiered_stop_loss_disabled_preserves_fixed_pct():
+    """Con enable_tiered_stop_loss=False, el mismo caso de arriba (dias=4, -25%) NO dispara: sigue el -50% fijo."""
+    risk_mgr = RiskManager(RiskLimits())
+    entry_time = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    reason = risk_mgr.evaluate_position_exit(
+        entry_price=100.0, current_price=75.0,  # -25%
+        entry_time=entry_time, now=now, expiry=date(2026, 9, 4),
+        stop_loss_pct=0.50, take_profit_pct=1.00, max_holding_business_days=5,
+        weekend_theta_guard_enabled=False,
+        enable_tiered_stop_loss=False,
+    )
+    assert reason is None
+
+
+# ---------------------------------------------------------------------------
+# risk/risk_manager.py: evaluate_partial_profit_take (MEJORA 2026-09-04)
+# ---------------------------------------------------------------------------
+
+def test_evaluate_partial_profit_take_triggers_above_threshold():
+    risk_mgr = RiskManager(RiskLimits())
+    assert risk_mgr.evaluate_partial_profit_take(
+        entry_price=100.0, current_price=116.0, already_taken=False, trigger_pct=0.15,
+    ) is True
+
+
+def test_evaluate_partial_profit_take_boundary_is_inclusive():
+    risk_mgr = RiskManager(RiskLimits())
+    assert risk_mgr.evaluate_partial_profit_take(
+        entry_price=100.0, current_price=115.0, already_taken=False, trigger_pct=0.15,
+    ) is True
+
+
+def test_evaluate_partial_profit_take_not_triggered_below_threshold():
+    risk_mgr = RiskManager(RiskLimits())
+    assert risk_mgr.evaluate_partial_profit_take(
+        entry_price=100.0, current_price=110.0, already_taken=False, trigger_pct=0.15,
+    ) is False
+
+
+def test_evaluate_partial_profit_take_skipped_if_already_taken():
+    """Ya se tomo antes para esta posicion: no se dispara de nuevo aunque el PnL% siga por encima del umbral."""
+    risk_mgr = RiskManager(RiskLimits())
+    assert risk_mgr.evaluate_partial_profit_take(
+        entry_price=100.0, current_price=150.0, already_taken=True, trigger_pct=0.15,
+    ) is False
+
+
+def test_evaluate_partial_profit_take_handles_missing_values():
+    risk_mgr = RiskManager(RiskLimits())
+    assert risk_mgr.evaluate_partial_profit_take(entry_price=None, current_price=150.0, already_taken=False) is False
+    assert risk_mgr.evaluate_partial_profit_take(entry_price=100.0, current_price=None, already_taken=False) is False
+    assert risk_mgr.evaluate_partial_profit_take(entry_price=0.0, current_price=150.0, already_taken=False) is False
 
 
 # ---------------------------------------------------------------------------
@@ -1030,6 +1197,232 @@ def test_build_exit_signals_stop_loss_takes_priority_over_vega_decay():
     assert signals[0].reason == "stop_loss"  # no "vega_theta_decay"
 
 
+# ---------------------------------------------------------------------------
+# strategy/weekly_asymmetric.py: build_exit_signals - Stop Loss escalonado,
+# ventana minima de vega decay, y toma de ganancia parcial (MEJORAS
+# 2026-09-04, ver seguimiento del analisis del export de trades del
+# 01-04/09/2026)
+# ---------------------------------------------------------------------------
+
+def test_build_exit_signals_tiered_stop_loss_triggers_earlier_for_older_position():
+    """
+    Dos posiciones con el mismo PnL% (-40%): la que lleva 1 dia habil NO
+    dispara (stage1, -50% fijo); la que lleva 2 dias habiles SI dispara
+    (stage2, -35%) - confirma que build_exit_signals conecta cfg.
+    enable_tiered_stop_loss/tiered_stop_loss_stage*_business_day/pct hasta
+    evaluate_position_exit().
+    """
+    cfg = _default_config(
+        enable_tiered_stop_loss=True,
+        tiered_stop_loss_stage2_business_day=2, tiered_stop_loss_stage2_pct=0.35,
+        tiered_stop_loss_stage3_business_day=4, tiered_stop_loss_stage3_pct=0.20,
+        weekend_theta_guard_enabled=False,
+    )
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    portfolio = Portfolio()
+    entry_time = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)  # lunes
+    now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)         # miercoles: 2 dias habiles despues
+    portfolio.add(Position(
+        symbol="GFGC_NEW", quantity=5, multiplier=100.0,
+        entry_price=100.0, entry_time=now - timedelta(hours=2), expiry=date(2026, 9, 4),  # 0 dias habiles
+    ))
+    portfolio.add(Position(
+        symbol="GFGC_OLD", quantity=5, multiplier=100.0,
+        entry_price=100.0, entry_time=entry_time, expiry=date(2026, 9, 4),  # 2 dias habiles
+    ))
+    signals = strategy.build_exit_signals(
+        portfolio, current_prices={"GFGC_NEW": 60.0, "GFGC_OLD": 60.0}, now=now,
+    )
+    reasons_by_symbol = {s.symbol: s.reason for s in signals}
+    assert "GFGC_NEW" not in reasons_by_symbol   # 0 dias: stage1, -50% fijo, -40% no alcanza
+    assert reasons_by_symbol.get("GFGC_OLD") == "stop_loss"  # 2 dias: stage2, -35%, -40% si dispara
+
+
+def test_build_exit_signals_vega_decay_min_holding_hours_blocks_early_close():
+    """
+    Misma compresion extrema de vega (20% del entry) en dos posiciones: la
+    abierta hace 1h NO dispara (por debajo del minimo configurado); la
+    abierta hace 4h SI dispara - confirma que build_exit_signals conecta
+    cfg.vega_decay_min_holding_hours hasta evaluate_vega_decay_exit().
+    """
+    cfg = _default_config(vega_decay_exit_ratio=0.35, vega_decay_min_holding_hours=3.0)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    portfolio = Portfolio()
+    now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    portfolio.add(Position(
+        symbol="GFGC_YOUNG", quantity=5, multiplier=100.0,
+        greeks_per_unit={"vega": 10.0, "gamma": 0.05, "delta": 0.5, "theta": -1.0},
+        entry_price=100.0, entry_time=now - timedelta(hours=1), expiry=date(2026, 9, 4),
+    ))
+    portfolio.add(Position(
+        symbol="GFGC_MATURE", quantity=5, multiplier=100.0,
+        greeks_per_unit={"vega": 10.0, "gamma": 0.05, "delta": 0.5, "theta": -1.0},
+        entry_price=100.0, entry_time=now - timedelta(hours=4), expiry=date(2026, 9, 4),
+    ))
+    signals = strategy.build_exit_signals(
+        portfolio, current_prices={"GFGC_YOUNG": 105.0, "GFGC_MATURE": 105.0}, now=now,
+        current_greeks={
+            "GFGC_YOUNG": {"vega": 2.0, "gamma": 0.01, "delta": 0.8, "theta": -0.3},
+            "GFGC_MATURE": {"vega": 2.0, "gamma": 0.01, "delta": 0.8, "theta": -0.3},
+        },
+    )
+    reasons_by_symbol = {s.symbol: s.reason for s in signals}
+    assert "GFGC_YOUNG" not in reasons_by_symbol
+    assert reasons_by_symbol.get("GFGC_MATURE") == "vega_theta_decay"
+
+
+def test_build_exit_signals_partial_profit_take_triggers_above_threshold_with_runner_left():
+    cfg = _default_config(enable_partial_profit_take=True, partial_profit_trigger_pct=0.15, partial_profit_take_fraction=0.50)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    portfolio = Portfolio()
+    now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    portfolio.add(Position(
+        symbol="GFGC5200O", quantity=10, multiplier=100.0,
+        entry_price=100.0, entry_time=now - timedelta(hours=1), expiry=date(2026, 9, 4),
+    ))
+    signals = strategy.build_exit_signals(portfolio, current_prices={"GFGC5200O": 120.0}, now=now)  # +20%
+    assert len(signals) == 1
+    assert signals[0].reason == "partial_profit_take"
+    assert signals[0].quantity == 5  # 50% de 10, deja un runner de 5
+    assert signals[0].action == "sell_to_close"
+
+
+def test_build_exit_signals_partial_profit_take_not_triggered_below_threshold():
+    cfg = _default_config(enable_partial_profit_take=True, partial_profit_trigger_pct=0.15)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    portfolio = Portfolio()
+    now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    portfolio.add(Position(
+        symbol="GFGC5200O", quantity=10, multiplier=100.0,
+        entry_price=100.0, entry_time=now - timedelta(hours=1), expiry=date(2026, 9, 4),
+    ))
+    signals = strategy.build_exit_signals(portfolio, current_prices={"GFGC5200O": 108.0}, now=now)  # +8%
+    assert signals == []
+
+
+def test_build_exit_signals_partial_profit_take_not_retriggered_once_taken():
+    """Position.partial_profit_taken=True (ya se tomo antes): no vuelve a generar señal aunque el PnL% siga alto."""
+    cfg = _default_config(enable_partial_profit_take=True, partial_profit_trigger_pct=0.15)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    portfolio = Portfolio()
+    now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    portfolio.add(Position(
+        symbol="GFGC5200O", quantity=5, multiplier=100.0,
+        entry_price=100.0, entry_time=now - timedelta(hours=1), expiry=date(2026, 9, 4),
+        partial_profit_taken=True,
+    ))
+    signals = strategy.build_exit_signals(portfolio, current_prices={"GFGC5200O": 130.0}, now=now)
+    assert signals == []
+
+
+def test_build_exit_signals_partial_profit_take_skipped_when_disabled():
+    cfg = _default_config(enable_partial_profit_take=False)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    portfolio = Portfolio()
+    now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    portfolio.add(Position(
+        symbol="GFGC5200O", quantity=10, multiplier=100.0,
+        entry_price=100.0, entry_time=now - timedelta(hours=1), expiry=date(2026, 9, 4),
+    ))
+    signals = strategy.build_exit_signals(portfolio, current_prices={"GFGC5200O": 130.0}, now=now)
+    assert signals == []
+
+
+def test_build_exit_signals_partial_profit_take_skipped_with_single_contract():
+    """Con quantity=1 no hay fraccion posible que deje un runner: no se toma ganancia parcial."""
+    cfg = _default_config(enable_partial_profit_take=True, partial_profit_trigger_pct=0.15)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    portfolio = Portfolio()
+    now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    portfolio.add(Position(
+        symbol="GFGC5200O", quantity=1, multiplier=100.0,
+        entry_price=100.0, entry_time=now - timedelta(hours=1), expiry=date(2026, 9, 4),
+    ))
+    signals = strategy.build_exit_signals(portfolio, current_prices={"GFGC5200O": 130.0}, now=now)
+    assert signals == []
+
+
+def test_build_exit_signals_partial_profit_take_yields_to_full_close_reason():
+    """Si Stop Loss/Take Profit/horizonte/vega decay ya dispararon, la toma de ganancia parcial ni se evalua."""
+    cfg = _default_config(
+        stop_loss_pct=0.50, enable_partial_profit_take=True, partial_profit_trigger_pct=0.15,
+    )
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    portfolio = Portfolio()
+    now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    portfolio.add(Position(
+        symbol="GFGC5200O", quantity=10, multiplier=100.0,
+        entry_price=100.0, entry_time=now - timedelta(hours=1), expiry=date(2026, 9, 4),
+    ))
+    # +110%: dispara take_profit, muy por encima tambien del umbral de ganancia parcial (+15%)
+    signals = strategy.build_exit_signals(portfolio, current_prices={"GFGC5200O": 210.0}, now=now)
+    assert len(signals) == 1
+    assert signals[0].reason == "take_profit"
+    assert signals[0].quantity == 10  # cierre TOTAL, no la fraccion parcial
+
+
+# ---------------------------------------------------------------------------
+# run_bot.py: GgalOptionsBot._act_on_exit_signal - ejecucion de la señal de
+# salida contra el portafolio (MEJORA 2026-09-04: rama nueva para
+# "partial_profit_take" que descuenta cantidad en vez de vaciar la
+# posicion - ver docstring de ese metodo).
+# ---------------------------------------------------------------------------
+
+def test_bot_act_on_exit_signal_full_close_zeroes_position():
+    original_shadow = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True  # fill sincronico (ver order_gateway.py.send)
+    try:
+        bot = GgalOptionsBot()
+        now = datetime.now(timezone.utc)
+        bot.portfolio.add(Position(
+            symbol="GFCLOSETEST", quantity=10, multiplier=100.0,
+            entry_price=100.0, entry_time=now - timedelta(hours=1),
+            expiry=date(2026, 9, 4), strategy_tag="weekly_asymmetric",
+        ))
+        quote = _quote("GFCLOSETEST", 5200, 0.45, 5200.0, days_biz=3, bid=39.0, ask=41.0)
+        bot.option_chain.upsert_quote(quote)
+
+        strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=_default_config(stop_loss_pct=0.50))
+        signals = strategy.build_exit_signals(bot.portfolio, current_prices={"GFCLOSETEST": 40.0}, now=now)
+        assert len(signals) == 1 and signals[0].reason == "stop_loss"
+
+        bot._act_on_exit_signal(signals[0], spot=5200.0)
+
+        pos = next(p for p in bot.portfolio.positions if p.symbol == "GFCLOSETEST")
+        assert pos.quantity == 0.0
+        assert pos.partial_profit_taken is False
+    finally:
+        SETTINGS.shadow.enabled = original_shadow
+
+
+def test_bot_act_on_exit_signal_partial_profit_take_reduces_quantity_and_sets_flag():
+    original_shadow = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True
+    try:
+        bot = GgalOptionsBot()
+        now = datetime.now(timezone.utc)
+        bot.portfolio.add(Position(
+            symbol="GFPARTIALTEST", quantity=10, multiplier=100.0,
+            entry_price=100.0, entry_time=now - timedelta(hours=1),
+            expiry=date(2026, 9, 4), strategy_tag="weekly_asymmetric",
+        ))
+        quote = _quote("GFPARTIALTEST", 5200, 0.45, 5200.0, days_biz=3, bid=119.0, ask=121.0)
+        bot.option_chain.upsert_quote(quote)
+
+        cfg = _default_config(enable_partial_profit_take=True, partial_profit_trigger_pct=0.15, partial_profit_take_fraction=0.50)
+        strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+        signals = strategy.build_exit_signals(bot.portfolio, current_prices={"GFPARTIALTEST": 120.0}, now=now)
+        assert len(signals) == 1 and signals[0].reason == "partial_profit_take" and signals[0].quantity == 5
+
+        bot._act_on_exit_signal(signals[0], spot=5200.0)
+
+        pos = next(p for p in bot.portfolio.positions if p.symbol == "GFPARTIALTEST")
+        assert pos.quantity == 5.0
+        assert pos.partial_profit_taken is True
+    finally:
+        SETTINGS.shadow.enabled = original_shadow
+
+
 ALL_TESTS = [
     test_position_sizer_applies_floor_division_formula,
     test_position_sizer_rejects_when_capital_insufficient_for_one_contract,
@@ -1047,6 +1440,18 @@ ALL_TESTS = [
     test_evaluate_vega_decay_exit_boundary_is_inclusive,
     test_evaluate_vega_decay_exit_handles_missing_values,
     test_evaluate_vega_decay_exit_sign_agnostic,
+    test_evaluate_vega_decay_exit_blocked_before_min_holding_hours,
+    test_evaluate_vega_decay_exit_allowed_after_min_holding_hours,
+    test_evaluate_vega_decay_exit_min_holding_hours_ignored_without_time_args,
+    test_evaluate_position_exit_tiered_stop_loss_stage1_uses_fixed_pct,
+    test_evaluate_position_exit_tiered_stop_loss_stage2_narrows_threshold,
+    test_evaluate_position_exit_tiered_stop_loss_stage3_narrows_further,
+    test_evaluate_position_exit_tiered_stop_loss_disabled_preserves_fixed_pct,
+    test_evaluate_partial_profit_take_triggers_above_threshold,
+    test_evaluate_partial_profit_take_boundary_is_inclusive,
+    test_evaluate_partial_profit_take_not_triggered_below_threshold,
+    test_evaluate_partial_profit_take_skipped_if_already_taken,
+    test_evaluate_partial_profit_take_handles_missing_values,
     test_scan_entry_signals_emits_buy_signal_for_cheap_base_in_band_and_horizon,
     test_scan_entry_signals_never_emits_signal_for_expensive_base,
     test_scan_entry_signals_excludes_bases_beyond_weekly_horizon,
@@ -1083,6 +1488,16 @@ ALL_TESTS = [
     test_build_exit_signals_vega_decay_skipped_without_current_greeks,
     test_build_exit_signals_vega_decay_disabled_by_config,
     test_build_exit_signals_stop_loss_takes_priority_over_vega_decay,
+    test_build_exit_signals_tiered_stop_loss_triggers_earlier_for_older_position,
+    test_build_exit_signals_vega_decay_min_holding_hours_blocks_early_close,
+    test_build_exit_signals_partial_profit_take_triggers_above_threshold_with_runner_left,
+    test_build_exit_signals_partial_profit_take_not_triggered_below_threshold,
+    test_build_exit_signals_partial_profit_take_not_retriggered_once_taken,
+    test_build_exit_signals_partial_profit_take_skipped_when_disabled,
+    test_build_exit_signals_partial_profit_take_skipped_with_single_contract,
+    test_build_exit_signals_partial_profit_take_yields_to_full_close_reason,
+    test_bot_act_on_exit_signal_full_close_zeroes_position,
+    test_bot_act_on_exit_signal_partial_profit_take_reduces_quantity_and_sets_flag,
 ]
 
 

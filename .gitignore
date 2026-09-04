@@ -24,3 +24,17 @@ venv/
 
 # Cache local pesado, no hace falta para correr el bot en el contenedor.
 instruments_sample.json
+
+# Secretos/tokens sueltos, movidos ahi para no commitearlos nunca (ver
+# limpieza del 2026-09-04 - mover a un gestor de contraseñas cuando puedas).
+_tokens_no_subir/
+
+# Log gigante de 24hs (no es codigo, y pesa cientos de MB - no pertenece al repo).
+ultimas24hs.log
+
+# Datos de operaciones reales - no pertenece al repo.
+Operaciones/
+
+# Bundle temporal usado para restaurar el historial de git.
+*.bundle
+*.patch

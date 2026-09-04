@@ -95,6 +95,11 @@ class RiskManager:
         take_profit_pct: float,
         max_holding_business_days: int,
         weekend_theta_guard_enabled: bool = True,
+        enable_tiered_stop_loss: bool = False,
+        tiered_stop_loss_stage2_business_day: int = 2,
+        tiered_stop_loss_stage2_pct: float = 0.35,
+        tiered_stop_loss_stage3_business_day: int = 4,
+        tiered_stop_loss_stage3_pct: float = 0.20,
     ) -> Optional[str]:
         """
         Devuelve el motivo de cierre forzado ("stop_loss", "take_profit",
@@ -110,18 +115,49 @@ class RiskManager:
         la perdida maxima que este modo tolera antes de cortar, en vez de
         dejar que la opcion siga perdiendo valor tiempo hasta el
         vencimiento.
+
+        `enable_tiered_stop_loss` (MEJORA 2026-09-04, ver seguimiento del
+        analisis del export de trades del 01-04/09/2026 - docs/ auditoria
+        de esa fecha): angosta progresivamente el Stop Loss a medida que
+        pasan los dias habiles desde la entrada, en vez de sostener el
+        mismo -stop_loss_pct% fijo durante las 5 ruedas del horizonte
+        semanal completo. Motivo real: ese export mostro 16 posiciones que
+        quedaron abiertas de un dia para el otro, con perdidas de hasta
+        -33.5% sin que el stop fijo de -50% llegara a frenarlas a tiempo -
+        angostar el stop a medida que se acerca el limite del horizonte
+        reduce esa cola de perdidas sin tocar el lado de ganancia (el mejor
+        resultado observado en esa ventana fue apenas +8.82%, muy lejos del
+        +100% de Take Profit). Los "stages" son ACUMULATIVOS por dias
+        habiles mantenidos (no dias corridos):
+            dias < tiered_stop_loss_stage2_business_day            -> stop_loss_pct tal cual (sin cambios)
+            tiered_stop_loss_stage2_business_day <= dias < stage3   -> tiered_stop_loss_stage2_pct
+            dias >= tiered_stop_loss_stage3_business_day            -> tiered_stop_loss_stage3_pct
+        Se espera stage2_pct <= stop_loss_pct y stage3_pct <= stage2_pct
+        (angostar, nunca ensanchar) pero esto NO se valida aca (ver
+        config.LongFirstConfig) - un typo de config que ensanche el stop en
+        vez de angostarlo no crashea, solo deja de cumplir el objetivo de
+        la mejora. Default `enable_tiered_stop_loss=False`: backward-
+        compatible para cualquier llamador que no lo pase (incluidos los
+        tests existentes) - preserva el stop_loss_pct fijo de siempre.
         """
         if entry_price is None or entry_price <= 0 or current_price is None:
             return None
 
         pnl_pct = (current_price - entry_price) / entry_price
+        holding_business_days = _business_days_between(entry_time.date(), now.date())
 
-        if pnl_pct <= -abs(stop_loss_pct):
+        effective_stop_loss_pct = abs(stop_loss_pct)
+        if enable_tiered_stop_loss:
+            if holding_business_days >= tiered_stop_loss_stage3_business_day:
+                effective_stop_loss_pct = abs(tiered_stop_loss_stage3_pct)
+            elif holding_business_days >= tiered_stop_loss_stage2_business_day:
+                effective_stop_loss_pct = abs(tiered_stop_loss_stage2_pct)
+
+        if pnl_pct <= -effective_stop_loss_pct:
             return "stop_loss"
         if pnl_pct >= abs(take_profit_pct):
             return "take_profit"
 
-        holding_business_days = _business_days_between(entry_time.date(), now.date())
         if holding_business_days >= max_holding_business_days:
             return "weekly_horizon_expired"
 
@@ -140,6 +176,9 @@ class RiskManager:
         entry_vega: Optional[float],
         current_vega: Optional[float],
         decay_ratio_threshold: float = 0.35,
+        entry_time: Optional[datetime] = None,
+        now: Optional[datetime] = None,
+        min_holding_hours: float = 0.0,
     ) -> Optional[str]:
         """
         Complementa (no reemplaza) evaluate_position_exit(): la tesis de
@@ -159,13 +198,72 @@ class RiskManager:
         ausentes (None) o `entry_vega == 0` (no deberia pasar en la
         practica: toda opcion con greeks validos tiene vega != 0), no se
         evalua nada - la ausencia de informacion nunca fuerza un cierre.
+
+        `entry_time`/`now`/`min_holding_hours` (FLEXIBILIZACION 2026-09-04,
+        a pedido explicito del usuario: esta salida estaba generando muchos
+        cierres con PnL bajo - el vega de una opcion ATM/cercana al dinero
+        puede comprimirse muy rapido apenas el subyacente se mueve un poco
+        en las primeras horas de vida de la posicion, sin que eso signifique
+        todavia que la tesis de convexidad fallo de verdad). Si se pasan los
+        tres y `min_holding_hours > 0`, esta salida NO se evalua hasta que la
+        posicion lleve al menos `min_holding_hours` horas abierta - le da
+        tiempo a la posicion a desarrollarse antes de cortarla por
+        compresion de vega. Default `min_holding_hours=0.0` (con
+        `entry_time`/`now` en None por default tambien): backward-compatible
+        para cualquier llamador que no los pase (incluidos los tests
+        existentes) - sin gate de tiempo, identico al comportamiento previo.
         """
         if entry_vega is None or current_vega is None or entry_vega == 0:
             return None
+        if entry_time is not None and now is not None and min_holding_hours > 0:
+            hours_held = (now - entry_time).total_seconds() / 3600.0
+            if hours_held < min_holding_hours:
+                return None
         ratio = abs(current_vega) / abs(entry_vega)
         if ratio <= decay_ratio_threshold:
             return "vega_theta_decay"
         return None
+
+    def evaluate_partial_profit_take(
+        self,
+        entry_price: Optional[float],
+        current_price: Optional[float],
+        already_taken: bool,
+        trigger_pct: float = 0.15,
+    ) -> bool:
+        """
+        MEJORA 2026-09-04 (ver seguimiento del analisis del export de trades
+        del 01-04/09/2026): complementa (no reemplaza) evaluate_position_exit()
+        - se evalua UNICAMENTE si esa funcion (y evaluate_vega_decay_exit) no
+        devolvieron ya un motivo de cierre TOTAL para el mismo ciclo (ver
+        WeeklyAsymmetricStrategy.build_exit_signals, que respeta ese orden de
+        prioridad). En esa ventana ninguna operacion llego a tocar el
+        +100% de Take Profit (el mejor resultado individual fue +8.82%), asi
+        que una parte de la ganancia no realizada terminaba dandose vuelta
+        antes del cierre final - esta salida asegura una FRACCION de la
+        posicion (ver config.LongFirstConfig.partial_profit_take_fraction)
+        apenas el PnL% no realizado supera `trigger_pct`, dejando el resto
+        como "runner" sujeto a las mismas reglas de siempre.
+
+        Devuelve True si corresponde tomar ganancia parcial en este ciclo,
+        False en cualquier otro caso (incluida la ausencia de datos). NO
+        calcula la cantidad a vender ni marca nada como ya tomado - eso es
+        responsabilidad del llamador (ver Position.partial_profit_taken,
+        poblado recien cuando el fill de venta parcial se confirma, nunca
+        antes, en run_bot.py:_act_on_exit_signal).
+
+        `already_taken`: si ya se tomo ganancia parcial antes para esta
+        misma posicion (Position.partial_profit_taken), esta salida no
+        vuelve a dispararse - se toma UNA sola vez por posicion, nunca en
+        cada ciclo mientras el PnL% siga por encima del umbral (eso vaciaria
+        el "runner" de a poco en vez de una unica vez).
+        """
+        if already_taken:
+            return False
+        if entry_price is None or entry_price <= 0 or current_price is None:
+            return False
+        pnl_pct = (current_price - entry_price) / entry_price
+        return pnl_pct >= abs(trigger_pct)
 
     # -----------------------------------------------------------------------
     # Modo Scalping Intradia (ver config.ScalpingConfig y
