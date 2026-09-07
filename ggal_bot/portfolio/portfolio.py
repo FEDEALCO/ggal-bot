@@ -9,6 +9,7 @@ la del mes siguiente, ver docs de diseño seccion 1.2).
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Dict, List, Optional
@@ -56,6 +57,34 @@ class Position:
     # (incluidas las creadas antes de este campo) nunca tomo ganancia
     # parcial todavia.
     partial_profit_taken: bool = False
+
+    # position_id (Fase 5.3, ver GGAL_BOT/analysis/AUDITORIA_FASE5.3_*.md):
+    # identidad ESTABLE de esta posicion durante todo su lifecycle (ENTRY ->
+    # ADD -> REDUCE -> PARTIAL_EXIT -> CLOSE). Se genera UNA sola vez al
+    # crear el objeto (default_factory, nunca se reasigna despues) y
+    # sobrevive aunque quantity llegue a 0 (los objetos Position con
+    # quantity=0 siguen en Portfolio.positions, nunca se remueven - ver
+    # Portfolio.add()). Antes de este campo, la unica identidad de una
+    # posicion era su lugar en la lista + symbol, indistinguible de otra
+    # Position del mismo symbol abierta despues (ver
+    # AUDITORIA_FASE5.2_LIFECYCLE_ROOT_CAUSE.md SS6 "Multiple Position
+    # Objects Test" y AUDITORIA_FASE5.2B_*.md SS1, el bug de over-close en
+    # run_bot.py::_act_on_exit_signal que este campo permite corregir).
+    position_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+
+    # contract_key (Fase 5.3): identidad de CONTRATO explicita
+    # (underlying|option_type|strike|expiry), independiente del ticker
+    # crudo (`symbol`). LIMITACION EXPLICITA (no resuelta en esta fase):
+    # sigue dependiendo de que el llamador pase `expiry` (ya existente en
+    # Position) - si dos contratos distintos llegaran a compartir el mismo
+    # string `symbol` en una rotacion de vencimiento, `contract_key` los
+    # distingue; si el llamador no puebla `expiry`, contract_key queda en
+    # None (nunca se fabrica un valor ficticio). No se usa todavia para
+    # ninguna decision de negocio (Guarda 2 sigue comparando por `symbol`
+    # via _position_quantity()) - es un campo de identidad/observabilidad,
+    # el cambio de comportamiento de Guarda 2 queda fuera del alcance de
+    # esta fase (ver AUDITORIA_FASE5.3_*.md, seccion de alcance).
+    contract_key: Optional[str] = None
 
     def contribution(self) -> Dict[str, float]:
         qty_mult = self.quantity * self.multiplier
