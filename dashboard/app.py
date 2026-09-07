@@ -39,7 +39,8 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from ggal_bot.config import SETTINGS  # noqa: E402
-from ggal_bot.paths import SHADOW_TRADES_LOG, STATE_FILE  # noqa: E402
+from ggal_bot.paths import POSITION_EVENTS_LOG, SHADOW_TRADES_LOG, STATE_FILE  # noqa: E402
+from ggal_bot.risk.kill_switch import KillSwitch  # noqa: E402
 from dashboard import pnl_engine as pe  # noqa: E402
 
 st.set_page_config(page_title="GGAL BOT — Dashboard", layout="wide", page_icon="📈")
@@ -178,6 +179,19 @@ kpi_row2[4].metric(
 if bot_state.get("risk_breaches") and "LIMITE EXCEDIDO" in str(bot_state.get("risk_breaches")):
     st.warning(f"⚠️ {bot_state['risk_breaches']}")
 
+# Kill switch centralizado (Fase 5.3, ver ggal_bot/risk/kill_switch.py):
+# se relee de disco en cada refresh del dashboard, asi que un trip()
+# disparado por el bot en su propio proceso se ve aca sin reiniciar nada.
+_ks_state = KillSwitch().status()
+if _ks_state.tripped:
+    st.error(
+        f"🛑 KILL SWITCH DISPARADO ({_ks_state.tripped_by}, {_ks_state.tripped_at}): "
+        f"{_ks_state.reason}\n\n"
+        "El bot NO abrira posiciones nuevas hasta un reset manual "
+        "(`python -m ggal_bot.risk.kill_switch --reset \"motivo\"`). Las salidas de "
+        "posiciones ya abiertas NO estan bloqueadas por este mecanismo."
+    )
+
 st.divider()
 
 
@@ -186,7 +200,34 @@ st.divider()
 # ---------------------------------------------------------------------------
 
 st.subheader("Operaciones")
-tab_closed, tab_open = st.tabs([f"Cerradas ({len(closed_df_f)})", f"Abiertas ({len(open_positions_f)})"])
+
+
+def _load_position_events() -> pd.DataFrame:
+    """
+    Lee logs/position_events.csv (Fase 5.3, ver
+    ggal_bot/portfolio/event_journal.py) - archivo NUEVO e independiente de
+    shadow_trades.csv, arranca vacio/inexistente hasta el primer evento de
+    lifecycle registrado DESPUES de este deploy (no reconstruye historial
+    previo, ver docstring del modulo).
+    """
+    if not POSITION_EVENTS_LOG.exists() or POSITION_EVENTS_LOG.stat().st_size == 0:
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(POSITION_EVENTS_LOG)
+    except (pd.errors.EmptyDataError, pd.errors.ParserError):
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
+    return df.sort_values("timestamp_utc", ascending=False).reset_index(drop=True)
+
+
+position_events_df = _load_position_events()
+
+tab_closed, tab_open, tab_lifecycle = st.tabs([
+    f"Cerradas ({len(closed_df_f)})", f"Abiertas ({len(open_positions_f)})",
+    f"Lifecycle ({len(position_events_df)})",
+])
 
 with tab_closed:
     if "Cerrada" not in status_filter:
@@ -245,6 +286,77 @@ with tab_open:
             "(vencio o rodo fuera del universo de vencimientos configurado); el PnL no realizado "
             "de esas filas queda en $0 hasta que se resuelva manualmente."
         )
+
+with tab_lifecycle:
+    st.caption(
+        "Position Lifecycle Event Journal (Fase 5.3) - un evento por cada ENTRY/REDUCE/"
+        "PARTIAL_EXIT/CLOSE/REJECT real, con position_id/contract_key/strategy_tag. "
+        "Archivo NUEVO e independiente de shadow_trades.csv: solo tiene datos a partir de "
+        "este deploy hacia adelante, no reconstruye el historial previo."
+    )
+    if position_events_df.empty:
+        st.info(
+            f"Todavia no hay eventos en `{POSITION_EVENTS_LOG}` (vacio hasta el primer "
+            "ENTRY/REDUCE/CLOSE/REJECT que ocurra con el codigo de esta fase ya desplegado)."
+        )
+    else:
+        event_filter = st.multiselect(
+            "Tipo de evento", options=sorted(position_events_df["event_type"].dropna().unique()),
+            default=list(sorted(position_events_df["event_type"].dropna().unique())),
+        )
+        df_display = position_events_df[position_events_df["event_type"].isin(event_filter)].copy()
+        df_display["timestamp_utc_str"] = df_display["timestamp_utc"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        st.dataframe(
+            df_display[[
+                "timestamp_utc_str", "event_type", "symbol", "strategy_tag", "position_id",
+                "contract_key", "side", "quantity_delta", "quantity_after", "price",
+                "reason", "data_unavailable_fields",
+            ]].rename(columns={
+                "timestamp_utc_str": "Cuando (UTC)", "event_type": "Evento", "symbol": "Ticker",
+                "strategy_tag": "Estrategia", "position_id": "Position ID",
+                "contract_key": "Contract Key", "side": "Lado", "quantity_delta": "Δ Cantidad",
+                "quantity_after": "Cantidad restante", "price": "Precio", "reason": "Motivo",
+                "data_unavailable_fields": "Campos no disponibles",
+            }),
+            width="stretch", hide_index=True,
+        )
+
+        st.caption(
+            "Resumen por Position ID (agrupa todos los eventos de UN mismo lote, no de un "
+            "mismo simbolo - dos lotes distintos del mismo ticker tienen Position ID distinto):"
+        )
+        # BUG REAL EVITADO EN REVISION (ver smoke test de esta fase): df_display
+        # esta ordenado DESCENDENTE por timestamp (mas reciente primero, para
+        # la tabla de arriba) - agrupar sobre ESE orden y pedir agg(...,"last")
+        # devuelve la fila mas VIEJA de cada grupo, no la mas reciente. Se
+        # ordena ASCENDENTE explicitamente aca, en una copia separada, solo
+        # para este resumen, para que "last" signifique lo que dice.
+        df_for_summary = df_display.sort_values("timestamp_utc", ascending=True)
+        summary_by_pos = (
+            df_for_summary[df_for_summary["position_id"].astype(bool)]
+            .groupby("position_id")
+            .agg(
+                symbol=("symbol", "first"),
+                strategy_tag=("strategy_tag", "first"),
+                n_eventos=("event_type", "count"),
+                primer_evento=("timestamp_utc", "min"),
+                ultimo_evento=("timestamp_utc", "max"),
+                ultima_cantidad=("quantity_after", "last"),
+            )
+            .reset_index()
+            .sort_values("ultimo_evento", ascending=False)
+        )
+        if not summary_by_pos.empty:
+            summary_by_pos["primer_evento"] = summary_by_pos["primer_evento"].dt.strftime("%Y-%m-%d %H:%M:%S")
+            summary_by_pos["ultimo_evento"] = summary_by_pos["ultimo_evento"].dt.strftime("%Y-%m-%d %H:%M:%S")
+            st.dataframe(
+                summary_by_pos.rename(columns={
+                    "position_id": "Position ID", "symbol": "Ticker", "strategy_tag": "Estrategia",
+                    "n_eventos": "N° eventos", "primer_evento": "Primer evento",
+                    "ultimo_evento": "Ultimo evento", "ultima_cantidad": "Cantidad actual",
+                }),
+                width="stretch", hide_index=True,
+            )
 
 st.divider()
 
