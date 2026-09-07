@@ -927,17 +927,45 @@ class ScalpingConfig:
 #   strategy/weekly_asymmetric.py + risk/position_sizer.py (DEFAULT).
 # "vol_arbitrage"     -> arbitraje de volatilidad delta-neutral original,
 #   ver strategy/vol_arbitrage.py (el modo con el que arranco el proyecto).
-VALID_STRATEGIES: Tuple[str, ...] = ("weekly_asymmetric", "vol_arbitrage")
+# "scalping"          -> Scalping Intradia (ver ScalpingConfig arriba),
+#   AGREGADO 2026-09-07 a pedido EXPLICITO del usuario, para poder elegir
+#   la estrategia activa al arrancar el bot entre las tres.
+#
+#   ADVERTENCIA DE DISEÑO (leer antes de setear esto en produccion): este
+#   valor es la seleccion EXCLUYENTE de "que estrategia principal corre" -
+#   run_bot.py.GgalOptionsBot.recompute_cycle() llama a UNA SOLA de las
+#   tres ramas (_run_weekly_asymmetric_cycle / _run_vol_arbitrage_cycle /
+#   _run_scalping_cycle como PRINCIPAL, no como aditivo) segun este valor.
+#   Esto es DISTINTO y en principio CONTRADICTORIO con la decision de
+#   arquitectura documentada arriba junto a ScalpingConfig (2026-09-03,
+#   "modo nuevo aparte" ADITIVO): ese modo aditivo (GGAL_BOT_ENABLE_SCALPING,
+#   independiente de esta variable) fue elegido especificamente para NO
+#   apagar la gestion (entradas Y SALIDAS - Stop Loss/Take Profit/horizonte/
+#   guardia de fin de semana) de las posiciones de weekly_asymmetric al
+#   activar scalping. GGAL_BOT_ACTIVE_STRATEGY=scalping SI apaga esa
+#   gestion por completo para cualquier posicion que no sea de scalping -
+#   fue una decision EXPLICITA del usuario (2026-09-07, eligio la opcion
+#   "excluyente" tras ser advertido de este mismo contraste) preferir un
+#   selector literal de 3 vias antes que preservar esa proteccion. Ver
+#   GgalOptionsBot._warn_orphaned_positions_for_active_strategy(), que
+#   loguea (sin bloquear nada - la eleccion ya fue tomada) cada posicion
+#   que quede sin ninguna gestion bajo la seleccion vigente, para que
+#   nunca sea una sorpresa silenciosa en produccion.
+VALID_STRATEGIES: Tuple[str, ...] = ("weekly_asymmetric", "vol_arbitrage", "scalping")
 
 
 @dataclass
 class StrategyConfig:
     """
-    Que estrategia corre el orquestador principal (run_bot.py). Un valor
-    invalido en GGAL_BOT_ACTIVE_STRATEGY (fuera de VALID_STRATEGIES) NO
-    frena el arranque del bot: run_bot.py cae a "weekly_asymmetric" y
-    loguea una advertencia explicita (ver GgalOptionsBot.__init__) en vez
-    de fallar en silencio o crashear.
+    Que estrategia corre el orquestador principal (run_bot.py) como
+    PRINCIPAL (entradas nuevas Y gestion de salidas) de forma EXCLUYENTE.
+    Un valor invalido en GGAL_BOT_ACTIVE_STRATEGY (fuera de
+    VALID_STRATEGIES) NO frena el arranque del bot: run_bot.py cae a
+    "weekly_asymmetric" y loguea una advertencia explicita (ver
+    GgalOptionsBot.__init__) en vez de fallar en silencio o crashear.
+
+    Ver la nota de advertencia junto a VALID_STRATEGIES arriba antes de
+    setear "scalping" aca en produccion.
     """
     active: str = _env_str("GGAL_BOT_ACTIVE_STRATEGY", "weekly_asymmetric")
 
