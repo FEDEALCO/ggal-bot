@@ -25,6 +25,31 @@ run_bot.py::connect_and_subscribe() lo llame ANTES de que arranque el loop
 principal, poblando self.portfolio antes de que Guarda 2 evalue ninguna
 señal.
 
+CONSOLIDACION (agregado el 2026-09-07, tras el primer trip real del kill
+switch en produccion - ver AUDITORIA_FASE5.2_LIFECYCLE_ROOT_CAUSE.md):
+match_trades_fifo() devuelve un OpenLot por CADA fill BUY sin cerrar
+todavia, no uno por simbolo - eso es correcto para el motor de PnL (cada
+lote conserva su propio precio/tiempo de entrada para el calculo FIFO de
+cierres futuros), pero viola el invariante de diseño del resto del sistema
+("como maximo una Position por simbolo+estrategia", el mismo que
+KillSwitch.evaluate() audita via max_positions_per_symbol_strategy). La
+version original de esta funcion creaba un Position por OpenLot crudo: en
+produccion, 5 bases con fragmentacion HISTORICA real (fills BUY repetidos
+sobre el mismo simbolo antes de que el fix de Fase 5.3 les pusiera
+contract_key/journal) se reconstruian como 2 a 6 Position "simultaneas"
+sobre la misma base - el kill switch disparo INMEDIATAMENTE al arrancar,
+correctamente detectando esa fragmentacion (el chequeo funciono como
+estaba pensado), pero el estado reconstruido no reflejaba el invariante
+que el resto del bot asume. Fix: se consolidan los OpenLot del mismo
+simbolo+signo en una sola fila via dashboard/pnl_engine.py::
+aggregate_open_positions() (ya existente y testeado - no reimplementado
+aca) ANTES de construir los Position - precio de entrada promedio
+ponderado por cantidad, entry_time el mas antiguo del grupo. Esto no
+descarta informacion: la cantidad NETA y el costo promedio ponderado son
+exactamente lo que Guarda 2 y el calculo de P&L no realizado necesitan; lo
+que se pierde (el detalle por-lote de cuando entro cada fraccion) no lo
+usa ningun consumidor de self.portfolio hoy.
+
 ALCANCE EXPLICITO - que NO resuelve este modulo:
   1. Modo LIVE (self.shadow_mode=False, ordenes reales via pyRofex): la
      reconciliacion "de verdad" en ese modo deberia ser contra el estado de
@@ -94,11 +119,16 @@ def reconstruct_positions_from_shadow_log(
     """
     Devuelve (positions, warnings).
 
-    `positions`: un Position por cada lote que queda ABIERTO tras procesar
-    TODO el historial de logs/shadow_trades.csv (o `csv_path`) con el mismo
-    FIFO que ya usa el dashboard - ver dashboard/pnl_engine.py::
-    match_trades_fifo, NO reimplementado aca a proposito (ese algoritmo ya
-    fue verificado, fila por fila, contra produccion en Fase 5/5.1).
+    `positions`: un Position por cada simbolo (+signo de direccion) que
+    queda con cantidad neta ABIERTA tras procesar TODO el historial de
+    logs/shadow_trades.csv (o `csv_path`) con el mismo FIFO que ya usa el
+    dashboard - ver dashboard/pnl_engine.py::match_trades_fifo, NO
+    reimplementado aca a proposito (ese algoritmo ya fue verificado, fila
+    por fila, contra produccion en Fase 5/5.1). Los lotes abiertos del
+    mismo simbolo+signo que devuelve match_trades_fifo se CONSOLIDAN en un
+    unico Position via dashboard/pnl_engine.py::aggregate_open_positions()
+    (precio de entrada promedio ponderado por cantidad, entry_time el mas
+    antiguo) - ver nota "CONSOLIDACION" en el docstring del modulo.
 
     `warnings`: texto humano no fatal - cada limitacion real de esta
     reconstruccion (ver docstring del modulo) se reporta aca. Nunca se
@@ -108,7 +138,12 @@ def reconstruct_positions_from_shadow_log(
     importar (pandas/numpy ausentes en este entorno).
     """
     try:
-        from dashboard.pnl_engine import _is_underlying_symbol, load_fills, match_trades_fifo
+        from dashboard.pnl_engine import (
+            _is_underlying_symbol,
+            aggregate_open_positions,
+            load_fills,
+            match_trades_fifo,
+        )
     except ImportError as exc:
         raise ReconciliationUnavailable(
             "No se pudo importar dashboard.pnl_engine para reconciliar el portfolio al "
@@ -145,45 +180,56 @@ def reconstruct_positions_from_shadow_log(
             "previo a este cambio)."
         )
 
+    # Consolida lotes abiertos del mismo simbolo+signo en una sola fila
+    # (precio de entrada promedio ponderado por cantidad, entry_time el mas
+    # antiguo) - funcion ya existente y testeada, reusada tal cual (ver nota
+    # "CONSOLIDACION" en el docstring del modulo). Sin esto, cada BUY sin
+    # cerrar todavia sobre el mismo simbolo se convertia en una Position
+    # "simultanea" distinta, violando el invariante de una sola Position
+    # por simbolo+estrategia que el resto del bot (incluido KillSwitch.
+    # evaluate) asume.
+    aggregated = aggregate_open_positions(open_lots)
+
     positions: List[Position] = []
-    for lot in open_lots:
-        is_underlying = _is_underlying_symbol(lot.symbol)
+    for row in aggregated.itertuples(index=False):
+        symbol = row.symbol
+        is_underlying = _is_underlying_symbol(symbol)
         greeks_per_unit = None
         expiry = None
         data_unavailable = []
         if not is_underlying:
-            quote = option_chain.get(lot.symbol) if option_chain is not None else None
+            quote = option_chain.get(symbol) if option_chain is not None else None
             if quote is not None and quote.greeks is not None:
                 greeks_per_unit = quote.greeks
                 expiry = quote.expiry
             else:
                 data_unavailable.append("greeks_per_unit")
                 warnings.append(
-                    f"{lot.symbol}: se reconstruyo la posicion (qty={lot.quantity}) pero no "
+                    f"{symbol}: se reconstruyo la posicion (qty={row.quantity}) pero no "
                     "hay cotizacion vigente en el option_chain actual para completar sus "
                     "griegas (probable base fuera del universo activo: vencida o rolleada) - "
                     "greeks_per_unit queda en None (Position.contribution() la trata como "
                     "delta=1 por unidad hasta que una entrada nueva la reemplace o se cierre)."
                 )
 
-        entry_time = lot.entry_time
+        entry_time = row.entry_time
         if hasattr(entry_time, "to_pydatetime"):
             entry_time = entry_time.to_pydatetime()
 
         positions.append(Position(
-            symbol=lot.symbol,
-            quantity=lot.quantity,
+            symbol=symbol,
+            quantity=row.quantity,
             multiplier=1.0 if is_underlying else mult,
             greeks_per_unit=greeks_per_unit,
             expiry=expiry,
-            entry_price=lot.entry_price,
+            entry_price=row.avg_entry_price,
             entry_time=entry_time,
             strategy_tag=None,
         ))
         if data_unavailable:
             logger.warning(
                 "Reconciliacion de arranque: %s reconstruido con campos incompletos (%s).",
-                lot.symbol, ", ".join(data_unavailable),
+                symbol, ", ".join(data_unavailable),
             )
 
     return positions, warnings

@@ -117,6 +117,40 @@ def test_reconstruct_with_option_chain_fills_greeks(tmp_path):
     assert not any("greeks_per_unit" in w for w in warnings)
 
 
+def test_reconstruct_consolidates_multiple_open_lots_into_one_position(tmp_path):
+    """
+    Regresion (2026-09-07, tras el primer trip real del kill switch en
+    produccion - ver AUDITORIA_FASE5.2_LIFECYCLE_ROOT_CAUSE.md): 3 BUY
+    consecutivos sobre la MISMA base, sin ninguna venta entre medio (la
+    fragmentacion historica real, causada por el bug de Guarda 2 ya
+    corregido) deben reconstruirse como UNA sola Position con la cantidad
+    total y el precio de entrada promedio ponderado por cantidad - NUNCA
+    como 3 Position "simultaneas" (eso es exactamente lo que disparo
+    max_positions_per_symbol_strategy en produccion apenas se desplego la
+    reconciliacion, antes de este fix).
+    """
+    csv_path = tmp_path / "shadow_trades.csv"
+    _write_shadow_csv(csv_path, [
+        ["2026-09-01T20:14:00+00:00", "c1", "GFGC7000OC", "buy", "market", 3, 570.0, 570.0, 570.0, "shadow_fill"],
+        ["2026-09-02T10:00:00+00:00", "c2", "GFGC7000OC", "buy", "market", 3, 580.0, 580.0, 580.0, "shadow_fill"],
+        ["2026-09-03T11:00:00+00:00", "c3", "GFGC7000OC", "buy", "market", 3, 590.0, 590.0, 590.0, "shadow_fill"],
+    ])
+
+    positions, _warnings = reconstruct_positions_from_shadow_log(csv_path=csv_path, option_multiplier=100.0)
+
+    assert len(positions) == 1, (
+        f"esperaba 1 Position consolidada para GFGC7000OC, hubo {len(positions)} - "
+        "esto reproduciria el trip de max_positions_per_symbol_strategy visto en produccion."
+    )
+    pos = positions[0]
+    assert pos.symbol == "GFGC7000OC"
+    assert pos.quantity == 9.0
+    # Promedio ponderado por cantidad: (3*570 + 3*580 + 3*590) / 9 = 580.0 (pesos iguales aca).
+    assert pos.entry_price == pytest.approx(580.0)
+    # entry_time = el mas antiguo del grupo (primer BUY), no el ultimo.
+    assert pos.entry_time.date() == date(2026, 9, 1)
+
+
 def test_reconstruct_fully_closed_symbol_yields_no_position(tmp_path):
     csv_path = tmp_path / "shadow_trades.csv"
     _write_shadow_csv(csv_path, [
