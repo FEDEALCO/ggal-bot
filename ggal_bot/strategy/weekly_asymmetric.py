@@ -279,9 +279,14 @@ class WeeklyAsymmetricStrategy:
                 diag.blocked_by_direction += 1
                 continue  # filtro direccional tecnico: bajo BULLISH/BEARISH sin reversion temprana, ni se evalua
 
-            # Horizonte semanal: nunca se abre una posicion que exceda el
+            # Horizonte de entrada: nunca se abre una posicion que exceda el
             # maximo de ruedas habiles configurado, aunque este muy barata.
-            if q.days_business > cfg.max_holding_business_days:
+            # cfg.max_holding_business_days puede ser None ("sin limite",
+            # ver LongFirstConfig/ScalpingConfig en config.py, AJUSTE
+            # 2026-09-07 a pedido explicito del usuario) - en ese caso
+            # ninguna cotizacion se descarta por este motivo, sin importar
+            # que tan lejano sea su vencimiento.
+            if cfg.max_holding_business_days is not None and q.days_business > cfg.max_holding_business_days:
                 diag.blocked_by_holding_days += 1
                 continue
 

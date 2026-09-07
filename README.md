@@ -378,8 +378,9 @@ Toda la configuracion vive en `LongFirstConfig` (`ggal_bot/config.py`) y se cont
 variables de entorno (ver la seccion nueva de `.env.example`): capital maximo
 (`GGAL_BOT_MAX_CAPITAL_ARS`, default $1.000.000), riesgo maximo por trade
 (`GGAL_BOT_MAX_RISK_PCT_PER_TRADE`, default 20%), objetivo de retorno semanal
-(`GGAL_BOT_WEEKLY_TARGET_ARS`), horizonte maximo en ruedas habiles
-(`GGAL_BOT_MAX_HOLDING_BUSINESS_DAYS`, default 5), Stop Loss / Take Profit
+(`GGAL_BOT_WEEKLY_TARGET_ARS`), horizonte de entrada/salida en ruedas habiles
+(`GGAL_BOT_MAX_HOLDING_BUSINESS_DAYS`; 0 o sin setear = sin limite, ver
+`.env.example` para el detalle de que controla cada lado), Stop Loss / Take Profit
 (`GGAL_BOT_STOP_LOSS_PCT` / `GGAL_BOT_TAKE_PROFIT_PCT`), y los umbrales de
 smile/moneyness que definen "barata" y la banda ATM/OTM buscada.
 

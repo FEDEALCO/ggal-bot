@@ -180,6 +180,28 @@ def test_evaluate_position_exit_triggers_weekly_horizon_expired():
     assert reason == "weekly_horizon_expired"
 
 
+def test_evaluate_position_exit_horizon_disabled_when_max_holding_business_days_is_none():
+    """
+    Regresion (2026-09-07, a pedido explicito del usuario - ver
+    LongFirstConfig/ScalpingConfig.max_holding_business_days en config.py):
+    con None ("sin limite"), la salida "weekly_horizon_expired" NUNCA debe
+    dispararse, sin importar cuantos dias habiles lleve abierta la
+    posicion. Mismo fixture EXACTO que
+    test_evaluate_position_exit_triggers_weekly_horizon_expired (5 ruedas
+    habiles mantenida) - unica diferencia: max_holding_business_days=None.
+    """
+    risk_mgr = RiskManager(RiskLimits())
+    entry_time = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)  # lunes
+    now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)         # lunes siguiente: 5 ruedas habiles despues
+    reason = risk_mgr.evaluate_position_exit(
+        entry_price=100.0, current_price=105.0,  # dentro de banda de SL/TP
+        entry_time=entry_time, now=now, expiry=date(2026, 10, 16),
+        stop_loss_pct=0.50, take_profit_pct=1.00, max_holding_business_days=None,
+        weekend_theta_guard_enabled=False,
+    )
+    assert reason is None
+
+
 def test_evaluate_position_exit_triggers_weekend_theta_guard_on_friday():
     risk_mgr = RiskManager(RiskLimits())
     now = datetime(2026, 8, 28, 15, 0, tzinfo=timezone.utc)  # viernes
@@ -476,6 +498,35 @@ def test_scan_entry_signals_excludes_bases_beyond_weekly_horizon():
         surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
     )
     assert signals == []
+
+
+def test_scan_entry_signals_includes_bases_beyond_horizon_when_limit_disabled():
+    """
+    Regresion (2026-09-07, a pedido explicito del usuario: "quita el limite
+    de vencimiento... el objetivo es que opere en el vto mas proximo de
+    opciones que tenga mayor profundidad y liquidez, como en este caso el
+    vto de octubre"). Mismo fixture EXACTO que el test de arriba (bases a
+    days_biz=10, mas alla del horizonte de 5 que usaba ese test), pero con
+    max_holding_business_days=None ("sin limite") - la base barata
+    (GFGC5200O, iv=0.45) ahora SI debe calificar, porque nada la descarta
+    por distancia al vencimiento.
+    """
+    cfg = _default_config(max_holding_business_days=None)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    spot = 5200.0
+    quotes = [
+        _quote("GFGC4900O", 4900, 0.60, spot, days_biz=10),
+        _quote("GFGC5050O", 5050, 0.57, spot, days_biz=10),
+        _quote("GFGC5200O", 5200, 0.45, spot, days_biz=10),  # barata, antes excluida solo por horizonte
+        _quote("GFGC5350O", 5350, 0.57, spot, days_biz=10),
+        _quote("GFGC5500O", 5500, 0.60, spot, days_biz=10),
+    ]
+    surface = VolatilitySurface(quotes)
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+    )
+    assert len(signals) == 1
+    assert signals[0].symbol == "GFGC5200O"
 
 
 def test_scan_entry_signals_excludes_bases_outside_moneyness_band():
@@ -1431,6 +1482,7 @@ ALL_TESTS = [
     test_evaluate_position_exit_triggers_stop_loss,
     test_evaluate_position_exit_triggers_take_profit,
     test_evaluate_position_exit_triggers_weekly_horizon_expired,
+    test_evaluate_position_exit_horizon_disabled_when_max_holding_business_days_is_none,
     test_evaluate_position_exit_triggers_weekend_theta_guard_on_friday,
     test_evaluate_position_exit_weekend_guard_skipped_if_expires_same_friday,
     test_evaluate_position_exit_returns_none_within_all_bands,
@@ -1455,6 +1507,7 @@ ALL_TESTS = [
     test_scan_entry_signals_emits_buy_signal_for_cheap_base_in_band_and_horizon,
     test_scan_entry_signals_never_emits_signal_for_expensive_base,
     test_scan_entry_signals_excludes_bases_beyond_weekly_horizon,
+    test_scan_entry_signals_includes_bases_beyond_horizon_when_limit_disabled,
     test_scan_entry_signals_excludes_bases_outside_moneyness_band,
     test_scan_entry_signals_ranks_by_convexity_score_descending,
     test_scan_spread_completion_signals_empty_without_confirmed_long_position,

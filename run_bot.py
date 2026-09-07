@@ -200,13 +200,27 @@ class GgalOptionsBot:
                 "semanal (comportamiento normal).", raw_forced_expiry,
             )
         elif self._forced_expiry is not None:
-            logger.warning(
-                "Vencimiento FORZADO por config (GGAL_BOT_FORCE_EXPIRY=%s): el bot va a ignorar "
-                "cualquier otro vencimiento por completo, tanto para entradas nuevas como para "
-                "completar spreads - verificar que GGAL_BOT_MAX_HOLDING_BUSINESS_DAYS (hoy=%d dias "
-                "habiles) cubra el plazo real hasta ese vencimiento, o ninguna entrada va a poder "
-                "abrirse ahi.", self._forced_expiry.isoformat(), SETTINGS.long_first.max_holding_business_days,
-            )
+            # GGAL_BOT_MAX_HOLDING_BUSINESS_DAYS puede ser None ("sin limite",
+            # ver LongFirstConfig en config.py, AJUSTE 2026-09-07) - en ese
+            # caso el vencimiento forzado nunca queda bloqueado por este
+            # motivo, asi que la advertencia de abajo no aplica.
+            horizon = SETTINGS.long_first.max_holding_business_days
+            if horizon is not None:
+                logger.warning(
+                    "Vencimiento FORZADO por config (GGAL_BOT_FORCE_EXPIRY=%s): el bot va a ignorar "
+                    "cualquier otro vencimiento por completo, tanto para entradas nuevas como para "
+                    "completar spreads - verificar que GGAL_BOT_MAX_HOLDING_BUSINESS_DAYS (hoy=%d dias "
+                    "habiles) cubra el plazo real hasta ese vencimiento, o ninguna entrada va a poder "
+                    "abrirse ahi.", self._forced_expiry.isoformat(), horizon,
+                )
+            else:
+                logger.warning(
+                    "Vencimiento FORZADO por config (GGAL_BOT_FORCE_EXPIRY=%s): el bot va a ignorar "
+                    "cualquier otro vencimiento por completo, tanto para entradas nuevas como para "
+                    "completar spreads. GGAL_BOT_MAX_HOLDING_BUSINESS_DAYS esta en 'sin limite', asi "
+                    "que este vencimiento nunca queda bloqueado por horizonte de entrada.",
+                    self._forced_expiry.isoformat(),
+                )
 
         self.delta_hedger = DeltaHedgingEngine(delta_band=SETTINGS.risk.delta_band)
 
