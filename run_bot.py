@@ -40,8 +40,14 @@ from ggal_bot.data.option_chain import OptionChain, OrderBookSnapshot
 from ggal_bot.models.implied_vol import ImpliedVolatilityCalculator
 from ggal_bot.models.volatility_surface import VolatilitySurface
 from ggal_bot.portfolio.portfolio import Portfolio, Position
+from ggal_bot.portfolio.event_journal import PositionEventJournal
+from ggal_bot.portfolio.reconciliation import (
+    ReconciliationUnavailable,
+    reconstruct_positions_from_shadow_log,
+)
 from ggal_bot.risk.risk_manager import RiskLimits, RiskManager
 from ggal_bot.risk.position_sizer import PositionSizer
+from ggal_bot.risk.kill_switch import KillSwitch
 from ggal_bot.execution.market_making import MarketMakingEngine
 from ggal_bot.execution.mid_price_exec import MidPriceExecutionEngine
 from ggal_bot.execution.order_gateway import (
@@ -285,6 +291,13 @@ class GgalOptionsBot:
         # -- Persistencia de estado ------------------------------------------
         self.state_writer = StateWriter()
 
+        # -- Position Lifecycle Event Journal (Fase 5.3, ver
+        # ggal_bot/portfolio/event_journal.py) --------------------------------
+        self.position_event_journal = PositionEventJournal()
+
+        # -- Kill switch centralizado (Fase 5.3, ver ggal_bot/risk/kill_switch.py) --
+        self.kill_switch = KillSwitch()
+
         # -- Conectividad de mercado ------------------------------------------
         # Shadow Trading (ver ggal_bot/data/live_shadow_feed.py): cuando esta
         # activo, el bot no abre ninguna conexion real de PyRofex - ni para
@@ -393,6 +406,66 @@ class GgalOptionsBot:
 
     # -- Conexion y arranque -------------------------------------------------
 
+    def _reconcile_portfolio_on_startup(self) -> None:
+        """
+        Fase 5.3 (ver ggal_bot/portfolio/reconciliation.py y
+        AUDITORIA_FASE5.3_*.md, "ROOT CAUSE RESOLVED"): reconstruye
+        self.portfolio desde logs/shadow_trades.csv ANTES de que el loop
+        principal evalue ninguna señal, para que un restart de proceso ya
+        no deje a Guarda 2 viendo una posicion "en cero" que en realidad
+        seguia abierta en el historial de fills. Solo corre en shadow mode
+        (ver alcance explicito documentado en reconciliation.py) y solo si
+        el portfolio esta vacio (nunca pisa posiciones ya creadas en este
+        mismo proceso).
+
+        Defensivo por diseño: cualquier problema aca (CSV corrupto, pandas
+        no instalado, lo que sea) se loguea y el bot sigue con Portfolio()
+        vacio - el comportamiento identico al de ANTES de esta fase -, en
+        vez de abortar el arranque. Nunca fabrica una posicion.
+        """
+        if not SETTINGS.shadow.reconcile_portfolio_on_startup:
+            logger.info(
+                "Reconciliacion de portfolio al arranque DESACTIVADA "
+                "(GGAL_BOT_SHADOW_RECONCILE_ON_STARTUP=false) - arrancando con portfolio vacio."
+            )
+            return
+        if self.portfolio.positions:
+            return
+        try:
+            positions, warnings = reconstruct_positions_from_shadow_log(option_chain=self.option_chain)
+        except ReconciliationUnavailable as exc:
+            logger.warning(
+                "Reconciliacion de portfolio al arranque OMITIDA (arrancando con portfolio "
+                "vacio, comportamiento previo a Fase 5.3): %s", exc,
+            )
+            return
+        except Exception:
+            logger.exception(
+                "Error inesperado reconciliando el portfolio al arranque - se continua con "
+                "portfolio vacio para no bloquear el arranque del bot."
+            )
+            return
+
+        for w in warnings:
+            logger.warning("Reconciliacion de arranque: %s", w)
+
+        if not positions:
+            logger.info(
+                "Reconciliacion de arranque: logs/shadow_trades.csv no dejo ninguna posicion "
+                "neta abierta - portfolio arranca vacio (esperado si el bot cerro todo antes "
+                "del ultimo restart, o si es la primera corrida)."
+            )
+            return
+
+        for pos in positions:
+            self.portfolio.add(pos)
+        logger.warning(
+            "Reconciliacion de arranque: %d posicion(es) restauradas desde logs/shadow_trades.csv "
+            "(%s) - ver ggal_bot/portfolio/reconciliation.py para el alcance/limitaciones exactas "
+            "de esta reconstruccion.",
+            len(positions), ", ".join(f"{p.symbol}={p.quantity:g}" for p in positions),
+        )
+
     def connect_and_subscribe(self) -> bool:
         if self.shadow_mode:
             # Sin PyRofex, sin websocket: bootstrap_universe() arma el
@@ -401,6 +474,7 @@ class GgalOptionsBot:
             # en cada recompute_cycle() via market_feed.poll() (ver abajo).
             self._subscribed_tickers = self.market_feed.bootstrap_universe(self.option_chain)
             self.market_feed.subscribe(self._subscribed_tickers)
+            self._reconcile_portfolio_on_startup()
             return True
 
         if not initialize_environment():
@@ -470,6 +544,20 @@ class GgalOptionsBot:
         elif self._option_staleness_logged:
             logger.info("Cotizaciones de opciones recuperadas: ninguna esta stale este ciclo.")
             self._option_staleness_logged = False
+
+        # Kill switch centralizado (Fase 5.3, ver ggal_bot/risk/kill_switch.py):
+        # se evalua ANTES de correr el escaneo de entradas de este ciclo,
+        # contra el estado del portfolio tal cual quedo al final del ciclo
+        # anterior, para que un breach recien detectado bloquee las
+        # entradas de ESTE ciclo (no solo del siguiente). No evalua
+        # max_daily_loss_ars aca (requeriria pandas/dashboard.pnl_engine,
+        # ver RiskLimitsConfig.max_daily_loss_ars - ese chequeo especifico
+        # queda deshabilitado hasta que un caller le pase
+        # realized_pnl_today_ars explicitamente, ver TODO de Fase 5.3
+        # siguiente commit). evaluate() es un no-op si ya esta disparado
+        # (no lo re-dispara con una reason distinta) y NUNCA resetea solo.
+        if not self.kill_switch.is_tripped():
+            self.kill_switch.evaluate(self.portfolio, SETTINGS.risk_limits)
 
         if self.active_strategy_name == "vol_arbitrage":
             all_signals = self._run_vol_arbitrage_cycle(spot)
@@ -1218,6 +1306,20 @@ class GgalOptionsBot:
                 remaining_to_reduce -= reduce_qty
                 if is_partial:
                     pos.partial_profit_taken = True
+
+                # Event journal (Fase 5.3, ver ggal_bot/portfolio/event_journal.py):
+                # un evento por LOTE efectivamente tocado (no uno por señal),
+                # exactamente lo que corrige el bug de over-close - cada fila
+                # aca representa una reduccion real de UN position_id puntual.
+                self.position_event_journal.log_event(
+                    "CLOSE" if pos.quantity <= 1e-9 else ("PARTIAL_EXIT" if is_partial else "REDUCE"),
+                    position_id=pos.position_id, contract_key=pos.contract_key,
+                    symbol=pos.symbol, strategy_tag=pos.strategy_tag or "weekly_asymmetric",
+                    side="sell", quantity_delta=-reduce_qty, quantity_after=pos.quantity,
+                    price=state.avg_fill_price,
+                    order_client_id=getattr(getattr(state, "request", None), "client_order_id", ""),
+                    reason=signal.reason,
+                )
             if is_partial and remaining_to_reduce > 1e-9:
                 logger.warning(
                     "Salida parcial %s: la señal pedia reducir %.2f contratos pero solo %.2f "
@@ -1269,6 +1371,22 @@ class GgalOptionsBot:
         if quote is None or quote.book.bid <= 0 or quote.book.ask <= 0:
             return
 
+        # Kill switch centralizado (Fase 5.3, ver ggal_bot/risk/kill_switch.py):
+        # bloquea SOLO entradas nuevas, nunca salidas (ver docstring de
+        # KillSwitch sobre por que _act_on_exit_signal no lo consulta).
+        if self.kill_switch.is_tripped():
+            state_ks = self.kill_switch.status()
+            logger.warning(
+                "Señal %s ignorada: kill switch disparado (%s: %s). Requiere reset manual "
+                "('python -m ggal_bot.risk.kill_switch --reset \"motivo\"').",
+                signal.symbol, state_ks.tripped_by, state_ks.reason,
+            )
+            self.position_event_journal.log_event(
+                "REJECT", symbol=signal.symbol, strategy_tag=strategy_tag,
+                side="buy", reason=f"kill_switch_tripped: {state_ks.reason}",
+            )
+            return
+
         # Guarda 1: orden de esta base ya en vigilancia.
         if self.mid_price_exec.has_open_order_for(signal.symbol):
             logger.debug("Señal %s ignorada: ya hay una orden en vigilancia sobre esa base.", signal.symbol)
@@ -1289,6 +1407,10 @@ class GgalOptionsBot:
                 "Señal %s descartada: la cartera de '%s' ya excede sus limites de riesgo (Griegas: %s).",
                 signal.symbol, strategy_tag, totals,
             )
+            self.position_event_journal.log_event(
+                "REJECT", symbol=signal.symbol, strategy_tag=strategy_tag,
+                side="buy", reason=f"greeks_limit_exceeded: {totals}",
+            )
             return
 
         sizer = position_sizer if position_sizer is not None else self.position_sizer
@@ -1298,6 +1420,10 @@ class GgalOptionsBot:
         )
         if not sizing.is_tradeable:
             logger.info("Señal %s descartada por sizing (%s).", signal.symbol, sizing.rejected_reason)
+            self.position_event_journal.log_event(
+                "REJECT", symbol=signal.symbol, strategy_tag=strategy_tag,
+                side="buy", reason=f"sizing_not_tradeable: {sizing.rejected_reason}",
+            )
             return
 
         state = self.mid_price_exec.submit(
@@ -1306,13 +1432,27 @@ class GgalOptionsBot:
         )
 
         if state.status is OrderStatus.FILLED and quote.greeks is not None:
-            self.portfolio.add(Position(
+            new_pos = Position(
                 symbol=signal.symbol, quantity=sizing.contracts,
                 multiplier=SETTINGS.instruments.option_multiplier,
                 greeks_per_unit=quote.greeks, expiry=quote.expiry,
                 entry_price=state.avg_fill_price, entry_time=datetime.now(timezone.utc),
                 strategy_tag=strategy_tag,
-            ))
+            )
+            self.portfolio.add(new_pos)
+            new_pos.contract_key = (
+                f"{SETTINGS.instruments.underlying_symbol}|{new_pos.symbol}|{quote.expiry.isoformat()}"
+                if quote.expiry is not None else None
+            )
+            self.position_event_journal.log_event(
+                "ENTRY", position_id=new_pos.position_id, contract_key=new_pos.contract_key,
+                symbol=new_pos.symbol, strategy_tag=strategy_tag, side="buy",
+                quantity_delta=new_pos.quantity, quantity_after=new_pos.quantity,
+                price=new_pos.entry_price,
+                order_client_id=getattr(getattr(state, "request", None), "client_order_id", ""),
+                reason=signal.reason,
+                data_unavailable_fields=() if new_pos.contract_key else ("contract_key",),
+            )
 
     def _act_on_spread_completion_signal(self, signal, spot: float) -> None:
         """
