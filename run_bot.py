@@ -1169,14 +1169,62 @@ class GgalOptionsBot:
         )
 
         if state.status is OrderStatus.FILLED:
+            # FASE 5.3 - fix del bug de "over-close" (ver
+            # AUDITORIA_FASE5.2B_FORENSIC_REPLAY.md SS1): cuando existe MAS
+            # DE UN objeto Position para el mismo symbol+strategy_tag
+            # (fragmentacion - ver weekly_asymmetric.py:build_exit_signals,
+            # que genera un ExitSignal POR CADA Position, no uno agregado
+            # por symbol), el codigo anterior aplicaba la MISMA operacion
+            # (vaciar a 0, o descontar signal.quantity) a TODOS los lotes
+            # que matcheaban, en vez de distribuir/limitar la reduccion a
+            # los `signal.quantity` contratos REALMENTE vendidos en este
+            # fill. Eso podia vaciar o sobre-reducir posiciones que esta
+            # señal en particular no representaba, un bug real de
+            # integridad de estado (Categoria C), independiente de la
+            # hipotesis de reinicio sin persistencia investigada para
+            # Guarda 2.
+            #
+            # Fix: consumir exactamente `signal.quantity` contratos, en
+            # orden FIFO (lote mas antiguo primero, por entry_time), across
+            # los lotes que matchean symbol+strategy_tag+quantity>0. Si
+            # is_partial, cada lote efectivamente tocado se marca
+            # partial_profit_taken=True (igual que antes, pero ahora solo
+            # en los lotes que de verdad se redujeron). Si la señal pedia
+            # cerrar mas de lo que hay disponible entre todos los lotes
+            # marcados, se deja constancia via warning en vez de fabricar
+            # cantidad o fallar silenciosamente.
             is_partial = signal.reason == "partial_profit_take"
-            for pos in self.portfolio.positions:
-                if pos.symbol == signal.symbol and pos.quantity > 0 and (pos.strategy_tag or "weekly_asymmetric") == strategy_tag:
-                    if is_partial:
-                        pos.quantity = max(0.0, pos.quantity - signal.quantity)
-                        pos.partial_profit_taken = True
-                    else:
-                        pos.quantity = 0.0
+            remaining_to_reduce = signal.quantity
+            matching = [
+                pos for pos in self.portfolio.positions
+                if pos.symbol == signal.symbol and pos.quantity > 0
+                and (pos.strategy_tag or "weekly_asymmetric") == strategy_tag
+            ]
+            matching.sort(key=lambda p: p.entry_time or datetime.min.replace(tzinfo=timezone.utc))
+            for pos in matching:
+                if remaining_to_reduce <= 0:
+                    break
+                if is_partial:
+                    reduce_qty = min(pos.quantity, remaining_to_reduce)
+                else:
+                    # Cierre total: sigue vaciando el lote completo (no solo
+                    # signal.quantity) para preservar el comportamiento
+                    # histórico de "cierre = flat" cuando hay un solo lote,
+                    # pero ahora détiene la iteración una vez consumida la
+                    # cantidad de la señal en vez de vaciar TODOS los lotes
+                    # restantes sin relación con este fill.
+                    reduce_qty = pos.quantity
+                pos.quantity -= reduce_qty
+                remaining_to_reduce -= reduce_qty
+                if is_partial:
+                    pos.partial_profit_taken = True
+            if is_partial and remaining_to_reduce > 1e-9:
+                logger.warning(
+                    "Salida parcial %s: la señal pedia reducir %.2f contratos pero solo %.2f "
+                    "estaban disponibles en posiciones marcadas '%s' - posible fragmentacion o "
+                    "inconsistencia de estado (ver AUDITORIA_FASE5.2B_FORENSIC_REPLAY.md SS1).",
+                    signal.symbol, signal.quantity, signal.quantity - remaining_to_reduce, strategy_tag,
+                )
 
     def _act_on_entry_signal(
         self, signal, spot: float, strategy_tag: str = "weekly_asymmetric",
