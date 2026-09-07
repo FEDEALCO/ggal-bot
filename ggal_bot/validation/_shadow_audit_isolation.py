@@ -47,4 +47,13 @@ _ISOLATED_LOG_PATH = Path(_ISOLATED_LOG_DIR.name) / "shadow_trades_test.csv"
 # OrderGateway/GgalOptionsBot. Nunca apunta al CSV real de produccion.
 _paths.SHADOW_TRADES_LOG = _ISOLATED_LOG_PATH
 
+# Fase 5.3: mismo aislamiento para el event journal nuevo
+# (ggal_bot/portfolio/event_journal.py) y el estado del kill switch
+# (ggal_bot/risk/kill_switch.py) - ambos, igual que ShadowAuditLogger, leen
+# su path por defecto de forma perezosa desde el modulo ggal_bot.paths, asi
+# que redirigirlos aca alcanza para aislar toda la corrida sin tocar cada
+# test individualmente.
+_paths.POSITION_EVENTS_LOG = Path(_ISOLATED_LOG_DIR.name) / "position_events_test.csv"
+_paths.KILL_SWITCH_STATE_FILE = Path(_ISOLATED_LOG_DIR.name) / "kill_switch_test.json"
+
 atexit.register(_ISOLATED_LOG_DIR.cleanup)

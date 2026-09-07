@@ -353,6 +353,47 @@ class RiskConfig:
 
 
 # ---------------------------------------------------------------------------
+# Kill switch y limites de riesgo CENTRALIZADOS a nivel de portfolio
+# (Fase 5.3, ver ggal_bot/risk/kill_switch.py). Distinto de RiskConfig
+# arriba (Griegas evaluadas POR ESTRATEGIA via Portfolio.
+# greeks_for_strategy_tag) y de LongFirstConfig/ScalpingConfig (sizing/
+# capital por estrategia): esto evalua limites AGREGADOS de TODA la cuenta
+# y, si se exceden, bloquea entradas nuevas en TODO el bot (nunca las
+# salidas - ver docstring de KillSwitch) hasta un reset manual persistido
+# en disco (paths.KILL_SWITCH_STATE_FILE), sobreviviendo restarts.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RiskLimitsConfig:
+    enabled: bool = _env_bool("GGAL_BOT_KILL_SWITCH_ENABLED", True)
+    # Perdida realizada MAXIMA del dia (ARS, valor positivo) antes de
+    # disparar el kill switch. None (default) = sin limite de PnL diario -
+    # DELIBERADO: calcular PnL realizado del dia requiere leer y parsear
+    # logs/shadow_trades.csv (dashboard.pnl_engine, que depende de pandas -
+    # ver comentario en requirements-dashboard.txt), una dependencia
+    # opcional que run_bot.py no fuerza por defecto (ver
+    # ggal_bot/portfolio/reconciliation.py, mismo criterio). Fijar un valor
+    # aca NO activa el calculo automaticamente: quien llame a
+    # KillSwitch.evaluate() debe pasarle `realized_pnl_today_ars` con un
+    # numero real, nunca None mientras el limite este seteado, en cuyo caso
+    # KillSwitch simplemente no evalua ese chequeo especifico (ver su
+    # docstring) - nunca se fabrica un valor de PnL.
+    max_daily_loss_ars: Optional[float] = _env_float("GGAL_BOT_MAX_DAILY_LOSS_ARS", 0.0) or None
+    # Techo agregado de contratos abiertos (suma de |quantity| de TODAS las
+    # posiciones, todas las estrategias). None (default) = sin techo
+    # agregado (cada estrategia sigue limitada por su propio capital/sizing).
+    max_open_contracts_total: Optional[float] = _env_float("GGAL_BOT_MAX_OPEN_CONTRACTS_TOTAL", 0.0) or None
+    # Cuantas Position simultaneas (quantity>0) se toleran para el MISMO
+    # symbol+strategy_tag antes de marcarlo como violacion de integridad -
+    # en el flujo normal, Guarda 2 (_act_on_entry_signal) ya garantiza como
+    # maximo 1 (ver AUDITORIA_FASE5.2_LIFECYCLE_ROOT_CAUSE.md); este limite
+    # es la red de contencion que DETECTA si esa garantia se violo (ej. el
+    # mismo escenario de restart-sin-persistencia que motivo
+    # reconciliation.py, antes de que ese modulo existiera).
+    max_positions_per_symbol_strategy: int = _env_int("GGAL_BOT_MAX_POSITIONS_PER_SYMBOL_STRATEGY", 1)
+
+
+# ---------------------------------------------------------------------------
 # Ejecucion / market making / control de slippage
 # ---------------------------------------------------------------------------
 
@@ -427,6 +468,17 @@ class ShadowConfig:
     source_reprobe_interval_seconds: float = _env_float("GGAL_BOT_SHADOW_SOURCE_REPROBE_SECONDS", 300.0)
 
     poll_interval_seconds: float = _env_float("GGAL_BOT_SHADOW_POLL_SECONDS", 5.0)
+
+    # Fase 5.3 (ver ggal_bot/portfolio/reconciliation.py y
+    # AUDITORIA_FASE5.3_*.md): al arrancar, reconstruye self.portfolio
+    # desde logs/shadow_trades.csv en vez de arrancar siempre vacio -
+    # cierra el gap identificado como la explicacion mas probable de la
+    # contradiccion de Guarda 2 observada en produccion (un restart de
+    # proceso sin persistencia de estado). Default True porque es
+    # estrictamente mas seguro que el comportamiento anterior (Guarda 2
+    # ve la posicion real en vez de creer que esta en cero) y falla de
+    # forma segura (portfolio vacio + warning) si no puede ejecutarse.
+    reconcile_portfolio_on_startup: bool = _env_bool("GGAL_BOT_SHADOW_RECONCILE_ON_STARTUP", True)
 
     def source_priority(self) -> Tuple[str, ...]:
         """
@@ -924,6 +976,7 @@ class Settings:
     rate: RateConfig = field(default_factory=RateConfig)
     signal: SignalConfig = field(default_factory=SignalConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
+    risk_limits: RiskLimitsConfig = field(default_factory=RiskLimitsConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     shadow: ShadowConfig = field(default_factory=ShadowConfig)
     broker_rest: BrokerRestConfig = field(default_factory=BrokerRestConfig)
