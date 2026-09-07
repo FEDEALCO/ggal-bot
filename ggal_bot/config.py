@@ -578,12 +578,47 @@ class LongFirstConfig:
     forbid_naked_short: bool = True
 
     # --- Capital y sizing dinamico (ver risk/position_sizer.py) ---
+    # AJUSTE DE RIESGO 2026-09-07 (post Fase 5.3, a pedido explicito del
+    # usuario, ver conversacion de esa fecha): bajado de 0.20 a 0.10.
+    # Motivo: mientras el Position Lifecycle Engine (Fase 5.3) recien se
+    # esta bedding-in en produccion, el usuario decidio arrancar en el
+    # extremo INFERIOR del rango de riesgo por trade en vez del superior -
+    # textual: "estamos corrigiendo un sistema que todavia tiene problemas
+    # de lifecycle/ejecucion, por lo que no tiene sentido mantener el
+    # extremo superior del rango mientras todavia estamos descubriendo como
+    # se comporta realmente". Subida propuesta EXPLICITAMENTE progresiva
+    # (10% -> 12% -> 15%) solo si los datos forward (via el event journal
+    # nuevo, ver ggal_bot/portfolio/event_journal.py) lo justifican - NO se
+    # sube de nuevo por decision unilateral de este commit.
     max_capital_ars: float = _env_float("GGAL_BOT_MAX_CAPITAL_ARS", 1_000_000.0)
-    max_risk_pct_per_trade: float = _env_float("GGAL_BOT_MAX_RISK_PCT_PER_TRADE", 0.20)
+    max_risk_pct_per_trade: float = _env_float("GGAL_BOT_MAX_RISK_PCT_PER_TRADE", 0.10)
     min_contracts_per_trade: int = _env_int("GGAL_BOT_MIN_CONTRACTS_PER_TRADE", 1)
 
     # --- Objetivo de retorno (dimensionamiento, NO garantia - ver nota arriba) ---
-    weekly_target_ars: float = _env_float("GGAL_BOT_WEEKLY_TARGET_ARS", 1_000_000.0)
+    # AJUSTE DE RIESGO 2026-09-07: bajado de $1.000.000 (100% semanal) a
+    # $400.000 (40% semanal), a pedido explicito del usuario, como
+    # "politica de riesgo" declarada - NO porque haya evidencia de que
+    # $1.000.000 causara el problema observado (el usuario fue explicito:
+    # "razonable como control de agresividad, pero no es una causa
+    # demostrada del problema").
+    #
+    # LIMITACION IMPORTANTE, verificada por grep antes de este cambio (no
+    # asumida): este campo NO esta conectado a NINGUN calculo del bot hoy.
+    # `risk/position_sizer.py::PositionSizer.compute_contracts()` (la unica
+    # fuente real de sizing) NO lo lee, y no hay ningun otro punto del
+    # codigo que lo use para limitar contratos, capital, o frecuencia de
+    # entradas - es puramente documental/de intencion (ver el docstring de
+    # weekly_asymmetric.py que lo cita como "PARAMETRO DE DIMENSIONAMIENTO
+    # para calibrar cuanta convexidad se busca", nunca como un input a una
+    # formula). El usuario pidio explicitamente que este valor NUNCA se use
+    # como presion para forzar mas operaciones - hoy esa garantia se
+    # cumple trivialmente porque el campo no se lee en ningun lado, pero
+    # eso tambien significa que bajarlo a $400.000 no cambia, por si solo,
+    # ningun comportamiento real del bot todavia. Si en el futuro se
+    # decide conectarlo a algo (ej. un techo adicional de riesgo agregado
+    # semanal), eso es un cambio de codigo nuevo, no cubierto por este
+    # commit.
+    weekly_target_ars: float = _env_float("GGAL_BOT_WEEKLY_TARGET_ARS", 400_000.0)
 
     # --- Horizonte semanal y guardia de decay de fin de semana ---
     max_holding_business_days: int = _env_int("GGAL_BOT_MAX_HOLDING_BUSINESS_DAYS", 5)
@@ -603,8 +638,33 @@ class LongFirstConfig:
     # -33.5% sin que el stop fijo de -50% las frenara a tiempo). Default
     # enabled=True (mejora activa por default; poner en false via env
     # restaura el stop_loss_pct fijo de siempre).
+    # AJUSTE DE RIESGO 2026-09-07 (post Fase 5.3, a pedido explicito del
+    # usuario): tiered_stop_loss_stage2_business_day adelantado de 2 a 1.
+    # Motivo, tal como lo planteo el usuario: el hallazgo de Fase 5.1
+    # (GFGC7600OC: overnight catastrofico -$133.568 corregido vs. intradia
+    # casi neutro -$1.334, ver AUDITORIA_FASE5.1_RECOVERY_FORENSICS.md
+    # seccion F) demuestra que el riesgo se concentra en ATRAVESAR UNA
+    # NOCHE, no especificamente en "haber pasado 2 dias habiles". Con
+    # `evaluate_position_exit()` (risk_manager.py) usando
+    # `holding_business_days >= tiered_stop_loss_stage2_business_day`,
+    # bajar el umbral de 2 a 1 hace que la etapa 2 (35%) se active ya
+    # despues del PRIMER overnight (holding_business_days>=1), en vez de
+    # recien despues del segundo - preserva intacto el stop_loss_pct del
+    # dia de entrada (0.50, sin overnight todavia) en vez de tocarlo
+    # directamente, que era la alternativa considerada y descartada
+    # (destruye la protección más holgada del día 0 sin necesidad, ya que
+    # el dia de entrada en si no tiene overnight).
+    #
+    # EXPLICITAMENTE NO VALIDADO COMO OPTIMO (ver discusion del usuario,
+    # 2026-09-07): "no tenemos evidencia suficiente para afirmar que 35%
+    # sea el SL optimo" - esto se trata como una politica de riesgo
+    # parametrizada (feature-flag friendly via env var), no como una
+    # conclusion estadistica. Medir su efecto real REQUIERE datos post
+    # Position Lifecycle Engine (Fase 5.3, ya desplegado) para no repetir
+    # el error de medir fragmentos FIFO como si fueran trades
+    # independientes (ver AUDITORIA_FASE5.1_RECOVERY_FORENSICS.md seccion E).
     enable_tiered_stop_loss: bool = _env_bool("GGAL_BOT_ENABLE_TIERED_STOP_LOSS", True)
-    tiered_stop_loss_stage2_business_day: int = _env_int("GGAL_BOT_TIERED_SL_STAGE2_DAY", 2)
+    tiered_stop_loss_stage2_business_day: int = _env_int("GGAL_BOT_TIERED_SL_STAGE2_DAY", 1)
     tiered_stop_loss_stage2_pct: float = _env_float("GGAL_BOT_TIERED_SL_STAGE2_PCT", 0.35)
     tiered_stop_loss_stage3_business_day: int = _env_int("GGAL_BOT_TIERED_SL_STAGE3_DAY", 4)
     tiered_stop_loss_stage3_pct: float = _env_float("GGAL_BOT_TIERED_SL_STAGE3_PCT", 0.20)
