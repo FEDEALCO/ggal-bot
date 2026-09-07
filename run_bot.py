@@ -120,11 +120,14 @@ class GgalOptionsBot:
             min_book_size=SETTINGS.risk.min_book_size,
             min_daily_volume=SETTINGS.risk.min_daily_volume,
         ))
-        # Seleccion de estrategia activa (ver config.StrategyConfig /
-        # GGAL_BOT_ACTIVE_STRATEGY): "weekly_asymmetric" (Long-First, DEFAULT)
-        # o "vol_arbitrage" (arbitraje delta-neutral original). Un valor
-        # invalido no frena el arranque - cae al default con una advertencia
-        # explicita, en vez de fallar en silencio o crashear el proceso.
+        # Seleccion EXCLUYENTE de estrategia activa (ver config.
+        # StrategyConfig/VALID_STRATEGIES y su advertencia de diseño
+        # completa): "weekly_asymmetric" (Long-First, DEFAULT), "vol_arbitrage"
+        # (arbitraje delta-neutral original) o "scalping" (Scalping Intradia
+        # como PRINCIPAL, no aditivo - agregado 2026-09-07 a pedido explicito
+        # del usuario). Un valor invalido no frena el arranque - cae al
+        # default con una advertencia explicita, en vez de fallar en
+        # silencio o crashear el proceso.
         active_strategy_name = SETTINGS.strategy.active
         if active_strategy_name not in VALID_STRATEGIES:
             logger.warning(
@@ -145,10 +148,23 @@ class GgalOptionsBot:
         # consume el filtro direccional obligado (BULLISH/BEARISH/NEUTRAL).
         # El modo vol_arbitrage original queda sin cambios de comportamiento.
         self.technical_engine: Optional[TechnicalAnalysisEngine] = None
+        # `self.strategy`: ver VALID_STRATEGIES/StrategyConfig en config.py
+        # para la advertencia de diseño completa sobre GGAL_BOT_ACTIVE_
+        # STRATEGY=scalping (seleccion EXCLUYENTE, 2026-09-07, a pedido
+        # explicito del usuario). Queda en None bajo "scalping": ese modo
+        # usa self.scalping_strategy (ver bloque de Scalping mas abajo, que
+        # se fuerza a ENCENDIDO cuando este es el valor activo), no una
+        # instancia nueva aca - self.strategy solo se referencia dentro de
+        # _run_weekly_asymmetric_cycle/_run_vol_arbitrage_cycle, y ninguna
+        # de las dos se llama desde recompute_cycle() cuando el valor activo
+        # es "scalping" (ver ahi), asi que None nunca se dereferencia.
+        self.strategy: Optional[object] = None
         if self.active_strategy_name == "vol_arbitrage":
             self.strategy = VolatilityArbitrageStrategy(
                 self.risk_manager, smile_threshold_vol_points=SETTINGS.signal.smile_threshold_vol_points,
             )
+        elif self.active_strategy_name == "scalping":
+            pass  # ver comentario de self.strategy arriba y el bloque de Scalping mas abajo.
         else:  # "weekly_asymmetric" (default)
             self.strategy = WeeklyAsymmetricStrategy(self.risk_manager, config=SETTINGS.long_first)
             self.position_sizer = PositionSizer()
@@ -220,6 +236,22 @@ class GgalOptionsBot:
         # de Octubre bajo weekly_asymmetric sigue gestionada exactamente
         # igual que antes de este modulo, linea por linea.
         self.scalping_enabled = SETTINGS.scalping.enabled
+        # GGAL_BOT_ACTIVE_STRATEGY=scalping (seleccion EXCLUYENTE, ver
+        # VALID_STRATEGIES en config.py) implica scalping SIEMPRE, sin
+        # importar GGAL_BOT_ENABLE_SCALPING: bajo esta seleccion,
+        # self.strategy queda en None (weekly_asymmetric/vol_arbitrage
+        # apagados por completo, ver arriba), asi que si tambien el modulo
+        # aditivo de scalping quedara apagado el bot no evaluaria NINGUNA
+        # entrada nueva en todo el proceso - un bot "encendido" que en la
+        # practica no hace nada, sin ningun aviso claro de por que.
+        if self.active_strategy_name == "scalping" and not self.scalping_enabled:
+            logger.warning(
+                "GGAL_BOT_ACTIVE_STRATEGY=scalping pero GGAL_BOT_ENABLE_SCALPING=false: se "
+                "fuerza el modulo de scalping a ENCENDIDO de todos modos - bajo esta seleccion "
+                "exclusiva, weekly_asymmetric/vol_arbitrage ya estan apagados por completo, asi "
+                "que sin esto el bot no operaria ninguna entrada nueva en absoluto."
+            )
+            self.scalping_enabled = True
         self.scalping_strategy: Optional[ScalpingStrategy] = None
         self.scalping_position_sizer: Optional[PositionSizer] = None
         self.scalping_risk_manager: Optional[RiskManager] = None
@@ -268,17 +300,32 @@ class GgalOptionsBot:
                 min_contracts=SETTINGS.scalping.min_contracts_per_trade,
             )
             self.intraday_engine = MultiTimeframeIntradayEngine(config=SETTINGS.scalping)
-            logger.warning(
-                "Modo SCALPING intradia ACTIVADO (GGAL_BOT_ENABLE_SCALPING=true), como modulo "
-                "ADITIVO junto a la estrategia principal '%s': opera sus PROPIAS posiciones "
-                "(Position.strategy_tag='scalping'), con su propio capital asignado "
-                "(GGAL_BOT_SCALPING_MAX_CAPITAL_ARS=$ %.2f, hasta %d posiciones concurrentes) y sus "
-                "propias reglas de entrada/salida (horizonte en minutos, cierre EOD %s, reversion de "
-                "IV) - NO modifica ni gestiona ninguna posicion de weekly_asymmetric/vol_arbitrage.",
-                self.active_strategy_name, SETTINGS.scalping.max_capital_ars,
-                SETTINGS.scalping.max_concurrent_positions,
-                SETTINGS.scalping.eod_close_time if SETTINGS.scalping.eod_close_enabled else "DESACTIVADO",
-            )
+            if self.active_strategy_name == "scalping":
+                logger.warning(
+                    "Modo SCALPING intradia ACTIVADO como estrategia EXCLUYENTE "
+                    "(GGAL_BOT_ACTIVE_STRATEGY=scalping): weekly_asymmetric/vol_arbitrage estan "
+                    "COMPLETAMENTE apagados (ni entradas ni salidas). Opera sus propias posiciones "
+                    "(Position.strategy_tag='scalping'), capital asignado "
+                    "(GGAL_BOT_SCALPING_MAX_CAPITAL_ARS=$ %.2f, hasta %d posiciones concurrentes) y "
+                    "sus propias reglas de entrada/salida (horizonte en minutos, cierre EOD %s, "
+                    "reversion de IV). Cualquier posicion de weekly_asymmetric/vol_arbitrage que "
+                    "haya quedado abierta de antes NO tiene ninguna gestion mientras esta seleccion "
+                    "siga vigente - ver GgalOptionsBot._warn_orphaned_positions_for_active_strategy().",
+                    SETTINGS.scalping.max_capital_ars, SETTINGS.scalping.max_concurrent_positions,
+                    SETTINGS.scalping.eod_close_time if SETTINGS.scalping.eod_close_enabled else "DESACTIVADO",
+                )
+            else:
+                logger.warning(
+                    "Modo SCALPING intradia ACTIVADO (GGAL_BOT_ENABLE_SCALPING=true), como modulo "
+                    "ADITIVO junto a la estrategia principal '%s': opera sus PROPIAS posiciones "
+                    "(Position.strategy_tag='scalping'), con su propio capital asignado "
+                    "(GGAL_BOT_SCALPING_MAX_CAPITAL_ARS=$ %.2f, hasta %d posiciones concurrentes) y sus "
+                    "propias reglas de entrada/salida (horizonte en minutos, cierre EOD %s, reversion de "
+                    "IV) - NO modifica ni gestiona ninguna posicion de weekly_asymmetric/vol_arbitrage.",
+                    self.active_strategy_name, SETTINGS.scalping.max_capital_ars,
+                    SETTINGS.scalping.max_concurrent_positions,
+                    SETTINGS.scalping.eod_close_time if SETTINGS.scalping.eod_close_enabled else "DESACTIVADO",
+                )
 
         # -- Ejecucion -----------------------------------------------------
         self.mm_engine = MarketMakingEngine(
@@ -466,6 +513,65 @@ class GgalOptionsBot:
             len(positions), ", ".join(f"{p.symbol}={p.quantity:g}" for p in positions),
         )
 
+    def _warn_orphaned_positions_for_active_strategy(self) -> None:
+        """
+        Advertencia FUERTE, agregada 2026-09-07 junto con la seleccion
+        EXCLUYENTE de estrategia (ver VALID_STRATEGIES/StrategyConfig en
+        config.py: GGAL_BOT_ACTIVE_STRATEGY ahora acepta "scalping" ademas
+        de "weekly_asymmetric"/"vol_arbitrage", a pedido explicito del
+        usuario tras ser advertido de esta misma consecuencia).
+
+        A diferencia del modo Scalping ADITIVO original (decision
+        deliberada del usuario del 2026-09-03, ver el comentario largo
+        junto a ScalpingConfig, de NO hacer esto por esta misma razon), la
+        seleccion excluyente apaga por completo la gestion - ni entradas
+        NI SALIDAS (Stop Loss/Take Profit/horizonte/guardia de fin de
+        semana) - de cualquier posicion que no pertenezca a la estrategia
+        activa vigente. Esta funcion NUNCA bloquea nada (la eleccion ya fue
+        tomada explicitamente) - unicamente deja constancia, por cada
+        posicion huerfana con su cantidad, de que nadie la esta vigilando,
+        para que nunca sea una sorpresa silenciosa como la que motivo esta
+        misma fase (ver AUDITORIA_FASE5.2_LIFECYCLE_ROOT_CAUSE.md).
+
+        Bajo "vol_arbitrage" no se declara NINGUN strategy_tag como
+        gestionado: su ciclo (_run_vol_arbitrage_cycle -> strategy.
+        scan_for_signals) no recibe el portfolio ni filtra por
+        strategy_tag, asi que no hay ninguna garantia real de gestion que
+        declarar sobre posiciones preexistentes bajo ese modo - reportarlas
+        como huerfanas es lo unico honesto, no una limitacion nueva de este
+        cambio (el modo vol_arbitrage no esta en uso en produccion, ver
+        docs/AUDITORIA_MAESTRA_2026-08-27.md).
+        """
+        managed_tags = set()
+        if self.active_strategy_name == "weekly_asymmetric":
+            managed_tags.add("weekly_asymmetric")
+        elif self.active_strategy_name == "scalping":
+            managed_tags.add("scalping")
+        # "vol_arbitrage": deliberadamente ningun tag (ver docstring arriba).
+        if self.scalping_enabled:
+            managed_tags.add("scalping")
+
+        orphaned: Dict[str, float] = {}
+        for pos in self.portfolio.positions:
+            if pos.quantity == 0:
+                continue
+            tag = pos.strategy_tag or "weekly_asymmetric"
+            if tag not in managed_tags:
+                orphaned[pos.symbol] = orphaned.get(pos.symbol, 0.0) + pos.quantity
+
+        if orphaned:
+            logger.warning(
+                "ATENCION - posiciones SIN NINGUNA gestion de riesgo bajo la seleccion exclusiva "
+                "vigente (GGAL_BOT_ACTIVE_STRATEGY=%s, modulo de scalping %s): %s. Ni Stop Loss, "
+                "ni Take Profit, ni horizonte semanal, ni guardia de fin de semana se evaluan "
+                "sobre estas bases mientras esta seleccion siga vigente - permanecen abiertas "
+                "hasta que las cierres a mano o reinicies el bot con la estrategia que las "
+                "gestiona. Ver GgalOptionsBot._warn_orphaned_positions_for_active_strategy().",
+                self.active_strategy_name,
+                "activado" if self.scalping_enabled else "desactivado",
+                {k: round(v, 4) for k, v in orphaned.items()},
+            )
+
     def connect_and_subscribe(self) -> bool:
         if self.shadow_mode:
             # Sin PyRofex, sin websocket: bootstrap_universe() arma el
@@ -475,6 +581,7 @@ class GgalOptionsBot:
             self._subscribed_tickers = self.market_feed.bootstrap_universe(self.option_chain)
             self.market_feed.subscribe(self._subscribed_tickers)
             self._reconcile_portfolio_on_startup()
+            self._warn_orphaned_positions_for_active_strategy()
             return True
 
         if not initialize_environment():
@@ -561,14 +668,26 @@ class GgalOptionsBot:
 
         if self.active_strategy_name == "vol_arbitrage":
             all_signals = self._run_vol_arbitrage_cycle(spot)
+        elif self.active_strategy_name == "scalping":
+            # Seleccion EXCLUYENTE (ver VALID_STRATEGIES en config.py):
+            # ni weekly_asymmetric ni vol_arbitrage corren en absoluto bajo
+            # este valor - self.strategy es None (ver __init__), asi que
+            # ninguna de esas dos ramas puede llamarse aca. El ciclo de
+            # scalping en si se dispara mas abajo, igual que en modo
+            # aditivo (self.scalping_enabled esta FORZADO a True en
+            # __init__ cuando active_strategy_name=="scalping").
+            all_signals = []
         else:
             all_signals = self._run_weekly_asymmetric_cycle(spot)
 
-        # Modulo ADITIVO de Scalping Intradia (ver ScalpingConfig/
-        # GGAL_BOT_ENABLE_SCALPING y el comentario largo en __init__):
-        # corre SIEMPRE DESPUES de la estrategia principal de arriba,
-        # nunca en su lugar - con el flag apagado (default) esta llamada
-        # es un no-op completo.
+        # Modulo de Scalping Intradia (ver ScalpingConfig/
+        # GGAL_BOT_ENABLE_SCALPING y el comentario largo en __init__): con
+        # GGAL_BOT_ACTIVE_STRATEGY=scalping corre como estrategia PRINCIPAL
+        # (self.scalping_enabled forzado a True en __init__, la rama de
+        # arriba ya dejo all_signals=[]); en cualquier otro caso, sigue
+        # siendo el modulo ADITIVO original que corre SIEMPRE DESPUES de la
+        # estrategia principal, nunca en su lugar - con el flag apagado
+        # (default) esta llamada es un no-op completo.
         if self.scalping_enabled:
             all_signals.extend(self._run_scalping_cycle(spot))
 

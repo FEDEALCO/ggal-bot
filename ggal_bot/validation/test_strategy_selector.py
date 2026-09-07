@@ -88,6 +88,151 @@ def test_vol_arbitrage_selection_leaves_position_sizer_unset():
         SETTINGS.strategy.active = original
 
 
+def test_scalping_exclusive_selection_disables_main_strategy_and_forces_scalping_on():
+    """
+    Regresion (2026-09-07, GGAL_BOT_ACTIVE_STRATEGY=scalping, seleccion
+    EXCLUYENTE agregada a pedido explicito del usuario - ver la advertencia
+    de diseño completa junto a VALID_STRATEGIES en config.py): con esta
+    seleccion, self.strategy (weekly_asymmetric/vol_arbitrage) debe quedar
+    en None - ninguna de las dos ramas de recompute_cycle() puede
+    dereferenciarlo -, y el modulo de scalping debe quedar SIEMPRE
+    encendido (con su propio warning si GGAL_BOT_ENABLE_SCALPING estaba en
+    false), porque de lo contrario el bot no operaria ninguna entrada
+    nueva en todo el proceso.
+    """
+    original_strategy = SETTINGS.strategy.active
+    original_scalping_enabled = SETTINGS.scalping.enabled
+    SETTINGS.strategy.active = "scalping"
+    SETTINGS.scalping.enabled = False  # simula GGAL_BOT_ENABLE_SCALPING sin setear
+    try:
+        bot = GgalOptionsBot()
+        assert bot.active_strategy_name == "scalping"
+        assert bot.strategy is None
+        assert bot.position_sizer is None
+        assert bot.technical_engine is None
+        assert bot.scalping_enabled is True, (
+            "GGAL_BOT_ACTIVE_STRATEGY=scalping debe forzar el modulo de scalping a ENCENDIDO "
+            "aunque GGAL_BOT_ENABLE_SCALPING este en false - de lo contrario el bot no "
+            "operaria ninguna entrada nueva en absoluto."
+        )
+        assert bot.scalping_strategy is not None
+        assert bot.scalping_position_sizer is not None
+        assert bot.scalping_risk_manager is not None
+    finally:
+        SETTINGS.strategy.active = original_strategy
+        SETTINGS.scalping.enabled = original_scalping_enabled
+
+
+def test_scalping_exclusive_selection_recompute_cycle_never_calls_other_strategies():
+    """
+    Confirma el dispatch de recompute_cycle(): bajo GGAL_BOT_ACTIVE_STRATEGY=
+    scalping, ni _run_weekly_asymmetric_cycle ni _run_vol_arbitrage_cycle
+    deben llamarse NUNCA (harian falta self.strategy/self.technical_engine,
+    que quedan en None bajo esta seleccion) - solo _run_scalping_cycle.
+    market_feed.poll() se reemplaza por un no-op para no pegarle a la red
+    real de data912.com en este test (mismo criterio que el resto de la
+    suite, que nunca llama a recompute_cycle() directamente por esto mismo).
+    """
+    original_strategy = SETTINGS.strategy.active
+    original_shadow = SETTINGS.shadow.enabled
+    SETTINGS.strategy.active = "scalping"
+    SETTINGS.shadow.enabled = True
+    try:
+        bot = GgalOptionsBot()
+        bot.market_feed.poll = lambda *_a, **_kw: None
+        bot._spot_book = OrderBookSnapshot(
+            SETTINGS.instruments.contado_ticker, bid=6999.0, ask=7001.0, bid_size=100, ask_size=100,
+        )
+
+        def _boom(*_a, **_kw):
+            raise AssertionError("no debia llamarse bajo GGAL_BOT_ACTIVE_STRATEGY=scalping")
+
+        bot._run_weekly_asymmetric_cycle = _boom
+        bot._run_vol_arbitrage_cycle = _boom
+
+        scalping_calls = []
+        original_scalping_cycle = bot._run_scalping_cycle
+
+        def _spy_scalping_cycle(spot):
+            scalping_calls.append(spot)
+            return original_scalping_cycle(spot)
+
+        bot._run_scalping_cycle = _spy_scalping_cycle
+
+        bot.recompute_cycle()  # no debe levantar AssertionError desde _boom
+
+        assert len(scalping_calls) == 1
+    finally:
+        SETTINGS.strategy.active = original_strategy
+        SETTINGS.shadow.enabled = original_shadow
+
+
+# ---------------------------------------------------------------------------
+# _warn_orphaned_positions_for_active_strategy(): advertencia (nunca bloqueo)
+# de posiciones sin ninguna gestion bajo la seleccion exclusiva vigente.
+# ---------------------------------------------------------------------------
+
+def test_warn_orphaned_positions_flags_weekly_asymmetric_position_under_scalping_selection():
+    """
+    Con GGAL_BOT_ACTIVE_STRATEGY=scalping y una posicion preexistente sin
+    strategy_tag (o sea, "weekly_asymmetric" por convencion - ver
+    Position.strategy_tag), la advertencia debe dispararse nombrando esa
+    base: bajo esta seleccion, ninguna salida de weekly_asymmetric se
+    evalua nunca (self.strategy es None), asi que esa posicion queda sin
+    ninguna gestion de riesgo hasta que se cierre a mano o se reinicie el
+    bot con weekly_asymmetric activo.
+    """
+    import run_bot as run_bot_module
+
+    original_strategy = SETTINGS.strategy.active
+    original_scalping_enabled = SETTINGS.scalping.enabled
+    SETTINGS.strategy.active = "scalping"
+    SETTINGS.scalping.enabled = False
+    try:
+        bot = GgalOptionsBot()
+        bot.portfolio.add(Position(symbol="GFGC7000OC", quantity=9.0, multiplier=100.0))
+
+        warnings_logged = []
+        original_warning = run_bot_module.logger.warning
+        run_bot_module.logger.warning = lambda msg, *args: warnings_logged.append(msg % args)
+        try:
+            bot._warn_orphaned_positions_for_active_strategy()
+        finally:
+            run_bot_module.logger.warning = original_warning
+
+        assert any("GFGC7000OC" in w and "ATENCION" in w for w in warnings_logged), (
+            f"esperaba una advertencia de posicion huerfana mencionando GFGC7000OC, se logueo: {warnings_logged}"
+        )
+    finally:
+        SETTINGS.strategy.active = original_strategy
+        SETTINGS.scalping.enabled = original_scalping_enabled
+
+
+def test_warn_orphaned_positions_silent_when_position_matches_active_strategy():
+    """Contraparte del test de arriba: sin ninguna posicion huerfana, no debe loguearse nada."""
+    import run_bot as run_bot_module
+
+    original_strategy = SETTINGS.strategy.active
+    SETTINGS.strategy.active = "weekly_asymmetric"
+    try:
+        bot = GgalOptionsBot()
+        bot.portfolio.add(Position(symbol="GFGC7000OC", quantity=9.0, multiplier=100.0))  # tag=None -> weekly_asymmetric
+
+        warnings_logged = []
+        original_warning = run_bot_module.logger.warning
+        run_bot_module.logger.warning = lambda msg, *args: warnings_logged.append(msg % args)
+        try:
+            bot._warn_orphaned_positions_for_active_strategy()
+        finally:
+            run_bot_module.logger.warning = original_warning
+
+        assert not any("ATENCION" in w for w in warnings_logged), (
+            f"no deberia haber ninguna posicion huerfana bajo weekly_asymmetric activo: {warnings_logged}"
+        )
+    finally:
+        SETTINGS.strategy.active = original_strategy
+
+
 def test_invalid_active_strategy_falls_back_to_weekly_asymmetric():
     original = SETTINGS.strategy.active
     SETTINGS.strategy.active = "esto_no_existe"
@@ -497,6 +642,10 @@ def test_weekly_asymmetric_cycle_forces_neutral_when_technical_snapshot_is_synth
 ALL_TESTS = [
     test_default_weekly_asymmetric_wires_strategy_and_position_sizer,
     test_vol_arbitrage_selection_leaves_position_sizer_unset,
+    test_scalping_exclusive_selection_disables_main_strategy_and_forces_scalping_on,
+    test_scalping_exclusive_selection_recompute_cycle_never_calls_other_strategies,
+    test_warn_orphaned_positions_flags_weekly_asymmetric_position_under_scalping_selection,
+    test_warn_orphaned_positions_silent_when_position_matches_active_strategy,
     test_invalid_active_strategy_falls_back_to_weekly_asymmetric,
     test_capital_available_ars_reflects_open_and_closed_positions,
     test_weekly_asymmetric_cycle_reconciles_exit_before_sizing_new_entry,
