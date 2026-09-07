@@ -93,7 +93,7 @@ class RiskManager:
         expiry: date,
         stop_loss_pct: float,
         take_profit_pct: float,
-        max_holding_business_days: int,
+        max_holding_business_days: Optional[int],
         weekend_theta_guard_enabled: bool = True,
         enable_tiered_stop_loss: bool = False,
         tiered_stop_loss_stage2_business_day: int = 2,
@@ -158,7 +158,12 @@ class RiskManager:
         if pnl_pct >= abs(take_profit_pct):
             return "take_profit"
 
-        if holding_business_days >= max_holding_business_days:
+        # max_holding_business_days=None ("sin limite", ver LongFirstConfig/
+        # ScalpingConfig en config.py, AJUSTE 2026-09-07 a pedido explicito
+        # del usuario): esta salida especifica queda desactivada - el resto
+        # de las salidas de arriba/abajo (Stop Loss/Take Profit/guardia de
+        # fin de semana) siguen evaluandose exactamente igual.
+        if max_holding_business_days is not None and holding_business_days >= max_holding_business_days:
             return "weekly_horizon_expired"
 
         # Guardia de fin de semana: el fin de semana son 2-3 dias corridos

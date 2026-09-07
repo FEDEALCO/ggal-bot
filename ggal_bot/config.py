@@ -595,33 +595,89 @@ class LongFirstConfig:
     min_contracts_per_trade: int = _env_int("GGAL_BOT_MIN_CONTRACTS_PER_TRADE", 1)
 
     # --- Objetivo de retorno (dimensionamiento, NO garantia - ver nota arriba) ---
-    # AJUSTE DE RIESGO 2026-09-07: bajado de $1.000.000 (100% semanal) a
-    # $400.000 (40% semanal), a pedido explicito del usuario, como
-    # "politica de riesgo" declarada - NO porque haya evidencia de que
-    # $1.000.000 causara el problema observado (el usuario fue explicito:
-    # "razonable como control de agresividad, pero no es una causa
-    # demostrada del problema").
+    # AJUSTE DE RIESGO 2026-09-07 (primera vuelta): bajado de $1.000.000
+    # (100% semanal) a $400.000 (40% semanal), a pedido explicito del
+    # usuario, como "politica de riesgo" declarada - NO porque hubiera
+    # evidencia de que $1.000.000 causara el problema observado (el usuario
+    # fue explicito en ese momento: "razonable como control de agresividad,
+    # pero no es una causa demostrada del problema").
     #
-    # LIMITACION IMPORTANTE, verificada por grep antes de este cambio (no
-    # asumida): este campo NO esta conectado a NINGUN calculo del bot hoy.
-    # `risk/position_sizer.py::PositionSizer.compute_contracts()` (la unica
-    # fuente real de sizing) NO lo lee, y no hay ningun otro punto del
-    # codigo que lo use para limitar contratos, capital, o frecuencia de
-    # entradas - es puramente documental/de intencion (ver el docstring de
-    # weekly_asymmetric.py que lo cita como "PARAMETRO DE DIMENSIONAMIENTO
-    # para calibrar cuanta convexidad se busca", nunca como un input a una
-    # formula). El usuario pidio explicitamente que este valor NUNCA se use
-    # como presion para forzar mas operaciones - hoy esa garantia se
-    # cumple trivialmente porque el campo no se lee en ningun lado, pero
-    # eso tambien significa que bajarlo a $400.000 no cambia, por si solo,
-    # ningun comportamiento real del bot todavia. Si en el futuro se
-    # decide conectarlo a algo (ej. un techo adicional de riesgo agregado
-    # semanal), eso es un cambio de codigo nuevo, no cubierto por este
-    # commit.
-    weekly_target_ars: float = _env_float("GGAL_BOT_WEEKLY_TARGET_ARS", 400_000.0)
+    # AJUSTE 2026-09-07 (segunda vuelta, mismo dia): vuelto a subir a
+    # $1.000.000 a pedido explicito del usuario ("buscar que la estrategia
+    # genere $1.000.000 por semana de profit"). Se le recordo la misma
+    # limitacion de abajo (sigue sin estar conectado a ningun calculo) antes
+    # de aplicar el cambio.
+    #
+    # LIMITACION IMPORTANTE, verificada por grep (no asumida, sigue vigente
+    # tras este segundo cambio): este campo NO esta conectado a NINGUN
+    # calculo del bot hoy. `risk/position_sizer.py::PositionSizer.
+    # compute_contracts()` (la unica fuente real de sizing) NO lo lee, y no
+    # hay ningun otro punto del codigo que lo use para limitar contratos,
+    # capital, frecuencia de entradas, ni para medir/reportar si la
+    # estrategia efectivamente lo esta cumpliendo - es puramente documental/
+    # de intencion (ver el docstring de weekly_asymmetric.py que lo cita
+    # como "PARAMETRO DE DIMENSIONAMIENTO para calibrar cuanta convexidad se
+    # busca", nunca como un input a una formula). Subirlo a $1.000.000 no
+    # cambia, por si solo, NINGUN comportamiento real del bot - no aumenta
+    # el sizing, no relaja ningun filtro de entrada, no agrega presion para
+    # operar mas seguido. El usuario fue informado explicitamente de esto
+    # antes de aplicar el cambio. Si en el futuro se decide conectarlo a
+    # algo real (ej. medir PnL semanal acumulado contra este objetivo en el
+    # dashboard, o un techo de riesgo agregado semanal), eso es un cambio de
+    # codigo nuevo, no cubierto por este commit.
+    weekly_target_ars: float = _env_float("GGAL_BOT_WEEKLY_TARGET_ARS", 1_000_000.0)
 
-    # --- Horizonte semanal y guardia de decay de fin de semana ---
-    max_holding_business_days: int = _env_int("GGAL_BOT_MAX_HOLDING_BUSINESS_DAYS", 5)
+    # --- Horizonte de entrada/salida y guardia de decay de fin de semana ---
+    # AJUSTE 2026-09-07, a pedido explicito del usuario: "quita el limite de
+    # vencimiento de aca a maximo 5 dias habiles... el objetivo es que opere
+    # en el vto mas proximo de opciones que tenga mayor profundidad y
+    # liquidez, como en este caso el vto de octubre". Cambiado de un entero
+    # fijo (5) a Optional[int] con None = "sin limite" (0 o sin setear la
+    # variable de entorno tambien resuelve a None - mismo patron que
+    # RiskLimitsConfig.max_daily_loss_ars/max_open_contracts_total mas
+    # arriba). Este campo cumple DOS roles distintos, acoplados por ser el
+    # mismo valor (ver strategy/weekly_asymmetric.py::scan_entry_signals y
+    # risk/risk_manager.py::evaluate_position_exit):
+    #   1) ENTRADA: descarta cualquier cotizacion cuyo vencimiento este a
+    #      mas dias habiles que este valor - con None, ninguna cotizacion se
+    #      descarta por este motivo (segun evidencia real en produccion, ver
+    #      ggal_bot/data/live_shadow_feed.py::_refresh_individual_quotes,
+    #      esto es exactamente lo que bloqueaba toda entrada nueva bajo
+    #      GGAL_BOT_FORCE_EXPIRY=octubre: "10 validas en 2026-10-16
+    #      (bloqueadas igual por horizonte semanal) vs. apenas 2 en
+    #      2026-09-18" - Septiembre ya no tiene profundidad suficiente ni
+    #      para llegar al piso de 3 cotizaciones para escanear).
+    #   2) SALIDA: fuerza el cierre de una posicion abierta tras mantenerla
+    #      este numero de dias habiles ("weekly_horizon_expired") - con
+    #      None, esta salida especifica queda desactivada (nunca se
+    #      dispara), dejando el resto de las salidas (Stop Loss/Take
+    #      Profit/tiered SL/toma parcial/compresion de vega) intactas y
+    #      operando exactamente igual que antes.
+    #
+    # ADVERTENCIA (NO resuelta por este cambio, ver weekend_theta_guard_
+    # enabled inmediatamente abajo): quitar este limite NO implica que una
+    # posicion pueda quedar abierta indefinidamente sin ningun corte
+    # temporal - weekend_theta_guard_enabled es un mecanismo COMPLETAMENTE
+    # INDEPENDIENTE (no lee este campo) que sigue forzando el cierre de
+    # CUALQUIER posicion todos los viernes mientras su vencimiento no haya
+    # llegado, sin importar cuantos dias lleve abierta. Ver la nota de
+    # riesgo junto a ese flag.
+    max_holding_business_days: Optional[int] = _env_int("GGAL_BOT_MAX_HOLDING_BUSINESS_DAYS", 0) or None
+    # NOTA DE RIESGO (leer junto con el cambio de arriba, 2026-09-07): este
+    # flag sigue en True por defecto - fuerza el cierre de CUALQUIER
+    # posicion todos los viernes cuyo vencimiento sea posterior a ese
+    # viernes (ver risk/risk_manager.py::evaluate_position_exit, chequeo
+    # "weekend_theta_guard"), sin importar el valor de
+    # max_holding_business_days de arriba. Se agrego originalmente (ver
+    # docs/auditoria del 2026-09-01) tras un caso real de -$133.568 de
+    # decay overnight/de fin de semana no capturado a tiempo por el stop
+    # fijo. Si el objetivo es sostener una posicion en un vencimiento mas
+    # lejano (ej. octubre) A TRAVES de uno o mas fines de semana, este flag
+    # la va a seguir cerrando cada viernes de todos modos - quitar el
+    # horizonte de arriba NO alcanza por si solo para lograr ese objetivo.
+    # Desactivarlo (GGAL_BOT_WEEKEND_THETA_GUARD=false) es una decision de
+    # riesgo aparte, deliberadamente NO tomada en este mismo cambio sin
+    # confirmacion explicita del usuario.
     weekend_theta_guard_enabled: bool = _env_bool("GGAL_BOT_WEEKEND_THETA_GUARD", True)
 
     # --- Salida forzada, medida sobre la PRIMA pagada (no sobre el subyacente) ---
@@ -792,8 +848,23 @@ class ScalpingConfig:
     # en minutos): esto solo filtra que bases se consideran para abrir
     # (bases de vencimiento muy lejano no sirven para scalping de alta
     # convexidad), la decision de CUANDO cerrar una posicion ya abierta es
-    # enteramente independiente y se mide en minutos.
-    max_holding_business_days: int = _env_int("GGAL_BOT_SCALPING_MAX_HOLDING_BUSINESS_DAYS", 3)
+    # enteramente independiente y se mide en minutos (o el cierre EOD, ver
+    # eod_close_enabled/eod_close_time mas abajo - NINGUNO de los dos lee
+    # este campo).
+    #
+    # AJUSTE 2026-09-07, a pedido explicito del usuario (mismo pedido que
+    # LongFirstConfig.max_holding_business_days arriba en el archivo, ver
+    # esa nota para el detalle completo/evidencia de produccion): cambiado
+    # de un entero fijo (3) a Optional[int] con None = "sin limite" (0 o
+    # sin setear la variable de entorno tambien resuelve a None). A
+    # diferencia de weekly_asymmetric, para Scalping esto es un cambio
+    # LIMPIO sin ninguna contrapartida de riesgo escondida: este campo NUNCA
+    # se usó para decidir cuando cerrar una posicion (eso ya es
+    # completamente independiente, en minutos + cierre EOD diario) - quitar
+    # el limite solo amplia que bases son candidatas para abrir (ej.
+    # octubre en vez de solo los proximos 3 dias habiles), sin tocar en
+    # absoluto la disciplina intradia de salida.
+    max_holding_business_days: Optional[int] = _env_int("GGAL_BOT_SCALPING_MAX_HOLDING_BUSINESS_DAYS", 0) or None
     require_level_confirmation: bool = _env_bool("GGAL_BOT_SCALPING_REQUIRE_LEVEL_CONFIRMATION", False)
     level_threshold_vol_points: float = _env_float("GGAL_BOT_SCALPING_LEVEL_THRESHOLD", 5.0)
     enable_obi_filter: bool = _env_bool("GGAL_BOT_SCALPING_ENABLE_OBI_FILTER", True)
