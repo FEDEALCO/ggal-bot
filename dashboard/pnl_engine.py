@@ -102,7 +102,23 @@ def load_fills(csv_path: Optional[Path] = None) -> pd.DataFrame:
     if df.empty:
         return df
 
-    df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
+    # BUG REAL VERIFICADO (2026-09-08, ver ggal_bot/ops/manual_close.py y su
+    # test_manual_close.py::test_close_position_manually_auto_detects...):
+    # sin format="ISO8601", pandas (>=2.0) infiere el formato de fecha del
+    # PRIMER valor no nulo de la columna y lo aplica de forma estricta al
+    # resto - un timestamp_utc con distinta precision de sub-segundo (ej.
+    # "...T10:00:00+00:00" sin microsegundos vs "...T10:00:00.123456+00:00"
+    # con microsegundos, ambos producidos por datetime.now(timezone.utc).
+    # isoformat() en ShadowAuditLogger.log_fill segun si el microsegundo
+    # cae en 0) se parsea como NaT en silencio - y dropna() lo descarta sin
+    # ningun warning. Reproducido de forma determinista: ver
+    # test_load_fills_parses_mixed_subsecond_precision_timestamps_without_dropping_rows.
+    # Esto corre el riesgo real de perder fills completos (compras o
+    # ventas) tanto en el dashboard como en la reconciliacion de arranque
+    # del bot (reconstruct_positions_from_shadow_log usa esta misma
+    # funcion) - format="ISO8601" parsea cada valor de forma independiente
+    # (sigue siendo estrictamente ISO 8601, no "adivina" formatos raros).
+    df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce", format="ISO8601")
     for col in ("quantity", "fill_price", "reference_price", "requested_price"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
 

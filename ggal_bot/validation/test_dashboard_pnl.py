@@ -272,6 +272,45 @@ def test_load_fills_returns_empty_frame_when_file_missing(tmp_path=None):
         assert df.empty
 
 
+def test_load_fills_parses_mixed_subsecond_precision_timestamps_without_dropping_rows():
+    """
+    Regresion (2026-09-08, BUG REAL descubierto al construir
+    ggal_bot/ops/manual_close.py - ver el comentario largo en
+    pnl_engine.load_fills()): sin format="ISO8601", pandas infiere el
+    formato de fecha del PRIMER valor no nulo de la columna y lo aplica de
+    forma ESTRICTA al resto de la columna - dos timestamps ISO 8601
+    perfectamente validos pero con distinta precision de sub-segundo (uno
+    sin microsegundos, otro con) hacian que el segundo se parseara como
+    NaT y lo descartara dropna() EN SILENCIO, sin ningun warning. Esto
+    afecta tanto al dashboard como a
+    ggal_bot.portfolio.reconciliation.reconstruct_positions_from_shadow_log
+    (misma funcion), que run_bot.py corre en CADA arranque del bot en modo
+    shadow - un fill perdido asi habria hecho reconstruir una posicion con
+    cantidad neta incorrecta sin ningun error visible.
+    """
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        csv_path = Path(tmp_dir) / "shadow_trades.csv"
+        csv_path.write_text(
+            "timestamp_utc,client_order_id,symbol,side,order_type,quantity,"
+            "requested_price,fill_price,reference_price,event\n"
+            "2026-09-01T10:00:00+00:00,cid1,GFGC7000OC,buy,limit,9.0,480.0,480.0,480.0,shadow_fill\n"
+            "2026-09-08T16:34:52.077279+00:00,cid2,GFGC7000OC,sell,market,9.0,500.0,500.0,500.0,shadow_fill\n"
+        )
+        fills = pe.load_fills(csv_path=csv_path)
+        assert len(fills) == 2, (
+            f"se esperaban 2 fills, se obtuvieron {len(fills)} - el fill con microsegundos "
+            "se esta descartando en silencio (ver docstring de este test)"
+        )
+        assert not fills["timestamp_utc"].isna().any()
+        closed, open_lots = pe.match_trades_fifo(fills, option_multiplier=100.0)
+        assert len(open_lots) == 0  # las 9 compradas y las 9 vendidas deben aparearse
+        assert len(closed) == 1
+        assert closed[0].quantity == 9.0
+
+
 def test_fit_smile_curve_returns_quadratic_shape():
     df = pd.DataFrame([
         {"strike": 5000.0, "spot_ref": 5200.0, "iv": 0.60},
@@ -329,6 +368,7 @@ ALL_TESTS = [
     test_compute_summary_win_rate_and_profit_factor,
     test_compute_max_drawdown_on_synthetic_equity_curve,
     test_load_fills_returns_empty_frame_when_file_missing,
+    test_load_fills_parses_mixed_subsecond_precision_timestamps_without_dropping_rows,
     test_fit_smile_curve_returns_quadratic_shape,
 ]
 
