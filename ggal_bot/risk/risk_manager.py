@@ -95,6 +95,7 @@ class RiskManager:
         take_profit_pct: float,
         max_holding_business_days: Optional[int],
         weekend_theta_guard_enabled: bool = True,
+        weekend_theta_guard_max_holding_business_days: Optional[int] = None,
         enable_tiered_stop_loss: bool = False,
         tiered_stop_loss_stage2_business_day: int = 2,
         tiered_stop_loss_stage2_pct: float = 0.35,
@@ -171,7 +172,30 @@ class RiskManager:
         # esperada no se materializo. Solo aplica si el vencimiento es
         # POSTERIOR a este viernes (si vence el viernes mismo, da lo mismo:
         # ya se va a resolver por vencimiento, no hace falta forzar nada).
-        if weekend_theta_guard_enabled and now.weekday() == 4 and expiry > now.date():
+        #
+        # ACOTACION (TANDA 2 "OPTIMIZACION EJECUTABLE", 2026-09-08, ver
+        # comentario extenso en config.LongFirstConfig.
+        # weekend_theta_guard_max_holding_business_days): el riesgo real que
+        # este guard protege (decay de fin de semana no capturado a tiempo)
+        # es mayor temprano en la vida de la posicion, cuando el Stop Loss
+        # todavia esta en su version mas ancha - no despues de que la
+        # posicion ya paso a una etapa de stop mas angosta. Con
+        # `weekend_theta_guard_max_holding_business_days=None` (default) el
+        # comportamiento es IDENTICO a como era antes de este parametro
+        # (dispara siempre, sin excepcion). Si esta seteado, una vez que la
+        # posicion ya lleva ese numero de dias habiles abierta, el guard
+        # deja de forzar el cierre semanal (ya esta protegida por un stop
+        # mas ajustado, y la tesis de horizonte largo puede sobrevivir el
+        # fin de semana).
+        if (
+            weekend_theta_guard_enabled
+            and now.weekday() == 4
+            and expiry > now.date()
+            and (
+                weekend_theta_guard_max_holding_business_days is None
+                or holding_business_days < weekend_theta_guard_max_holding_business_days
+            )
+        ):
             return "weekend_theta_guard"
 
         return None

@@ -77,8 +77,19 @@ def test_default_weekly_asymmetric_wires_strategy_and_position_sizer():
 
 
 def test_vol_arbitrage_selection_leaves_position_sizer_unset():
+    """
+    ACTUALIZADO (TANDA 2 "OPTIMIZACION EJECUTABLE", seccion 12, 2026-09-08):
+    ahora requiere shadow.enabled=True explicito - vol_arbitrage fuera de
+    modo shadow cae a weekly_asymmetric (ver la nueva salvaguarda en
+    GgalOptionsBot.__init__ y test_vol_arbitrage_selection_blocked_outside_
+    shadow_mode_falls_back_to_weekly_asymmetric mas abajo). Este test sigue
+    validando UNICAMENTE el wiring de seleccion bajo vol_arbitrage
+    (position_sizer sin usar), no la salvaguarda en si.
+    """
     original = SETTINGS.strategy.active
+    original_shadow = SETTINGS.shadow.enabled
     SETTINGS.strategy.active = "vol_arbitrage"
+    SETTINGS.shadow.enabled = True
     try:
         bot = GgalOptionsBot()
         assert bot.active_strategy_name == "vol_arbitrage"
@@ -86,6 +97,30 @@ def test_vol_arbitrage_selection_leaves_position_sizer_unset():
         assert bot.position_sizer is None
     finally:
         SETTINGS.strategy.active = original
+        SETTINGS.shadow.enabled = original_shadow
+
+
+def test_vol_arbitrage_selection_blocked_outside_shadow_mode_falls_back_to_weekly_asymmetric():
+    """
+    NUEVO (TANDA 2 "OPTIMIZACION EJECUTABLE", seccion 12, 2026-09-08):
+    vol_arbitrage es NO-GO de produccion por instruccion explicita y
+    repetida del usuario. Antes de esta salvaguarda, nada impedia que
+    GGAL_BOT_ACTIVE_STRATEGY=vol_arbitrage con GGAL_BOT_SHADOW_MODE=false
+    (el default de shadow.enabled) arrancara el bot operando vol_arbitrage
+    con ordenes REALES. Ahora debe caer a weekly_asymmetric.
+    """
+    original = SETTINGS.strategy.active
+    original_shadow = SETTINGS.shadow.enabled
+    SETTINGS.strategy.active = "vol_arbitrage"
+    SETTINGS.shadow.enabled = False
+    try:
+        bot = GgalOptionsBot()
+        assert bot.active_strategy_name == "weekly_asymmetric"
+        assert isinstance(bot.strategy, WeeklyAsymmetricStrategy)
+        assert bot.position_sizer is not None
+    finally:
+        SETTINGS.strategy.active = original
+        SETTINGS.shadow.enabled = original_shadow
 
 
 def test_scalping_exclusive_selection_disables_main_strategy_and_forces_scalping_on():
@@ -642,6 +677,7 @@ def test_weekly_asymmetric_cycle_forces_neutral_when_technical_snapshot_is_synth
 ALL_TESTS = [
     test_default_weekly_asymmetric_wires_strategy_and_position_sizer,
     test_vol_arbitrage_selection_leaves_position_sizer_unset,
+    test_vol_arbitrage_selection_blocked_outside_shadow_mode_falls_back_to_weekly_asymmetric,
     test_scalping_exclusive_selection_disables_main_strategy_and_forces_scalping_on,
     test_scalping_exclusive_selection_recompute_cycle_never_calls_other_strategies,
     test_warn_orphaned_positions_flags_weekly_asymmetric_position_under_scalping_selection,

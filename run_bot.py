@@ -136,6 +136,34 @@ class GgalOptionsBot:
                 active_strategy_name, ", ".join(VALID_STRATEGIES),
             )
             active_strategy_name = "weekly_asymmetric"
+
+        # SALVAGUARDA (TANDA 2 "OPTIMIZACION EJECUTABLE", seccion 12,
+        # 2026-09-08): vol_arbitrage es NO-GO de produccion por instruccion
+        # explicita y repetida del usuario (debe permanecer SHADOW/PAPER
+        # ONLY - nunca cierra posiciones solo, ver TODO documentado en
+        # _act_on_signal). VERIFICADO por lectura de codigo: antes de esta
+        # salvaguarda, NADA en VALID_STRATEGIES/la seleccion de arriba
+        # distinguia "shadow-only" de "production-ready" - un
+        # GGAL_BOT_ACTIVE_STRATEGY=vol_arbitrage puesto por error (o por
+        # configuracion vieja arrastrada) en un deploy CON
+        # GGAL_BOT_SHADOW_MODE=false habria operado vol_arbitrage con
+        # ordenes REALES sin que ningun otro chequeo lo impidiera. Se
+        # verifica aca, temprano en el arranque, contra SETTINGS.shadow.
+        # enabled directamente (no contra self.shadow_mode, todavia sin
+        # asignar en este punto del __init__): si se pide vol_arbitrage
+        # fuera de modo shadow, se cae a "weekly_asymmetric" con un
+        # logger.critical explicito, en vez de arrancar en silencio con
+        # exposicion short/vol_arbitrage real no autorizada.
+        if active_strategy_name == "vol_arbitrage" and not SETTINGS.shadow.enabled:
+            logger.critical(
+                "GGAL_BOT_ACTIVE_STRATEGY=vol_arbitrage pero GGAL_BOT_SHADOW_MODE=false "
+                "(o sin setear): vol_arbitrage es NO-GO DE PRODUCCION (debe permanecer "
+                "SHADOW/PAPER ONLY, no cierra posiciones solo - ver TODO en _act_on_signal). "
+                "Se fuerza 'weekly_asymmetric' en su lugar. Para operar vol_arbitrage, hacerlo "
+                "UNICAMENTE con GGAL_BOT_SHADOW_MODE=true."
+            )
+            active_strategy_name = "weekly_asymmetric"
+
         self.active_strategy_name = active_strategy_name
 
         # `self.position_sizer` solo existe bajo weekly_asymmetric: el modo
@@ -1219,6 +1247,36 @@ class GgalOptionsBot:
         """Posicion neta (signed) actualmente registrada en self.portfolio para `symbol`."""
         return sum(p.quantity for p in self.portfolio.positions if p.symbol == symbol)
 
+    def _log_guard2(
+        self, *, caller: str, symbol: str, strategy_tag: str, existing_quantity: float,
+        reason: str, blocked: bool,
+    ) -> None:
+        """
+        Instrumentacion de Guarda 2 (TANDA 2 "OPTIMIZACION EJECUTABLE",
+        seccion 5, 2026-09-08): antes de este cambio, el rechazo de Guarda 2
+        se logueaba con `logger.debug(...)` en los tres call sites
+        (_act_on_entry_signal/_act_on_signal/_act_on_spread_completion_signal)
+        - si el nivel de log en produccion es INFO (lo tipico), esas lineas
+        NUNCA quedan escritas, asi que un "ADD" inesperado en logs no se
+        podia correlacionar con si Guarda 2 lo bloqueo o lo dejo pasar. Esta
+        funcion centraliza el log a nivel INFO (siempre visible) para AMBOS
+        resultados (bloqueado y permitido), con exactamente los campos
+        pedidos para poder reproducir un caso real: estrategia, simbolo,
+        cantidad existente ANTES de esta señal, motivo de la señal, quien
+        llamo (que guard-2 especifico, de las tres rutas de entrada
+        existentes), resultado del guard y timestamp (via el propio logger).
+        No incluye order/client_order_id aca: a esta altura del codigo
+        (ANTES de intentar el fill) todavia no existe una orden - ver
+        el "ENTRY"/"REJECT" en self.position_event_journal (mas abajo en
+        cada metodo) para la correlacion con esos IDs una vez que el fill
+        se intenta.
+        """
+        logger.info(
+            "Guarda 2 [%s]: symbol=%s strategy_tag=%s existing_quantity=%.4f reason=%s -> %s",
+            caller, symbol, strategy_tag, existing_quantity, reason,
+            "BLOQUEADO (ya existe posicion)" if blocked else "OK (sin posicion previa)",
+        )
+
     def _capital_available_ars(self, strategy_tag: str = "weekly_asymmetric") -> float:
         """
         Capital libre para nuevas entradas de la estrategia `strategy_tag`:
@@ -1320,9 +1378,17 @@ class GgalOptionsBot:
         # self.portfolio mas abajo (tanto en modo shadow, donde el fill es
         # instantaneo, como en real via order reports/get_account_positions,
         # a completar segun la integracion final con tu ALYC).
-        if self._position_quantity(signal.symbol) != 0:
-            logger.debug("Señal %s ignorada: ya existe una posicion abierta sobre esa base.", signal.symbol)
+        existing_qty = self._position_quantity(signal.symbol)
+        if existing_qty != 0:
+            self._log_guard2(
+                caller="_act_on_signal(vol_arbitrage)", symbol=signal.symbol, strategy_tag="vol_arbitrage",
+                existing_quantity=existing_qty, reason=getattr(signal, "reason", ""), blocked=True,
+            )
             return
+        self._log_guard2(
+            caller="_act_on_signal(vol_arbitrage)", symbol=signal.symbol, strategy_tag="vol_arbitrage",
+            existing_quantity=existing_qty, reason=getattr(signal, "reason", ""), blocked=False,
+        )
 
         # AISLAMIENTO por strategy_tag (ver Portfolio.greeks_for_strategy_tag
         # y el mismo fix aplicado a _act_on_entry_signal mas abajo, 2026-09-
@@ -1411,6 +1477,33 @@ class GgalOptionsBot:
         if self.mid_price_exec.has_open_order_for(signal.symbol):
             logger.debug("Salida %s pospuesta: ya hay una orden en vigilancia sobre esa base.", signal.symbol)
             return
+
+        # INSTRUMENTACION DE CALIDAD DE EJECUCION (TANDA 2 "OPTIMIZACION
+        # EJECUTABLE", seccion 9, 2026-09-08): a diferencia del path de
+        # ENTRADA (donde scan_entry_signals ya excluye quotes stale ANTES de
+        # emitir una señal, ver RiskConfig.max_option_quote_staleness_seconds
+        # y risk_manager.check_liquidity), el path de SALIDA no tenia ningun
+        # chequeo de antiguedad/calidad de la punta - un exit procedia igual
+        # aunque el quote tuviera bid/ask "vivos" pero muy viejos (mid !=
+        # precio ejecutable real). Deliberadamente NO se bloquea el exit por
+        # esto (ver docstring de KillSwitch: una salida nunca debe quedar
+        # atrapada esperando un dato mejor que puede no llegar) - se registra
+        # el motivo (decision price = mid, bid/ask/spread relativo, edad real
+        # del quote, cantidad solicitada) para que quede trazable si el fill
+        # resultante se aleja del mid "on decision" ademas de exigir mas
+        # visibilidad si la punta es vieja.
+        book = quote.book
+        quote_age = book.age_seconds()
+        stale_threshold = SETTINGS.risk.max_option_quote_staleness_seconds
+        log_fn = logger.warning if quote_age > stale_threshold else logger.info
+        log_fn(
+            "Salida %s [reason=%s]: decision_price(mid)=%.2f bid=%.2f ask=%.2f "
+            "spread_rel=%.4f quote_age=%.1fs (umbral=%.0fs, %s) requested_qty=%.2f",
+            signal.symbol, getattr(signal, "reason", ""), book.mid, book.bid, book.ask,
+            book.spread_relative, quote_age, stale_threshold,
+            "STALE - el mid puede no ser fielmente ejecutable" if quote_age > stale_threshold else "OK",
+            signal.quantity,
+        )
 
         state = self.mid_price_exec.submit(
             symbol=signal.symbol, book=quote.book, side=OrderSide.SELL, quantity=signal.quantity,
@@ -1557,9 +1650,17 @@ class GgalOptionsBot:
         # pyramideo) - GLOBAL a todo el bot, no solo a `strategy_tag`: dos
         # estrategias distintas nunca deben terminar con posiciones
         # simultaneas sobre la MISMA base.
-        if self._position_quantity(signal.symbol) != 0:
-            logger.debug("Señal %s ignorada: ya existe una posicion abierta sobre esa base.", signal.symbol)
+        existing_qty = self._position_quantity(signal.symbol)
+        if existing_qty != 0:
+            self._log_guard2(
+                caller="_act_on_entry_signal", symbol=signal.symbol, strategy_tag=strategy_tag,
+                existing_quantity=existing_qty, reason=getattr(signal, "reason", ""), blocked=True,
+            )
             return
+        self._log_guard2(
+            caller="_act_on_entry_signal", symbol=signal.symbol, strategy_tag=strategy_tag,
+            existing_quantity=existing_qty, reason=getattr(signal, "reason", ""), blocked=False,
+        )
 
         rm = risk_manager if risk_manager is not None else self.risk_manager
         totals = self.portfolio.greeks_for_strategy_tag(strategy_tag)
@@ -1630,9 +1731,19 @@ class GgalOptionsBot:
         if self.mid_price_exec.has_open_order_for(signal.short_symbol):
             logger.debug("Pata corta %s pospuesta: ya hay una orden en vigilancia sobre esa base.", signal.short_symbol)
             return
-        if self._position_quantity(signal.short_symbol) != 0:
-            logger.debug("Pata corta %s ignorada: ya existe una posicion sobre esa base.", signal.short_symbol)
+        existing_qty = self._position_quantity(signal.short_symbol)
+        if existing_qty != 0:
+            self._log_guard2(
+                caller="_act_on_spread_completion_signal", symbol=signal.short_symbol,
+                strategy_tag="weekly_asymmetric", existing_quantity=existing_qty,
+                reason="spread_completion", blocked=True,
+            )
             return
+        self._log_guard2(
+            caller="_act_on_spread_completion_signal", symbol=signal.short_symbol,
+            strategy_tag="weekly_asymmetric", existing_quantity=existing_qty,
+            reason="spread_completion", blocked=False,
+        )
 
         quantity = signal.long_quantity_confirmed
         state = self.mid_price_exec.submit(
@@ -1694,18 +1805,70 @@ class GgalOptionsBot:
 
         if state.status is OrderStatus.FILLED:
             signed_qty = state.request.quantity if state.request.side is OrderSide.BUY else -state.request.quantity
-            self.portfolio.add(Position(
-                symbol=state.request.symbol, quantity=signed_qty,
-                # multiplier=1.0: el subyacente cotiza por ACCION, no por
-                # contrato de opciones de 100 unidades (ver el mismo ajuste
-                # en dashboard/pnl_engine.py, multiplier_for_symbol()).
-                multiplier=1.0,
-                # greeks_per_unit=None es la marca (ver portfolio.Position y
-                # _capital_available_ars()) de "esto es el subyacente,
-                # delta=1 por unidad" - nunca se confunde con una opcion.
-                greeks_per_unit=None,
-                entry_price=state.avg_fill_price, entry_time=datetime.now(timezone.utc),
-            ))
+            # FIX DE FRAGMENTACION (TANDA 2 "OPTIMIZACION EJECUTABLE", seccion
+            # 5, 2026-09-08): ANTES de este fix, cada hedge fill exitoso
+            # agregaba un objeto Position NUEVO para el subyacente (via
+            # self.portfolio.add(...) incondicional) en vez de consolidar en
+            # la posicion de hedge YA abierta - exactamente el mismo patron
+            # de fragmentacion "multiples Position por symbol" que
+            # ggal_bot/portfolio/reconciliation.py ya corrigio para el path
+            # de RECONCILIACION AL ARRANQUE, pero que seguia sin corregirse
+            # aca, en el path de hedge EN VIVO. Con GGAL_BOT_ENABLE_DELTA_HEDGE
+            # en su default actual (True, ver RiskConfig.enable_delta_hedge -
+            # ADVERTENCIA: el comentario de ese campo describe la intencion
+            # del usuario de apagarlo, pero el DEFAULT DE CODIGO sigue en
+            # True; verificar el valor real configurado en Northflank) y un
+            # rehedge repetido, esto habria seguido creando una Position
+            # nueva por cada fill de cobertura, inflando indefinidamente
+            # `max_positions_per_symbol_strategy` (kill_switch.py) para el
+            # subyacente hasta disparar el kill switch por "fragmentacion" -
+            # una via de falsos trips COMPLETAMENTE DISTINTA de la ya
+            # corregida en reconciliation.py, y candidata real a explicar
+            # cualquier ADD inesperado sobre el subyacente visto en logs.
+            #
+            # Fix: buscar la Position de HEDGE ya abierta para este symbol
+            # (marca: greeks_per_unit is None, ver portfolio.Position) y
+            # consolidar ahi - promedio ponderado de precio de entrada si el
+            # nuevo fill AMPLIA la posicion en la misma direccion (o si la
+            # posicion previa estaba en 0), o simplemente ajustar la
+            # cantidad (preservando el precio de entrada de lo que queda)
+            # si el fill la esta reduciendo/revirtiendo. Nunca se crea una
+            # segunda Position para el mismo subyacente mientras la primera
+            # siga viva.
+            existing_hedge = next(
+                (p for p in self.portfolio.positions if p.symbol == state.request.symbol and p.greeks_per_unit is None),
+                None,
+            )
+            if existing_hedge is None:
+                self.portfolio.add(Position(
+                    symbol=state.request.symbol, quantity=signed_qty,
+                    # multiplier=1.0: el subyacente cotiza por ACCION, no por
+                    # contrato de opciones de 100 unidades (ver el mismo ajuste
+                    # en dashboard/pnl_engine.py, multiplier_for_symbol()).
+                    multiplier=1.0,
+                    # greeks_per_unit=None es la marca (ver portfolio.Position y
+                    # _capital_available_ars()) de "esto es el subyacente,
+                    # delta=1 por unidad" - nunca se confunde con una opcion.
+                    greeks_per_unit=None,
+                    entry_price=state.avg_fill_price, entry_time=datetime.now(timezone.utc),
+                ))
+            else:
+                old_qty = existing_hedge.quantity
+                same_direction_or_flat = old_qty == 0 or (old_qty > 0) == (signed_qty > 0)
+                if same_direction_or_flat:
+                    total_abs_qty = abs(old_qty) + abs(signed_qty)
+                    if total_abs_qty > 0:
+                        existing_hedge.entry_price = (
+                            abs(old_qty) * (existing_hedge.entry_price or 0.0)
+                            + abs(signed_qty) * state.avg_fill_price
+                        ) / total_abs_qty
+                # direccion contraria (reduce/revierte la cobertura previa):
+                # el entry_price del remanente se preserva tal cual (no se
+                # fabrica un costo nuevo para la porcion que se esta
+                # cerrando), igual criterio que _act_on_exit_signal.
+                existing_hedge.quantity = old_qty + signed_qty
+                if existing_hedge.entry_time is None:
+                    existing_hedge.entry_time = datetime.now(timezone.utc)
 
     def _current_option_books(self) -> Dict[str, OrderBookSnapshot]:
         books = {q.symbol: q.book for q in self.option_chain.all_quotes()}

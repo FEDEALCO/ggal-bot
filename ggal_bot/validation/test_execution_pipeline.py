@@ -306,6 +306,66 @@ def test_maybe_hedge_records_fill_so_delta_reflects_the_hedge():
         SETTINGS.shadow.enabled = original_enabled
 
 
+def test_maybe_hedge_consolidates_repeated_fills_into_a_single_position():
+    """
+    Fix de fragmentacion (TANDA 2 "OPTIMIZACION EJECUTABLE", seccion 5,
+    2026-09-08): a diferencia de test_maybe_hedge_records_fill_so_delta_
+    reflects_the_hedge (donde el segundo llamado NO genera fill porque
+    needs_hedge() ya da False, asi que nunca ejercita el bug real), este
+    test fuerza DOS fills de cobertura REALES y consecutivos sobre el
+    MISMO subyacente (simulando dos ciclos donde el delta de opciones
+    sigue fuera de banda incluso despues de la primera cobertura, ej. por
+    una nueva señal que agrega mas delta entre medio) - antes del fix,
+    cada fill agregaba una Position NUEVA (fragmentacion, el mismo patron
+    que ggal_bot/portfolio/reconciliation.py ya corrigio para el path de
+    arranque); ahora deben consolidarse en UNA sola Position con la
+    cantidad y el precio de entrada (promedio ponderado) correctos.
+    """
+    original_enabled = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True
+    try:
+        bot = GgalOptionsBot()
+        bot.portfolio.add(Position(
+            symbol="GFGC5200O", quantity=10, multiplier=100.0,
+            greeks_per_unit={"delta": 0.5, "gamma": 0.01, "vega": 5.0, "theta": -1.0},
+        ))
+        bot._spot_book = OrderBookSnapshot(
+            SETTINGS.instruments.contado_ticker, bid=5199.0, ask=5201.0, bid_size=5000, ask_size=5000,
+        )
+
+        # Primer hedge: delta total 500, banda 150 -> vende 350.
+        totals_1 = bot.portfolio.total_greeks()
+        bot._maybe_hedge(totals_1, spot=5200.0)
+        hedge_after_1 = [p for p in bot.portfolio.positions if p.symbol == SETTINGS.instruments.contado_ticker]
+        assert len(hedge_after_1) == 1
+        assert hedge_after_1[0].quantity == -350.0
+
+        # Simula un ciclo posterior donde una NUEVA posicion de opciones
+        # vuelve a sacar al portafolio de la banda (delta options +300 mas,
+        # sin tocar la cobertura ya existente) - esto SI dispara un segundo
+        # fill de cobertura real (needs_hedge() vuelve a dar True).
+        bot.portfolio.add(Position(
+            symbol="GFGC5300O", quantity=6, multiplier=100.0,
+            greeks_per_unit={"delta": 0.5, "gamma": 0.01, "vega": 5.0, "theta": -1.0},
+        ))
+        totals_2 = bot.portfolio.total_greeks()
+        assert bot.delta_hedger.needs_hedge(totals_2["delta"])  # confirma que el 2do fill es real
+        bot._maybe_hedge(totals_2, spot=5200.0)
+
+        hedge_after_2 = [p for p in bot.portfolio.positions if p.symbol == SETTINGS.instruments.contado_ticker]
+        assert len(hedge_after_2) == 1, (
+            f"BUG: la cobertura se fragmento en {len(hedge_after_2)} objetos Position "
+            "distintos para el mismo subyacente en vez de consolidarse en uno solo."
+        )
+        # La cantidad final debe ser la suma exacta de ambos fills (-350 + el
+        # segundo, mayor en magnitud que el primero porque el excedente sobre
+        # banda tambien crecio) - nunca se "pierde" ni se "duplica" cobertura.
+        assert hedge_after_2[0].quantity < -350.0
+        assert hedge_after_2[0].entry_price is not None and hedge_after_2[0].entry_price > 0
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+
+
 def test_maybe_hedge_does_nothing_when_delta_hedge_disabled():
     """
     Feature nueva (2026-09-01, a pedido explicito del usuario -
@@ -486,6 +546,7 @@ ALL_TESTS = [
     test_business_days_between_excludes_weekends,
     test_act_on_signal_does_not_reenter_same_symbol_across_cycles_in_shadow_mode,
     test_maybe_hedge_records_fill_so_delta_reflects_the_hedge,
+    test_maybe_hedge_consolidates_repeated_fills_into_a_single_position,
     test_maybe_hedge_does_nothing_when_delta_hedge_disabled,
     test_capital_available_ars_excludes_delta_hedge_underlying_position,
     test_on_book_update_stamps_spot_last_update_at,

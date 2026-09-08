@@ -166,6 +166,43 @@ def test_evaluate_skips_delta_check_when_spot_not_provided(tmp_path):
     assert ks.is_tripped() is False
 
 
+def test_evaluate_trips_on_correlated_delta_across_weekly_asymmetric_and_scalping(tmp_path):
+    """
+    VERIFICADO (TANDA 2 "OPTIMIZACION EJECUTABLE", seccion 8, 2026-09-08):
+    max_portfolio_delta_ars debe considerar el delta de TODAS las
+    estrategias combinadas cuando ambas estan activas simultaneamente
+    (weekly_asymmetric + scalping, modo aditivo) - no solo una a la vez.
+    Portfolio.total_greeks() (portfolio/portfolio.py) ya suma TODAS las
+    posiciones sin filtrar por strategy_tag, asi que KillSwitch.evaluate()
+    ya cubre este caso SIN cambios de codigo adicionales - este test lo
+    deja demostrado explicitamente en vez de asumirlo.
+    """
+    ks = KillSwitch(path=tmp_path / "ks.json")
+    limits = RiskLimitsConfig(max_portfolio_delta_ars=1_000_000.0)
+
+    portfolio = Portfolio()
+    portfolio.add(Position(
+        symbol="GFGC7000OC", quantity=2.0, multiplier=100.0,
+        greeks_per_unit={"delta": 0.5, "gamma": 0.0009, "vega": 3.2, "theta": -1.4},
+        strategy_tag="weekly_asymmetric",
+    ))
+    portfolio.add(Position(
+        symbol="GFGC7200OC", quantity=2.0, multiplier=100.0,
+        greeks_per_unit={"delta": 0.5, "gamma": 0.0009, "vega": 3.2, "theta": -1.4},
+        strategy_tag="scalping",
+    ))
+    # delta de CADA pata sola = 2*100*0.5 = 100 acciones equiv.; spot=7100 ->
+    # notional individual = 100*7100 = 710.000 ARS, POR DEBAJO del limite de
+    # 1.000.000 - ni weekly_asymmetric ni scalping solas lo superarian.
+    # Combinadas: delta total = 200 acciones equiv. -> notional = 200*7100 =
+    # 1.420.000 ARS, POR ENCIMA del limite - solo la SUMA de ambas estrategias
+    # lo dispara, demostrando que Portfolio.total_greeks() ya agrega
+    # correctamente across strategy_tag distintos.
+    reason = ks.evaluate(portfolio, limits, spot=7100.0)
+    assert reason is not None and "direccional agregada" in reason
+    assert ks.is_tripped() is True
+
+
 def test_tripped_kill_switch_blocks_new_entry_but_never_blocks_exit(tmp_path):
     """
     Integracion contra el bot real: con el kill switch disparado,

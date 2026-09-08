@@ -642,7 +642,16 @@ class LongFirstConfig:
     # algo real (ej. medir PnL semanal acumulado contra este objetivo en el
     # dashboard, o un techo de riesgo agregado semanal), eso es un cambio de
     # codigo nuevo, no cubierto por este commit.
-    weekly_target_ars: float = _env_float("GGAL_BOT_WEEKLY_TARGET_ARS", 1_000_000.0)
+    #
+    # AJUSTE 2026-09-08 (TANDA 2 "OPTIMIZACION EJECUTABLE", seccion 7, tercera
+    # vuelta sobre el mismo parametro): bajado de nuevo a $500.000 (50%
+    # semanal) a pedido explicito del usuario, junto con max_risk_pct_per_trade
+    # (ver ese campo mas arriba - su default de codigo YA estaba en 0.10,
+    # exactamente el baseline pedido en esta misma tanda, verificado por
+    # lectura, sin necesidad de cambiarlo). La limitacion de arriba (campo
+    # puramente documental, sin ninguna conexion de codigo) sigue vigente sin
+    # cambios.
+    weekly_target_ars: float = _env_float("GGAL_BOT_WEEKLY_TARGET_ARS", 500_000.0)
 
     # --- Horizonte de entrada/salida y guardia de decay de fin de semana ---
     # AJUSTE 2026-09-07, a pedido explicito del usuario: "quita el limite de
@@ -696,6 +705,48 @@ class LongFirstConfig:
     # riesgo aparte, deliberadamente NO tomada en este mismo cambio sin
     # confirmacion explicita del usuario.
     weekend_theta_guard_enabled: bool = _env_bool("GGAL_BOT_WEEKEND_THETA_GUARD", True)
+    # RESOLUCION de la contradiccion senalada arriba (TANDA 2 -
+    # "OPTIMIZACION EJECUTABLE", seccion 3, 2026-09-08): VERIFICADO por
+    # lectura de codigo (risk/risk_manager.py::evaluate_position_exit) que
+    # el guard de arriba SI es, literalmente, un cierre general
+    # incondicional - dispara todos los viernes para CUALQUIER posicion
+    # cuyo vencimiento no haya llegado todavia, sin importar cuantos dias
+    # lleva abierta ni que tan lejos este ese vencimiento (podria ser
+    # Octubre). Esto vuelve inutil, en la practica, haber quitado el
+    # limite de max_holding_business_days de arriba: ninguna posicion
+    # sobrevive nunca a un fin de semana, sin importar el horizonte
+    # "sin limite" configurado.
+    #
+    # Riesgo REAL que este guard protege (no se elimina, se ACOTA): el
+    # caso documentado del 2026-09-01 (-$133.568 de decay overnight/fin de
+    # semana no capturado a tiempo) ocurrio sobre una posicion RECIEN
+    # ABIERTA, sin todavia la proteccion del Stop Loss escalonado
+    # (tiered_stop_loss_*, MEJORA 2026-09-04, que en su defecto actual
+    # angosta el stop ya desde el primer dia habil de holding, ver
+    # tiered_stop_loss_stage2_business_day=1 mas abajo) - es decir, el
+    # riesgo de fin de semana es mayor CUANTO MAS TEMPRANO en su vida esta
+    # la posicion (todavia con el stop mas ancho), no despues de que ya
+    # paso por las etapas mas angostas del stop escalonado.
+    #
+    # Politica nueva (configurable, backward-compatible): con este campo
+    # en None (default), el comportamiento es IDENTICO al de siempre (el
+    # guard sigue disparando sin excepcion, cero cambio de comportamiento
+    # para quien no lo configure). Si se fija un numero de dias habiles,
+    # el guard deja de aplicarse una vez que la posicion ya lleva ESE
+    # numero de dias habiles abierta - reutiliza deliberadamente el mismo
+    # concepto ya validado por el usuario en tiered_stop_loss_stage3_
+    # business_day (dia a partir del cual el stop mas angosto, 20% por
+    # default, ya esta protegiendo la posicion) en vez de inventar un
+    # numero nuevo sin evidencia: una posicion que ya esta bajo el stop
+    # mas angosto tiene, por construccion, una perdida maxima ya acotada
+    # aunque el fin de semana la sorprenda. NO se fija un default distinto
+    # de None aca (DATA INSUFFICIENT para elegir un numero de dias optimo
+    # sin datos post Position Lifecycle Engine) - queda a criterio
+    # explicito del usuario configurarlo via
+    # GGAL_BOT_WEEKEND_THETA_GUARD_MAX_HOLDING_BUSINESS_DAYS.
+    weekend_theta_guard_max_holding_business_days: Optional[int] = (
+        _env_int("GGAL_BOT_WEEKEND_THETA_GUARD_MAX_HOLDING_BUSINESS_DAYS", 0) or None
+    )
 
     # --- Salida forzada, medida sobre la PRIMA pagada (no sobre el subyacente) ---
     stop_loss_pct: float = _env_float("GGAL_BOT_STOP_LOSS_PCT", 0.50)     # -50% de la prima -> cerrar

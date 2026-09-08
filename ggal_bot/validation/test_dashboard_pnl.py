@@ -284,6 +284,33 @@ def test_fit_smile_curve_returns_quadratic_shape():
     assert curve["fitted_iv"].min() > 0  # sonrisa razonable, sin IVs negativas en el rango ajustado
 
 
+def test_match_trades_fifo_pnl_scales_with_real_quantity_not_a_fixed_value():
+    """
+    Regresion especifica (TANDA 2 "OPTIMIZACION EJECUTABLE", seccion 6,
+    2026-09-08) contra el bug historico de cantidad fija (ver docstring de
+    test_match_trades_fifo_uses_multiplier_1_for_delta_hedge_legs mas
+    arriba, "unos pocos millones de PnL realizado" fabricados por no usar
+    la cantidad real del fill). Usa deliberadamente una cantidad GRANDE y
+    poco comun (17 contratos, ni 1 ni 2 - los valores ya cubiertos por los
+    tests de arriba) para que un regreso a "cantidad fija = 1" (o
+    cualquier otro valor fijo) haga fallar este test de inmediato: el PnL
+    esperado es EXACTAMENTE (precio_venta - precio_compra) * 17 *
+    multiplicador, ni mas ni menos.
+    """
+    fills = pd.DataFrame([
+        _fill_row("2026-01-01T10:00:00Z", "q1", "GFGC5200O", "buy", 17, 80.0),
+        _fill_row("2026-01-01T10:05:00Z", "q2", "GFGC5200O", "sell", 17, 95.0),
+    ])
+    closed, open_lots = pe.match_trades_fifo(fills, option_multiplier=100.0)
+    assert len(open_lots) == 0
+    assert len(closed) == 1
+    trade = closed[0]
+    assert trade.quantity == 17
+    expected_pnl = (95.0 - 80.0) * 17 * 100.0  # = 25.500,0 - NO 1500.0 (lo que daria qty fija=1)
+    assert trade.pnl_ars == expected_pnl
+    assert trade.pnl_ars != (95.0 - 80.0) * 1 * 100.0
+
+
 ALL_TESTS = [
     test_classify_strategy_uses_contado_and_futuro_tickers,
     test_multiplier_for_symbol_is_1_for_underlying_and_option_multiplier_for_options,
@@ -295,6 +322,7 @@ ALL_TESTS = [
     test_match_trades_fifo_handles_short_round_trip,
     test_match_trades_fifo_partial_close_leaves_open_remainder,
     test_match_trades_fifo_reproduces_the_reported_reentry_bug_pattern_correctly,
+    test_match_trades_fifo_pnl_scales_with_real_quantity_not_a_fixed_value,
     test_aggregate_open_positions_weighted_average_price,
     test_mark_to_market_computes_unrealized_pnl_from_bot_state,
     test_mark_to_market_flags_missing_price_as_zero_pnl,
