@@ -227,6 +227,65 @@ def test_evaluate_position_exit_weekend_guard_skipped_if_expires_same_friday():
     assert reason is None  # se resuelve por vencimiento, no hace falta forzar nada
 
 
+def test_evaluate_position_exit_weekend_guard_still_fires_when_cap_not_configured():
+    """
+    weekend_theta_guard_max_holding_business_days=None (default, TANDA 2
+    2026-09-08) debe preservar EXACTAMENTE el comportamiento de siempre:
+    el guard dispara sin excepcion, sin importar cuantos dias lleva
+    abierta la posicion - regresion explicita para que nadie asuma que el
+    parametro nuevo cambia algo sin configurarlo.
+    """
+    risk_mgr = RiskManager(RiskLimits())
+    now = datetime(2026, 8, 28, 15, 0, tzinfo=timezone.utc)  # viernes
+    entry_time = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)  # lunes, 4 dias habiles antes
+    reason = risk_mgr.evaluate_position_exit(
+        entry_price=100.0, current_price=105.0, entry_time=entry_time,
+        now=now, expiry=date(2026, 10, 16),  # vencimiento lejano (Octubre)
+        stop_loss_pct=0.50, take_profit_pct=1.00, max_holding_business_days=None,
+        weekend_theta_guard_enabled=True, weekend_theta_guard_max_holding_business_days=None,
+    )
+    assert reason == "weekend_theta_guard"
+
+
+def test_evaluate_position_exit_weekend_guard_exempts_position_past_configured_cap():
+    """
+    Con weekend_theta_guard_max_holding_business_days=4 y una posicion que
+    ya lleva 4 dias habiles abierta (entro el lunes, hoy es viernes), el
+    guard YA NO debe forzar el cierre - la politica nueva (config.py,
+    TANDA 2) asume que a esa altura la posicion ya esta bajo un stop mas
+    ajustado (tiered_stop_loss) y puede sobrevivir el fin de semana.
+    """
+    risk_mgr = RiskManager(RiskLimits())
+    now = datetime(2026, 8, 28, 15, 0, tzinfo=timezone.utc)  # viernes
+    entry_time = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)  # lunes, 4 dias habiles antes
+    reason = risk_mgr.evaluate_position_exit(
+        entry_price=100.0, current_price=105.0, entry_time=entry_time,
+        now=now, expiry=date(2026, 10, 16),
+        stop_loss_pct=0.50, take_profit_pct=1.00, max_holding_business_days=None,
+        weekend_theta_guard_enabled=True, weekend_theta_guard_max_holding_business_days=4,
+    )
+    assert reason is None
+
+
+def test_evaluate_position_exit_weekend_guard_still_fires_below_configured_cap():
+    """
+    Simetrico al test anterior: con el mismo cap=4 pero una posicion que
+    todavia lleva MENOS de 4 dias habiles (entro el martes, hoy es
+    viernes = 3 dias habiles), el guard debe seguir disparando - la
+    exencion nueva es estrictamente >= cap, nunca antes.
+    """
+    risk_mgr = RiskManager(RiskLimits())
+    now = datetime(2026, 8, 28, 15, 0, tzinfo=timezone.utc)  # viernes
+    entry_time = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)  # martes, 3 dias habiles antes
+    reason = risk_mgr.evaluate_position_exit(
+        entry_price=100.0, current_price=105.0, entry_time=entry_time,
+        now=now, expiry=date(2026, 10, 16),
+        stop_loss_pct=0.50, take_profit_pct=1.00, max_holding_business_days=None,
+        weekend_theta_guard_enabled=True, weekend_theta_guard_max_holding_business_days=4,
+    )
+    assert reason == "weekend_theta_guard"
+
+
 def test_evaluate_position_exit_returns_none_within_all_bands():
     risk_mgr = RiskManager(RiskLimits())
     now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)  # miercoles
@@ -1485,6 +1544,9 @@ ALL_TESTS = [
     test_evaluate_position_exit_horizon_disabled_when_max_holding_business_days_is_none,
     test_evaluate_position_exit_triggers_weekend_theta_guard_on_friday,
     test_evaluate_position_exit_weekend_guard_skipped_if_expires_same_friday,
+    test_evaluate_position_exit_weekend_guard_still_fires_when_cap_not_configured,
+    test_evaluate_position_exit_weekend_guard_exempts_position_past_configured_cap,
+    test_evaluate_position_exit_weekend_guard_still_fires_below_configured_cap,
     test_evaluate_position_exit_returns_none_within_all_bands,
     test_evaluate_position_exit_handles_missing_current_price,
     test_evaluate_vega_decay_exit_triggers_below_threshold,

@@ -556,6 +556,7 @@ class WeeklyAsymmetricStrategy:
                 stop_loss_pct=cfg.stop_loss_pct, take_profit_pct=cfg.take_profit_pct,
                 max_holding_business_days=cfg.max_holding_business_days,
                 weekend_theta_guard_enabled=cfg.weekend_theta_guard_enabled,
+                weekend_theta_guard_max_holding_business_days=cfg.weekend_theta_guard_max_holding_business_days,
                 enable_tiered_stop_loss=cfg.enable_tiered_stop_loss,
                 tiered_stop_loss_stage2_business_day=cfg.tiered_stop_loss_stage2_business_day,
                 tiered_stop_loss_stage2_pct=cfg.tiered_stop_loss_stage2_pct,
