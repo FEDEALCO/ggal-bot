@@ -391,6 +391,23 @@ class RiskLimitsConfig:
     # mismo escenario de restart-sin-persistencia que motivo
     # reconciliation.py, antes de que ese modulo existiera).
     max_positions_per_symbol_strategy: int = _env_int("GGAL_BOT_MAX_POSITIONS_PER_SYMBOL_STRATEGY", 1)
+    # BRECHA VERIFICADA (mega-prompt "OPTIMIZACION EJECUTABLE", seccion 12):
+    # ni RiskLimitsConfig (este archivo) ni RiskLimits (ggal_bot/risk/
+    # risk_manager.py, que solo topea max_vega_total/max_gamma_total) tenian
+    # NINGUN limite de exposicion DIRECCIONAL agregada (delta). El riesgo
+    # concreto: "Trade A ok + Trade B ok + Trade C ok" en simbolos/strikes
+    # DISTINTOS pero misma direccion (ej. varios calls de GGAL) puede acumular
+    # un delta de portfolio grande sin que ningun chequeo individual lo vea -
+    # exactamente el patron de riesgo correlacionado que el mega-prompt pide
+    # cubrir. Se agrava porque delta-hedging esta deshabilitado por pedido
+    # explicito previo del usuario (ver comentario en risk_manager.py: "sin
+    # ningun tope de reemplazo"). None (default) = sin limite (comportamiento
+    # actual sin cambios hasta que se configure explicitamente). Unidad: ARS
+    # nocionales = |delta total del portfolio (en acciones subyacentes
+    # equivalentes)| * spot - por eso KillSwitch.evaluate() ahora acepta un
+    # `spot` opcional (ver su docstring/firma). Sin `spot` este chequeo no se
+    # evalua (no se fabrica un spot ficticio).
+    max_portfolio_delta_ars: Optional[float] = _env_float("GGAL_BOT_MAX_PORTFOLIO_DELTA_ARS", 0.0) or None
 
 
 # ---------------------------------------------------------------------------

@@ -373,6 +373,30 @@ class GgalOptionsBot:
                 "conecta a PyRofex ni envia ordenes reales. Datos via "
                 "data912.com o Mock/Replay; fills simulados en logs/shadow_trades.csv."
             )
+            # BRECHA VERIFICADA (mega-prompt "OPTIMIZACION EJECUTABLE",
+            # seccion sobre Execution Engine/calidad de ejecucion): en
+            # execution/order_gateway.py, OrderGateway.send() en modo
+            # shadow fija `fill_price = state.reference_price or
+            # request.price` - es decir, CADA fill simulado se ejecuta
+            # exactamente al precio mid/de referencia del momento de la
+            # decision, con slippage y spread simulados = 0. Esto es
+            # independiente de MidPriceExecutionEngine (que si modela
+            # cancelacion por movimiento adverso y mejora de precio por
+            # timeout antes de decidir SI enviar la orden) - el problema es
+            # que, una vez decidido enviar, el FILL en si no paga spread
+            # ni slippage. Consecuencia: todo PnL/EV historico calculado
+            # sobre logs/shadow_trades.csv de esta corrida es una COTA
+            # SUPERIOR optimista, no una cifra neta de costos de ejecucion
+            # reales. ShadowAuditLogger ya registra requested_price/
+            # fill_price/reference_price por fill (ver order_gateway.py),
+            # asi que la brecha entre decision y ejecucion queda disponible
+            # para analisis futuro aunque hoy no se resta de ningun reporte.
+            logger.warning(
+                "SHADOW MODE: los fills simulados se ejecutan EXACTAMENTE al precio de "
+                "referencia (mid) del momento de la decision - slippage/spread simulados = "
+                "$0 (ver OrderGateway.send()). El PnL/EV de logs/shadow_trades.csv es una "
+                "cota SUPERIOR optimista, NO una cifra neta de costos de ejecucion reales."
+            )
             self.market_feed = LiveShadowFeed(on_book_update=self._on_book_update)
         else:
             self.market_feed = MarketDataFeed(on_book_update=self._on_book_update)
@@ -677,8 +701,12 @@ class GgalOptionsBot:
         # realized_pnl_today_ars explicitamente, ver TODO de Fase 5.3
         # siguiente commit). evaluate() es un no-op si ya esta disparado
         # (no lo re-dispara con una reason distinta) y NUNCA resetea solo.
+        # `spot=spot` (ya calculado arriba este mismo ciclo) habilita el
+        # nuevo chequeo de riesgo direccional agregado
+        # (RiskLimitsConfig.max_portfolio_delta_ars, ver kill_switch.py) -
+        # sin esto ese limite, aunque configurado, nunca se evaluaria.
         if not self.kill_switch.is_tripped():
-            self.kill_switch.evaluate(self.portfolio, SETTINGS.risk_limits)
+            self.kill_switch.evaluate(self.portfolio, SETTINGS.risk_limits, spot=spot)
 
         if self.active_strategy_name == "vol_arbitrage":
             all_signals = self._run_vol_arbitrage_cycle(spot)

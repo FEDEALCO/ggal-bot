@@ -134,6 +134,7 @@ class KillSwitch:
         portfolio,
         limits: RiskLimitsConfig,
         realized_pnl_today_ars: Optional[float] = None,
+        spot: Optional[float] = None,
     ) -> Optional[str]:
         """
         Evalua los limites agregados de portfolio contra `limits` y, si
@@ -145,6 +146,13 @@ class KillSwitch:
         No hace nada (devuelve None sin evaluar) si `limits.enabled` es
         False - permite desactivar el kill switch entero via config sin
         tener que comentar el call site en run_bot.py.
+
+        `spot` es opcional y sigue el mismo patron que
+        `realized_pnl_today_ars`: solo se necesita para evaluar
+        `limits.max_portfolio_delta_ars` (que requiere convertir el delta
+        agregado del portfolio, en acciones subyacentes equivalentes, a un
+        nocional en ARS). Si ese limite esta configurado pero no se pasa
+        `spot`, el chequeo simplemente se omite (nunca se fabrica un spot).
         """
         if not limits.enabled:
             return None
@@ -189,6 +197,26 @@ class KillSwitch:
             )
             self.trip(reason, tripped_by="max_positions_per_symbol_strategy")
             return reason
+
+        # Riesgo direccional AGREGADO (ver comentario en
+        # RiskLimitsConfig.max_portfolio_delta_ars): a diferencia de los
+        # chequeos anteriores (que miran PnL, contratos totales o
+        # fragmentacion por base individual), este suma el delta de TODAS
+        # las posiciones de TODAS las estrategias/simbolos - es el unico
+        # chequeo de este modulo pensado especificamente para detectar
+        # riesgo CORRELACIONADO (varias posiciones individualmente
+        # aceptables que juntas exponen al portfolio en una sola direccion).
+        if limits.max_portfolio_delta_ars is not None and spot is not None:
+            total_delta = portfolio.total_greeks().get("delta", 0.0)
+            delta_notional_ars = abs(total_delta) * spot
+            if delta_notional_ars > limits.max_portfolio_delta_ars:
+                reason = (
+                    f"Exposicion direccional agregada del portfolio (delta={total_delta:,.2f} "
+                    f"acciones equiv. x spot=${spot:,.2f} = ${delta_notional_ars:,.2f}) supera el "
+                    f"limite configurado (${limits.max_portfolio_delta_ars:,.2f})."
+                )
+                self.trip(reason, tripped_by="max_portfolio_delta_ars")
+                return reason
 
         return None
 
