@@ -16,7 +16,7 @@ from ggal_bot.validation import _shadow_audit_isolation  # noqa: F401
 from ggal_bot.config import SETTINGS, RiskLimitsConfig
 from ggal_bot.data.option_chain import OrderBookSnapshot, OptionQuote
 from ggal_bot.models.black_scholes import OptionType
-from ggal_bot.portfolio.portfolio import Position
+from ggal_bot.portfolio.portfolio import Portfolio, Position
 from ggal_bot.risk.kill_switch import KillSwitch
 from ggal_bot.strategy.weekly_asymmetric import EntrySignal
 from run_bot import GgalOptionsBot
@@ -113,6 +113,55 @@ def test_evaluate_disabled_never_trips(tmp_path):
         positions = [Position(symbol="A", quantity=999.0, multiplier=100.0)]
 
     reason = ks.evaluate(_FakePortfolio(), limits)
+    assert reason is None
+    assert ks.is_tripped() is False
+
+
+def test_evaluate_trips_on_correlated_delta_across_different_symbols(tmp_path):
+    """
+    RiskLimitsConfig.max_portfolio_delta_ars (mega-prompt "OPTIMIZACION
+    EJECUTABLE", seccion 12): tres posiciones en simbolos/strikes
+    DISTINTOS, cada una individualmente chica, que en la MISMA direccion
+    (todas calls largos) acumulan un delta de portfolio grande - exactamente
+    el patron "Trade A ok + Trade B ok + Trade C ok = riesgo excesivo" que
+    ni max_open_contracts_total ni max_positions_per_symbol_strategy (ambos
+    por-base, no agregados-direccionales) pueden detectar.
+    """
+    ks = KillSwitch(path=tmp_path / "ks.json")
+    limits = RiskLimitsConfig(max_portfolio_delta_ars=1_000_000.0)
+
+    portfolio = Portfolio()
+    for symbol, strike in (("GFGC7000OC", 7000.0), ("GFGC7200OC", 7200.0), ("GFGC7400OC", 7400.0)):
+        portfolio.add(Position(
+            symbol=symbol, quantity=10.0, multiplier=100.0,
+            greeks_per_unit={"delta": 0.5, "gamma": 0.0009, "vega": 3.2, "theta": -1.4},
+            strategy_tag="weekly_asymmetric",
+        ))
+    # delta total = 3 * (10 * 100 * 0.5) = 1500 acciones equiv.; spot=7100 ->
+    # notional = 1500 * 7100 = 10.650.000 ARS, muy por encima del limite.
+    reason = ks.evaluate(portfolio, limits, spot=7100.0)
+    assert reason is not None and "direccional agregada" in reason
+    assert ks.is_tripped() is True
+
+
+def test_evaluate_skips_delta_check_when_spot_not_provided(tmp_path):
+    """
+    Simetrico a como max_daily_loss_ars se omite sin realized_pnl_today_ars:
+    si max_portfolio_delta_ars esta configurado pero el caller no pasa
+    `spot`, el chequeo NO se evalua (nunca se fabrica un spot ficticio) -
+    no debe disparar el kill switch aunque el delta acumulado sea enorme.
+    """
+    ks = KillSwitch(path=tmp_path / "ks.json")
+    limits = RiskLimitsConfig(max_portfolio_delta_ars=1.0)  # limite absurdamente bajo
+
+    portfolio = Portfolio()
+    portfolio.add(Position(
+        symbol="GFGC7000OC", quantity=100.0, multiplier=100.0,
+        greeks_per_unit={"delta": 0.9, "gamma": 0.0009, "vega": 3.2, "theta": -1.4},
+        strategy_tag="weekly_asymmetric",
+    ))
+
+    reason = ks.evaluate(portfolio, limits)  # sin spot=
     assert reason is None
     assert ks.is_tripped() is False
 
