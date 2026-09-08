@@ -67,13 +67,22 @@ ALCANCE EXPLICITO - que NO resuelve este modulo:
      mismo simbolo que weekly_asymmetric.
   3. Griegas (`Position.greeks_per_unit`): se completan con la cotizacion
      VIGENTE de self.option_chain al momento de reconciliar (si esa base
-     sigue en el universo activo) - no con las griegas del momento del
-     fill original (esas no se loguean en ningun lado, ver limitacion ya
-     documentada de que greeks_per_unit nunca se refresca post-creacion en
-     el codigo existente). Si la base ya no esta en el universo vigente
-     (vencio, rodo fuera de rango), greeks_per_unit queda en None
-     (tratada por Position.contribution() como delta=1 por unidad) y se
-     reporta en `warnings` - NUNCA se fabrica un valor de griega.
+     sigue en el universo activo Y tiene punta de dos lados vigente para
+     calcular IV) - no con las griegas del momento del fill original (esas
+     no se loguean en ningun lado, ver limitacion ya documentada de que
+     greeks_per_unit nunca se refresca post-creacion en el codigo
+     existente). Si la base ya no esta en el universo vigente (vencio,
+     rodo fuera de rango) O esta en el universo pero sin punta vigente
+     ahora mismo (iliquida), greeks_per_unit queda en None (tratada por
+     Position.contribution() como delta=1 por unidad) y se reporta en
+     `warnings` - NUNCA se fabrica un valor de griega. `Position.expiry`
+     es INDEPENDIENTE de esto (fix 2026-09-08, ver el bloque `if not
+     is_underlying` de abajo): es un dato estatico de la definicion del
+     instrumento, se completa apenas la base sigue en el universo activo,
+     aunque sus griegas no se hayan podido calcular todavia - sin este
+     fix, build_exit_signals() saltaba (por falta de expiry) cualquier
+     posicion reconstruida que no tuviera cotizacion de dos lados en ese
+     instante, aunque estuviera perfectamente identificada en el universo.
 """
 from __future__ import annotations
 
@@ -198,19 +207,55 @@ def reconstruct_positions_from_shadow_log(
         expiry = None
         data_unavailable = []
         if not is_underlying:
+            # BUG REAL VERIFICADO (2026-09-08, ver el log de produccion tras
+            # activar el modo aditivo weekly_asymmetric+scalping: las 6
+            # bases huerfanas seguian sin evaluarse en SL/TP/horizonte
+            # porque esta funcion las reconstruia con expiry=None): antes,
+            # `expiry` solo se completaba DENTRO del mismo `if quote.greeks
+            # is not None`, atado a la disponibilidad de griegas - pero
+            # OptionQuote.expiry es un campo ESTATICO de la definicion del
+            # instrumento (ver data/option_chain.py: se fija al bootstrapear
+            # el universo, nunca depende de si hay o no punta bid/ask
+            # vigente para calcular IV/griegas). Una base bien adentro del
+            # universo activo pero momentaneamente sin cotizacion de dos
+            # puntas (iliquida, lejos del spot) quedaba con expiry=None
+            # igual que si estuviera realmente vencida/fuera del universo -
+            # y build_exit_signals() salta cualquier posicion con
+            # `expiry is None` ("no se puede evaluar Stop Loss/Take
+            # Profit"), asi que esa base quedaba SIN gestion de riesgo
+            # indefinidamente, incluso bajo el modo aditivo que en teoria ya
+            # la cubre por strategy_tag. Fix: `expiry` se completa apenas
+            # `quote` existe (dato real, no fabricado - viene de la
+            # definicion del instrumento); `greeks_per_unit`/el warning
+            # siguen dependiendo, como antes, de que `quote.greeks` este
+            # calculado.
             quote = option_chain.get(symbol) if option_chain is not None else None
+            if quote is not None:
+                expiry = quote.expiry
             if quote is not None and quote.greeks is not None:
                 greeks_per_unit = quote.greeks
-                expiry = quote.expiry
             else:
                 data_unavailable.append("greeks_per_unit")
-                warnings.append(
-                    f"{symbol}: se reconstruyo la posicion (qty={row.quantity}) pero no "
-                    "hay cotizacion vigente en el option_chain actual para completar sus "
-                    "griegas (probable base fuera del universo activo: vencida o rolleada) - "
-                    "greeks_per_unit queda en None (Position.contribution() la trata como "
-                    "delta=1 por unidad hasta que una entrada nueva la reemplace o se cierre)."
-                )
+                if quote is None:
+                    warnings.append(
+                        f"{symbol}: se reconstruyo la posicion (qty={row.quantity}) pero no "
+                        "existe en el option_chain actual (probable base fuera del universo "
+                        "activo: vencida o rolleada) - ni expiry ni greeks_per_unit se pueden "
+                        "completar; build_exit_signals() va a saltear esta posicion por "
+                        "completo hasta que se cierre a mano (ver ggal_bot/ops/manual_close.py)."
+                    )
+                else:
+                    warnings.append(
+                        f"{symbol}: se reconstruyo la posicion (qty={row.quantity}) - esta en "
+                        "el universo activo (expiry recuperado de la definicion del "
+                        "instrumento) pero sin punta de dos lados vigente para calcular IV/"
+                        "griegas ahora mismo (probable base iliquida/lejos del spot) - "
+                        "greeks_per_unit queda en None (Position.contribution() la trata como "
+                        "delta=1 por unidad hasta que una entrada nueva la reemplace o se "
+                        "cierre); el horizonte/guardia de fin de semana SI se evaluan igual "
+                        "(no dependen de griegas), Stop Loss/Take Profit siguen sin poder "
+                        "evaluarse hasta que haya un precio vigente."
+                    )
 
         entry_time = row.entry_time
         if hasattr(entry_time, "to_pydatetime"):

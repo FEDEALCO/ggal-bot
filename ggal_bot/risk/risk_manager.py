@@ -141,23 +141,44 @@ class RiskManager:
         compatible para cualquier llamador que no lo pase (incluidos los
         tests existentes) - preserva el stop_loss_pct fijo de siempre.
         """
-        if entry_price is None or entry_price <= 0 or current_price is None:
+        if entry_price is None or entry_price <= 0:
             return None
 
-        pnl_pct = (current_price - entry_price) / entry_price
         holding_business_days = _business_days_between(entry_time.date(), now.date())
 
-        effective_stop_loss_pct = abs(stop_loss_pct)
-        if enable_tiered_stop_loss:
-            if holding_business_days >= tiered_stop_loss_stage3_business_day:
-                effective_stop_loss_pct = abs(tiered_stop_loss_stage3_pct)
-            elif holding_business_days >= tiered_stop_loss_stage2_business_day:
-                effective_stop_loss_pct = abs(tiered_stop_loss_stage2_pct)
+        # BUG REAL VERIFICADO (2026-09-08, ver reconciliation.py y el log de
+        # produccion tras activar el modo aditivo weekly_asymmetric+
+        # scalping): antes, `current_price is None` cortaba la funcion ENTERA
+        # aca arriba (return None), asi que una posicion sin cotizacion
+        # vigente (base iliquida, lejos del spot - ver
+        # reconciliation.reconstruct_positions_from_shadow_log) quedaba SIN
+        # NINGUNA gestion de riesgo en absoluto, ni siquiera el horizonte
+        # semanal o la guardia de fin de semana, que son puramente
+        # CALENDARIO (entry_time/expiry/now) y no necesitan ningun precio
+        # para evaluarse - la unica salida real que Stop Loss/Take Profit
+        # (y su version escalonada) necesitan es `current_price`, porque
+        # miden PnL%. Separar esto es estrictamente mas protector, nunca
+        # menos: nunca hace que una salida dispare ANTES de lo que lo haria
+        # con precio disponible, solo evita quedarse ciego a horizonte/
+        # fin de semana cuando falta precio. Precedente ya existente en el
+        # codigo: evaluate_scalping_exit() (mas abajo en este archivo) ya
+        # separa su cierre EOD del precio de la misma forma - ver
+        # test_evaluate_scalping_exit_eod_close_fires_even_without_current_price
+        # en test_scalping_mode.py.
+        if current_price is not None:
+            pnl_pct = (current_price - entry_price) / entry_price
 
-        if pnl_pct <= -effective_stop_loss_pct:
-            return "stop_loss"
-        if pnl_pct >= abs(take_profit_pct):
-            return "take_profit"
+            effective_stop_loss_pct = abs(stop_loss_pct)
+            if enable_tiered_stop_loss:
+                if holding_business_days >= tiered_stop_loss_stage3_business_day:
+                    effective_stop_loss_pct = abs(tiered_stop_loss_stage3_pct)
+                elif holding_business_days >= tiered_stop_loss_stage2_business_day:
+                    effective_stop_loss_pct = abs(tiered_stop_loss_stage2_pct)
+
+            if pnl_pct <= -effective_stop_loss_pct:
+                return "stop_loss"
+            if pnl_pct >= abs(take_profit_pct):
+                return "take_profit"
 
         # max_holding_business_days=None ("sin limite", ver LongFirstConfig/
         # ScalpingConfig en config.py, AJUSTE 2026-09-07 a pedido explicito

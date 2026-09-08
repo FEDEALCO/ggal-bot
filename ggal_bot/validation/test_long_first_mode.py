@@ -308,6 +308,62 @@ def test_evaluate_position_exit_handles_missing_current_price():
     assert reason is None
 
 
+def test_evaluate_position_exit_horizon_expired_fires_even_without_current_price():
+    """
+    Regresion (BUG REAL VERIFICADO 2026-09-08, ver reconciliation.py y el
+    log de produccion tras el modo aditivo weekly_asymmetric+scalping):
+    antes, `current_price is None` cortaba TODA la funcion (incluidos el
+    horizonte semanal y la guardia de fin de semana, que son puramente
+    calendario y no necesitan ningun precio) - una posicion sin cotizacion
+    vigente (base iliquida, ver reconciliation.reconstruct_positions_from_
+    shadow_log) quedaba sin NINGUNA gestion de riesgo en absoluto, ni
+    siquiera el corte por horizonte. `max_holding_business_days=5` con 6
+    dias habiles de holding debe disparar igual sin importar que no haya
+    precio.
+    """
+    risk_mgr = RiskManager(RiskLimits())
+    now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)  # miercoles
+    entry_time = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)  # lunes de la semana anterior
+    reason = risk_mgr.evaluate_position_exit(
+        entry_price=100.0, current_price=None, entry_time=entry_time,
+        now=now, expiry=date(2026, 10, 16),
+        stop_loss_pct=0.50, take_profit_pct=1.00, max_holding_business_days=5,
+    )
+    assert reason == "weekly_horizon_expired"
+
+
+def test_evaluate_position_exit_weekend_guard_fires_even_without_current_price():
+    """Mismo bug que el test de arriba, version guardia de fin de semana."""
+    risk_mgr = RiskManager(RiskLimits())
+    now = datetime(2026, 8, 28, 15, 0, tzinfo=timezone.utc)  # viernes
+    entry_time = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)  # miercoles, sin cap configurado
+    reason = risk_mgr.evaluate_position_exit(
+        entry_price=100.0, current_price=None, entry_time=entry_time,
+        now=now, expiry=date(2026, 10, 16),
+        stop_loss_pct=0.50, take_profit_pct=1.00, max_holding_business_days=None,
+        weekend_theta_guard_enabled=True, weekend_theta_guard_max_holding_business_days=None,
+    )
+    assert reason == "weekend_theta_guard"
+
+
+def test_evaluate_position_exit_still_returns_none_without_price_when_no_calendar_condition_met():
+    """
+    Complemento: sin precio, pero TAMPOCO ninguna condicion de calendario
+    (ni horizonte ni fin de semana) - debe seguir devolviendo None, no
+    "inventar" un cierre. Prueba que el fix es aditivo, no un cambio de
+    comportamiento por default.
+    """
+    risk_mgr = RiskManager(RiskLimits())
+    now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)  # miercoles
+    reason = risk_mgr.evaluate_position_exit(
+        entry_price=100.0, current_price=None, entry_time=now - timedelta(hours=1),
+        now=now, expiry=date(2026, 9, 4),
+        stop_loss_pct=0.50, take_profit_pct=1.00, max_holding_business_days=5,
+        weekend_theta_guard_enabled=True,
+    )
+    assert reason is None
+
+
 def test_evaluate_vega_decay_exit_triggers_below_threshold():
     risk_mgr = RiskManager(RiskLimits())
     reason = risk_mgr.evaluate_vega_decay_exit(entry_vega=10.0, current_vega=3.0, decay_ratio_threshold=0.35)
@@ -1549,6 +1605,9 @@ ALL_TESTS = [
     test_evaluate_position_exit_weekend_guard_still_fires_below_configured_cap,
     test_evaluate_position_exit_returns_none_within_all_bands,
     test_evaluate_position_exit_handles_missing_current_price,
+    test_evaluate_position_exit_horizon_expired_fires_even_without_current_price,
+    test_evaluate_position_exit_weekend_guard_fires_even_without_current_price,
+    test_evaluate_position_exit_still_returns_none_without_price_when_no_calendar_condition_met,
     test_evaluate_vega_decay_exit_triggers_below_threshold,
     test_evaluate_vega_decay_exit_does_not_trigger_above_threshold,
     test_evaluate_vega_decay_exit_boundary_is_inclusive,

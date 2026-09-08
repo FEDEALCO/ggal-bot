@@ -117,6 +117,64 @@ def test_reconstruct_with_option_chain_fills_greeks(tmp_path):
     assert not any("greeks_per_unit" in w for w in warnings)
 
 
+def test_reconstruct_fills_expiry_even_when_quote_has_no_greeks_yet(tmp_path):
+    """
+    Regresion (BUG REAL VERIFICADO 2026-09-08, ver el log de produccion tras
+    activar el modo aditivo weekly_asymmetric+scalping): una base que SIGUE
+    en el universo activo (option_chain.get() la devuelve) pero todavia no
+    tiene punta de dos lados vigente para calcular IV/griegas (iliquida,
+    lejos del spot) NO debe perder su `expiry` - antes de este fix,
+    `expiry` se completaba adentro del mismo `if quote.greeks is not None`
+    que `greeks_per_unit`, asi que una base perfectamente identificada
+    quedaba con expiry=None, y build_exit_signals() la saltaba por
+    completo (nunca evaluaba Stop Loss/Take Profit/horizonte/guardia de
+    fin de semana) hasta que alguna cotizacion nueva la reemplazara o se
+    cerrara a mano. Esto es exactamente lo que le paso en produccion a las
+    6 posiciones huerfanas reportadas (GFGC6800/7000/7200/7400/7600/8000OC).
+    """
+    csv_path = tmp_path / "shadow_trades.csv"
+    _write_shadow_csv(csv_path, [
+        ["2026-09-01T20:14:00+00:00", "c1", "GFGC7600OC", "buy", "market", 17, 500.0, 500.0, 500.0, "shadow_fill"],
+    ])
+
+    quote_sin_griegas = _make_quote("GFGC7600OC")
+    quote_sin_griegas.greeks = None  # universo activo, pero sin punta de dos lados vigente ahora mismo
+
+    class _FakeChain:
+        def get(self, symbol):
+            return quote_sin_griegas if symbol == "GFGC7600OC" else None
+
+    positions, warnings = reconstruct_positions_from_shadow_log(
+        csv_path=csv_path, option_multiplier=100.0, option_chain=_FakeChain(),
+    )
+    assert len(positions) == 1
+    pos = positions[0]
+    assert pos.greeks_per_unit is None  # esto SI sigue sin poder completarse, correctamente
+    assert pos.expiry == date(2026, 9, 18)  # pero el vencimiento (dato estatico) no deberia perderse
+    assert any("greeks_per_unit" in w for w in warnings)
+    assert any("universo activo" in w for w in warnings)  # el warning ya distingue "en universo, sin punta" de "fuera del universo"
+
+
+def test_reconstruct_leaves_expiry_none_when_symbol_truly_not_in_universe(tmp_path):
+    """Complemento del test de arriba: si la base NO esta en el universo (quote is None), expiry SI debe quedar en None - ahi no hay ningun dato real que recuperar."""
+    csv_path = tmp_path / "shadow_trades.csv"
+    _write_shadow_csv(csv_path, [
+        ["2026-09-01T20:14:00+00:00", "c1", "GFGC8000OC", "buy", "market", 58, 10.0, 10.0, 10.0, "shadow_fill"],
+    ])
+
+    class _EmptyChain:
+        def get(self, symbol):
+            return None
+
+    positions, warnings = reconstruct_positions_from_shadow_log(
+        csv_path=csv_path, option_multiplier=100.0, option_chain=_EmptyChain(),
+    )
+    assert len(positions) == 1
+    assert positions[0].expiry is None
+    assert positions[0].greeks_per_unit is None
+    assert any("fuera del universo" in w for w in warnings)
+
+
 def test_reconstruct_consolidates_multiple_open_lots_into_one_position(tmp_path):
     """
     Regresion (2026-09-07, tras el primer trip real del kill switch en
