@@ -434,6 +434,11 @@ class GgalOptionsBot:
         self._spot_book: Optional[OrderBookSnapshot] = None
         self._recent_volumes: Dict[str, float] = {}
         self._shutting_down = False
+        # Numero de señal (SIGINT/SIGTERM) que disparo el shutdown, o None si
+        # todavia no se recibio ninguna. Se guarda aca (en vez de loguearse
+        # directamente desde el signal handler) por la razon documentada en
+        # _install_signal_handlers().
+        self._shutdown_signal: Optional[int] = None
 
         # Guardia de staleness de datos de mercado (ver RiskConfig.
         # max_market_data_staleness_seconds / _is_market_data_stale()):
@@ -1895,13 +1900,50 @@ class GgalOptionsBot:
                     logger.exception("Error no controlado en recompute_cycle(); se continua en el proximo ciclo.")
                 time.sleep(cycle_seconds)
         except KeyboardInterrupt:
+            # Fallback defensivo: en la practica SIGINT ya es interceptado por
+            # _handler() (mas abajo), que marca self._shutting_down y hace que
+            # el while de arriba termine solo, sin necesidad de esta excepcion.
             pass
         finally:
+            # El log de "señal recibida" se emite aca, fuera del signal
+            # handler, ver la razon en _install_signal_handlers(). En este
+            # punto ya estamos de vuelta en el flujo secuencial normal del
+            # hilo principal (no interrumpiendo nada), asi que loguear aca es
+            # seguro.
+            self._log_shutdown_signal_if_any()
             self.shutdown()
+
+    def _log_shutdown_signal_if_any(self) -> None:
+        """Loguea la señal de apagado recibida (SIGINT/SIGTERM), si hubo
+        alguna. Se llama SIEMPRE desde el flujo normal de ejecucion (nunca
+        desde el signal handler en si), ver la razon en
+        _install_signal_handlers()."""
+        if self._shutdown_signal is not None:
+            logger.info(
+                "Señal de apagado recibida (%s); iniciando graceful shutdown.",
+                self._shutdown_signal,
+            )
 
     def _install_signal_handlers(self) -> None:
         def _handler(signum, frame):  # noqa: ARG001
-            logger.info("Señal de apagado recibida (%s); iniciando graceful shutdown.", signum)
+            # IMPORTANTE: un signal handler en Python se ejecuta en el hilo
+            # principal, "insertado" en el punto exacto de bytecode en el que
+            # la señal llego -- incluso si ese punto esta en medio de un
+            # logger.info(...) ya en curso escribiendo al mismo stream de
+            # logs. Si este handler tambien llama a logger.info(...), termina
+            # reentrando el mismo _io.BufferedWriter todavia bloqueado por la
+            # escritura interrumpida, lo cual dispara "RuntimeError: reentrant
+            # call inside <_io.BufferedWriter ...>" (observado en produccion
+            # durante un shutdown). La logica de logging del modulo `logging`
+            # hace I/O, y hacer I/O dentro de un signal handler no es seguro
+            # en general por esta misma razon.
+            #
+            # Por eso este handler NO loguea nada: solo guarda el numero de
+            # señal y levanta la bandera de apagado. El mensaje se loguea de
+            # forma segura despues, desde run_forever(), una vez que el hilo
+            # principal volvio a su flujo de ejecucion normal (ver el
+            # `finally` de run_forever()).
+            self._shutdown_signal = signum
             self._shutting_down = True
 
         signal.signal(signal.SIGINT, _handler)
