@@ -149,6 +149,34 @@ class SpreadCompletionSignal:
 
 
 @dataclass
+class SpreadOpenSignal:
+    """
+    MEJORA 2026-09-17 (a pedido explicito del usuario, conversacion sobre el
+    indicador SuperTrend AI del 2026-09-10): "si el ratio [IV implicita ATM
+    actual / volatilidad realizada] esta alto, la prima esta cara relativo a
+    lo que el activo realmente se mueve - ahi conviene un spread de debito
+    (comprar el strike cercano, vender uno mas lejano) en vez de la opcion
+    simple, para pagar menos theta". Distinto de SpreadCompletionSignal: ese
+    otro solo agrega la pata corta a una LARGA YA CONFIRMADA en el
+    portafolio (financiamiento/cap defensivo); este abre AMBAS patas de
+    una, como entrada nueva, cuando la dislocacion de smile indica IV cara
+    en vez de barata (ver WeeklyAsymmetricStrategy.
+    scan_expensive_iv_spread_signals). Ver
+    config.LongFirstConfig.enable_expensive_iv_spread_entry (apagado por
+    defecto).
+    """
+    long_symbol: str
+    short_symbol: str
+    option_type: OptionType
+    action: str = "open_debit_spread"
+    reason: str = ""
+    iv_dislocation_vol_points: float = 0.0
+    net_debit_premium: float = 0.0     # prima larga - prima corta (mid); lo que realmente se paga por spread
+    days_business_to_expiry: int = 0
+    trend_context: str = ""
+
+
+@dataclass
 class ExitSignal:
     symbol: str
     reason: str            # "stop_loss" | "take_profit" | "weekly_horizon_expired" | "weekend_theta_guard" | "vega_theta_decay" | "partial_profit_take"
@@ -179,9 +207,11 @@ class EntryScanDiagnostics:
     total_quotes: int = 0
     blocked_by_direction: int = 0       # smile_threshold None: bloqueo direccional tecnico (BULLISH/BEARISH sin reversion)
     blocked_by_holding_days: int = 0
+    blocked_by_min_days_to_expiry: int = 0  # ver config.LongFirstConfig.min_business_days_to_expiry_for_entry
     blocked_by_liquidity: int = 0
     blocked_by_obi: int = 0
     blocked_by_moneyness: int = 0
+    blocked_by_delta_band: int = 0      # ver config.LongFirstConfig.enable_delta_band_filter
     evaluated_for_dislocation: int = 0  # llegaron al chequeo de smile (pasaron todos los filtros anteriores)
     blocked_by_dislocation: int = 0     # llegaron pero no alcanzaron el umbral vigente (normal o extremo bajo NEUTRAL)
     qualified: int = 0                  # generaron EntrySignal
@@ -290,6 +320,18 @@ class WeeklyAsymmetricStrategy:
                 diag.blocked_by_holding_days += 1
                 continue
 
+            # Piso de vencimiento minimo (MEJORA 2026-09-17, ver
+            # config.LongFirstConfig.min_business_days_to_expiry_for_entry):
+            # complementa al filtro de arriba (que descarta vencimientos
+            # DEMASIADO LEJANOS) descartando tambien los DEMASIADO CERCANOS
+            # para tener mercado real - getattr() defensivo porque
+            # ScalpingConfig podria no tener el atributo si se agrega en el
+            # futuro un caller que reutilice esta funcion sin ese campo.
+            min_days_to_expiry = getattr(cfg, "min_business_days_to_expiry_for_entry", None)
+            if min_days_to_expiry is not None and q.days_business < min_days_to_expiry:
+                diag.blocked_by_min_days_to_expiry += 1
+                continue
+
             volume = recent_volumes.get(q.symbol, 0.0)
             if not self.risk_manager.check_liquidity(q.book, volume):
                 diag.blocked_by_liquidity += 1
@@ -310,6 +352,20 @@ class WeeklyAsymmetricStrategy:
             if abs(log_moneyness) > cfg.moneyness_band_pct:
                 diag.blocked_by_moneyness += 1
                 continue  # fuera de la banda ATM/OTM cercana (convexidad objetivo)
+
+            # Filtro ADICIONAL por banda de delta (MEJORA 2026-09-17, ver
+            # config.LongFirstConfig.enable_delta_band_filter) - apagado por
+            # defecto, se SUMA al filtro de moneyness de arriba (no lo
+            # reemplaza) cuando esta habilitado. Una base sin Griegas
+            # calculadas todavia (q.greeks is None) se descarta por este
+            # filtro en vez de admitirse a ciegas - mismo criterio
+            # conservador que el resto de los filtros de calidad de este
+            # metodo.
+            if getattr(cfg, "enable_delta_band_filter", False):
+                delta = abs((q.greeks or {}).get("delta", 0.0)) if q.greeks is not None else None
+                if delta is None or not (cfg.delta_band_min <= delta <= cfg.delta_band_max):
+                    diag.blocked_by_delta_band += 1
+                    continue
 
             diag.evaluated_for_dislocation += 1
             dislocation = surface.smile_dislocation(q)
@@ -359,6 +415,95 @@ class WeeklyAsymmetricStrategy:
         diag.qualified = len(candidates)
         self.last_scan_diagnostics = diag
         return candidates
+
+    # -- Spread de debito como ENTRADA NUEVA cuando la IV esta CARA (MEJORA 2026-09-17) --
+
+    def scan_expensive_iv_spread_signals(
+        self,
+        surface: VolatilitySurface,
+        option_chain: OptionChain,
+        recent_volumes: Dict[str, float],
+        trend: str = Trend.NEUTRAL.value,
+        max_quote_age_seconds: Optional[float] = None,
+        now: Optional[float] = None,
+    ) -> List[SpreadOpenSignal]:
+        """
+        Ver config.LongFirstConfig.enable_expensive_iv_spread_entry para la
+        motivacion completa. Complementa scan_entry_signals() (que solo
+        actua sobre dislocacion NEGATIVA, "IV barata"): esta busca
+        dislocacion POSITIVA ("IV cara") y, si encuentra una base candidata
+        Y un wing valido para armarle spread (_find_wing_quote, la misma
+        logica ya usada por scan_spread_completion_signals), arma AMBAS
+        patas como entrada nueva - no requiere ninguna posicion previa en
+        el portafolio (a diferencia de scan_spread_completion_signals).
+        Apagado por defecto (`self.cfg.enable_expensive_iv_spread_entry`).
+
+        Bajo NEUTRAL no se genera ninguna señal (mismo criterio que
+        scan_spread_completion_signals: sin conviccion direccional no hay
+        base para asumir el riesgo direccional neto que todavia conserva un
+        spread de debito, aunque acotado).
+        """
+        cfg = self.cfg
+        if not getattr(cfg, "enable_expensive_iv_spread_entry", False):
+            return []
+        ta_cfg = SETTINGS.technical_analysis
+        if ta_cfg.enabled and trend == Trend.NEUTRAL.value:
+            return []
+
+        allowed_option_type: Optional[OptionType] = None
+        if ta_cfg.enabled and trend == Trend.BULLISH.value:
+            allowed_option_type = OptionType.CALL
+        elif ta_cfg.enabled and trend == Trend.BEARISH.value:
+            allowed_option_type = OptionType.PUT
+
+        threshold = getattr(cfg, "expensive_iv_spread_threshold_vol_points", 3.0)
+        min_days_to_expiry = getattr(cfg, "min_business_days_to_expiry_for_entry", None)
+
+        signals: List[SpreadOpenSignal] = []
+        for q in surface.quotes:
+            if allowed_option_type is not None and q.option_type is not allowed_option_type:
+                continue
+            if cfg.max_holding_business_days is not None and q.days_business > cfg.max_holding_business_days:
+                continue
+            if min_days_to_expiry is not None and q.days_business < min_days_to_expiry:
+                continue
+            volume = recent_volumes.get(q.symbol, 0.0)
+            if not self.risk_manager.check_liquidity(q.book, volume):
+                continue
+            if cfg.enable_obi_filter and not passes_obi_filter(q.book, cfg.min_obi_for_entry):
+                continue
+            if not q.spot_ref or q.spot_ref <= 0:
+                continue
+            if abs(math.log(q.strike / q.spot_ref)) > cfg.moneyness_band_pct:
+                continue
+
+            dislocation = surface.smile_dislocation(q)
+            if dislocation <= threshold:
+                continue  # no esta lo suficientemente "cara" para justificar pagar menos theta con un spread
+
+            wing = self._find_wing_quote(
+                option_chain, q, cfg, max_quote_age_seconds=max_quote_age_seconds, now=now,
+            )
+            if wing is None or wing.book.bid <= 0 or wing.book.ask <= 0:
+                continue
+
+            net_debit = q.book.mid - wing.book.mid
+            if net_debit <= 0:
+                continue  # spread degenerado (credito neto en vez de debito) - no es el patron que se busca aca
+
+            spread_kind = "Bull Call Spread" if q.option_type is OptionType.CALL else "Bear Put Spread"
+            signals.append(SpreadOpenSignal(
+                long_symbol=q.symbol, short_symbol=wing.symbol, option_type=q.option_type,
+                reason=(
+                    f"{spread_kind} (entrada nueva): IV cruda {dislocation:.2f} vol pts por encima de "
+                    f"la curva (cara) - se paga {net_debit:.2f} de debito neto en vez de la prima "
+                    f"simple {q.book.mid:.2f} para pagar menos theta (horizonte semanal: "
+                    f"{q.days_business}d habiles; tendencia 1D: {trend})"
+                ),
+                iv_dislocation_vol_points=dislocation, net_debit_premium=net_debit,
+                days_business_to_expiry=q.days_business, trend_context=trend,
+            ))
+        return signals
 
     # -- Spreads: la pata corta SOLO si la larga ya esta confirmada en portafolio --
 
@@ -509,12 +654,45 @@ class WeeklyAsymmetricStrategy:
         wings = [q for q in same_series if q.strike <= long_quote.strike - min_wing_strike_diff]
         return max(wings, key=lambda q: q.strike) if wings else None
 
+    @staticmethod
+    def _trend_has_reversed(
+        option_type: Optional[str], trend_at_entry: Optional[str], current_trend: str,
+    ) -> bool:
+        """
+        MEJORA 2026-09-17 (ver config.LongFirstConfig.
+        enable_trend_reversal_exit para la motivacion completa).
+        Deliberadamente ESTRICTA: solo True cuando `current_trend` paso al
+        EXTREMO CONTRARIO del que motivo la entrada -
+
+            CALL comprada bajo BULLISH -> current_trend == BEARISH
+            PUT  comprada bajo BEARISH -> current_trend == BULLISH
+
+        Una lectura NEUTRAL de por medio (fading, no reversion confirmada
+        al extremo contrario) NO cuenta como reversion - evita cerrar una
+        posicion sana ante ruido de corto plazo del filtro tecnico (el
+        mismo criterio conservador que ya rige en scan_entry_signals: bajo
+        NEUTRAL no hay descarte direccional automatico). Una posicion sin
+        `option_type`/`trend_at_entry` poblados (None, ver Position;
+        incluida CUALQUIER posicion abierta antes de que estos dos campos
+        existieran) o abierta bajo una tendencia de entrada que ya era
+        NEUTRAL (sin tesis direccional de la cual "reversar") nunca
+        dispara esta salida.
+        """
+        if option_type is None or trend_at_entry is None:
+            return False
+        if option_type == OptionType.CALL.value:
+            return trend_at_entry == Trend.BULLISH.value and current_trend == Trend.BEARISH.value
+        if option_type == OptionType.PUT.value:
+            return trend_at_entry == Trend.BEARISH.value and current_trend == Trend.BULLISH.value
+        return False
+
     # -- Salidas: glue hacia RiskManager.evaluate_position_exit() ---------------
 
     def build_exit_signals(
         self, portfolio: Portfolio, current_prices: Dict[str, float], now: datetime,
         current_greeks: Optional[Dict[str, Dict[str, float]]] = None,
         strategy_tag: str = "weekly_asymmetric",
+        trend: str = Trend.NEUTRAL.value,
     ) -> List[ExitSignal]:
         """
         `current_prices`: mid vigente por simbolo (ej. desde el
@@ -538,6 +716,17 @@ class WeeklyAsymmetricStrategy:
         comportamiento previo a este parametro para cualquier llamador que
         no lo pase - incluida la posicion de Octubre en produccion, que no
         tiene esta marca poblada.
+
+        `trend` (MEJORA 2026-09-17, ver config.LongFirstConfig.
+        enable_trend_reversal_exit y _trend_has_reversed mas abajo):
+        lectura VIGENTE de tendencia 1D, misma inyectada que en
+        scan_entry_signals()/scan_expensive_iv_spread_signals - se compara
+        contra Position.trend_at_entry (congelado al fill) para decidir si
+        la tesis direccional que motivo la entrada ya se invalidio. Default
+        NEUTRAL preserva el comportamiento previo a este parametro para
+        cualquier llamador que no lo pase (ademas, con
+        enable_trend_reversal_exit apagado por defecto, esta salida ni
+        siquiera se evalua).
         """
         cfg = self.cfg
         signals: List[ExitSignal] = []
@@ -580,6 +769,21 @@ class WeeklyAsymmetricStrategy:
                     entry_time=position.entry_time, now=now,
                     min_holding_hours=cfg.vega_decay_min_holding_hours,
                 )
+
+            # Salida por reversion de tendencia (MEJORA 2026-09-17, ver
+            # config.LongFirstConfig.enable_trend_reversal_exit y
+            # _trend_has_reversed): solo se evalua si nada disparo todavia
+            # (misma prioridad que la salida por compresion de vega) y solo
+            # si la posicion tiene la metadata de entrada necesaria
+            # (Position.option_type/trend_at_entry - ninguna posicion
+            # abierta antes de este campo la tiene, por lo que esta salida
+            # nunca las afecta retroactivamente).
+            if (
+                reason is None
+                and getattr(cfg, "enable_trend_reversal_exit", False)
+                and self._trend_has_reversed(position.option_type, position.trend_at_entry, trend)
+            ):
+                reason = "trend_reversal_exit"
 
             if reason is not None:
                 signals.append(ExitSignal(symbol=position.symbol, reason=reason, quantity=position.quantity))

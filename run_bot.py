@@ -59,7 +59,7 @@ from ggal_bot.execution.order_gateway import (
 )
 from ggal_bot.strategy.delta_hedger import DeltaHedgingEngine
 from ggal_bot.strategy.vol_arbitrage import VolatilityArbitrageStrategy
-from ggal_bot.strategy.weekly_asymmetric import EntryScanDiagnostics, WeeklyAsymmetricStrategy
+from ggal_bot.strategy.weekly_asymmetric import EntryScanDiagnostics, ExitSignal, WeeklyAsymmetricStrategy
 from ggal_bot.strategy.scalping import ScalpingStrategy
 from ggal_bot.data.technical_analysis import TechnicalAnalysisEngine, Trend
 from ggal_bot.data.intraday_bars import MultiTimeframeIntradayEngine
@@ -433,6 +433,24 @@ class GgalOptionsBot:
 
         self._spot_book: Optional[OrderBookSnapshot] = None
         self._recent_volumes: Dict[str, float] = {}
+        # Cooldown de reentrada post stop_loss para vol_arbitrage (MEJORA
+        # 2026-09-17, ver VolArbitrageConfig.reentry_cooldown_seconds y
+        # _check_vol_arbitrage_exits/_act_on_signal): symbol -> timestamp
+        # (time.time()) hasta el cual NO se debe reabrir esa base tras un
+        # cierre por stop_loss. Vacio = ninguna base en cooldown todavia
+        # (comportamiento identico al de antes de esta mejora mientras
+        # reentry_cooldown_seconds siga en None).
+        self._vol_arbitrage_reentry_cooldown_until: Dict[str, float] = {}
+        # Alerta activa por posicion sin cotizacion vigente (MEJORA
+        # 2026-09-17, ver RiskConfig.stale_quote_warning_seconds y
+        # _warn_positions_without_valid_quote): symbol -> timestamp
+        # (time.time()) desde el cual esa base, con una posicion abierta,
+        # dejo de tener una cotizacion `bid>0 and ask>0` en self.option_chain.
+        self._position_missing_quote_since: Dict[str, float] = {}
+        # Bases ya alertadas esta racha (evita repetir el mismo
+        # logger.warning en cada ciclo de ~2-4s mientras la condicion
+        # persista - mismo criterio que self._option_staleness_logged).
+        self._position_missing_quote_warned: set = set()
         self._shutting_down = False
         # Numero de señal (SIGINT/SIGTERM) que disparo el shutdown, o None si
         # todavia no se recibio ninguna. Se guarda aca (en vez de loguearse
@@ -723,6 +741,15 @@ class GgalOptionsBot:
             logger.info("Cotizaciones de opciones recuperadas: ninguna esta stale este ciclo.")
             self._option_staleness_logged = False
 
+        # Alerta activa por posicion sin cotizacion vigente (MEJORA
+        # 2026-09-17, ver RiskConfig.stale_quote_warning_seconds): corre
+        # SIEMPRE, sin importar la estrategia activa (mismo criterio que
+        # option_chain.recompute_all arriba) - se ubica DESPUES de
+        # recompute_all (para ver el estado de la cadena ya actualizado
+        # este ciclo) y ANTES del kill switch/dispatch de estrategia, para
+        # que la alerta sea lo mas temprana posible dentro del ciclo.
+        self._warn_positions_without_valid_quote()
+
         # Kill switch centralizado (Fase 5.3, ver ggal_bot/risk/kill_switch.py):
         # se evalua ANTES de correr el escaneo de entradas de este ciclo,
         # contra el estado del portfolio tal cual quedo al final del ciclo
@@ -784,8 +811,139 @@ class GgalOptionsBot:
             option_chain_snapshot=self._option_chain_snapshot(),
         )
 
+    def _check_vol_arbitrage_exits(self, spot: float) -> None:
+        """
+        MEJORA 2026-09-17 (ver VolArbitrageConfig.__doc__ en config.py para
+        la evidencia completa: GFGC8000OC perdio -$681.053 en shadow tras
+        13 dias sin NINGUN control de riesgo, porque este modo nunca
+        evaluaba salidas). "Salidas primero" (mismo orden que
+        _run_weekly_asymmetric_cycle) - se corre ANTES de escanear entradas
+        nuevas en el mismo ciclo, reutilizando RiskManager.
+        evaluate_position_exit() tal cual (misma fuente de verdad de
+        "cuando cerrar" que el resto del bot) y _act_on_exit_signal() para
+        ejecutar el cierre. Deliberadamente sin tiered stop ni toma de
+        ganancia parcial (ver VolArbitrageConfig.__doc__) - el objetivo es
+        que ninguna posicion quede sin ningun corte, no replicar el motor
+        de salida completo de weekly_asymmetric.
+
+        `SETTINGS.vol_arbitrage.enabled=False` restaura el comportamiento
+        de siempre (esta funcion no hace nada) - backward-compatible.
+        """
+        cfg = SETTINGS.vol_arbitrage
+        if not cfg.enabled:
+            return
+        now = datetime.now(timezone.utc)
+        for position in self.portfolio.positions:
+            if position.strategy_tag != "vol_arbitrage" or position.quantity <= 0:
+                continue
+            if position.entry_price is None or position.entry_time is None or position.expiry is None:
+                continue
+            quote = self.option_chain.get(position.symbol)
+            current_price = quote.book.mid if (quote is not None and quote.book.mid > 0) else None
+            reason = self.risk_manager.evaluate_position_exit(
+                entry_price=position.entry_price, current_price=current_price,
+                entry_time=position.entry_time, now=now, expiry=position.expiry,
+                stop_loss_pct=cfg.stop_loss_pct, take_profit_pct=cfg.take_profit_pct,
+                max_holding_business_days=cfg.max_holding_business_days,
+                weekend_theta_guard_enabled=cfg.weekend_theta_guard_enabled,
+            )
+            if reason is not None:
+                logger.info(
+                    "Señal de salida [vol_arbitrage]: %s reason=%s (sin esta mejora, esta posicion "
+                    "no se hubiera evaluado nunca - ver VolArbitrageConfig.__doc__).",
+                    position.symbol, reason,
+                )
+                self._act_on_exit_signal(
+                    ExitSignal(symbol=position.symbol, reason=reason, quantity=position.quantity),
+                    spot, strategy_tag="vol_arbitrage",
+                )
+                # Cooldown de reentrada (MEJORA 2026-09-17, ver
+                # VolArbitrageConfig.reentry_cooldown_seconds): UNICAMENTE
+                # tras stop_loss - es la unica razon de cierre que refleja
+                # que la tesis de esta señal salio mal (take_profit es un
+                # buen resultado; horizonte/guardia de fin de semana son
+                # calendario, no juicio sobre la señal). Evidencia real (ver
+                # analisis del export de trades 2026-09-17T17-13, base
+                # GFGC7600OC): scan_for_signals() re-emite la MISMA
+                # dislocacion persistente en cada ciclo (ver docstring de
+                # _act_on_signal) - sin este cooldown, en cuanto Guarda 2 se
+                # libera (qty vuelve a 0 tras el cierre) el bot puede
+                # reabrir la MISMA base de inmediato, en el ciclo
+                # inmediatamente siguiente, contra una IV que probablemente
+                # todavia no se corrigio - "encadenando" stops en vez de
+                # dejar que la sonrisa se normalice. Default None (ver
+                # config.py) = sin cooldown, comportamiento identico al de
+                # antes de esta mejora.
+                if reason == "stop_loss" and cfg.reentry_cooldown_seconds is not None:
+                    self._vol_arbitrage_reentry_cooldown_until[position.symbol] = (
+                        time.time() + cfg.reentry_cooldown_seconds
+                    )
+
+    def _warn_positions_without_valid_quote(self, now: Optional[float] = None) -> None:
+        """
+        MEJORA 2026-09-17 (ver RiskConfig.stale_quote_warning_seconds para
+        la motivacion completa). Se llama SIEMPRE, sin importar la
+        estrategia activa (ver recompute_cycle, mismo criterio que
+        option_chain.recompute_all/kill_switch.evaluate arriba) - una
+        posicion de CUALQUIER strategy_tag (weekly_asymmetric/vol_arbitrage/
+        scalping) puede quedarse sin cotizacion vigente.
+
+        `now`: timestamp inyectable (time.time()) para que este metodo sea
+        testeable de forma deterministica - default None usa el reloj real
+        (unico metodo del modulo que llama time.time() internamente en vez
+        de recibirlo siempre inyectado, porque a diferencia de
+        strategy/weekly_asymmetric.py este archivo SI mezcla I/O con logica
+        de estado en varios puntos, ver _check_vol_arbitrage_exits arriba).
+        """
+        threshold = SETTINGS.risk.stale_quote_warning_seconds
+        if threshold is None:
+            return
+        now_ts = now if now is not None else time.time()
+
+        symbols_with_open_positions = {p.symbol for p in self.portfolio.positions if p.quantity != 0}
+        # Purga bases que ya no tienen posicion abierta (se cerraron este
+        # ciclo o antes) - evita una fuga de memoria de simbolos viejos en
+        # los dos dict/set de estado de abajo.
+        for symbol in list(self._position_missing_quote_since.keys()):
+            if symbol not in symbols_with_open_positions:
+                del self._position_missing_quote_since[symbol]
+                self._position_missing_quote_warned.discard(symbol)
+
+        for symbol in symbols_with_open_positions:
+            quote = self.option_chain.get(symbol)
+            has_valid_quote = quote is not None and quote.book.bid > 0 and quote.book.ask > 0
+            if has_valid_quote:
+                if symbol in self._position_missing_quote_since:
+                    logger.info(
+                        "Cotizacion recuperada para %s (posicion abierta): se resuelve la alerta "
+                        "de cotizacion faltante.", symbol,
+                    )
+                    del self._position_missing_quote_since[symbol]
+                    self._position_missing_quote_warned.discard(symbol)
+                continue
+
+            missing_since = self._position_missing_quote_since.get(symbol)
+            if missing_since is None:
+                self._position_missing_quote_since[symbol] = now_ts
+                continue
+
+            elapsed = now_ts - missing_since
+            if elapsed >= threshold and symbol not in self._position_missing_quote_warned:
+                logger.warning(
+                    "ALERTA: la posicion abierta en %s no tiene cotizacion valida (bid/ask) en "
+                    "la cadena vigente hace %.0fs (umbral=%.0fs) - Stop Loss/Take Profit/toma de "
+                    "ganancia parcial/compresion de vega NO se estan evaluando para esta base "
+                    "mientras esto dure (ver risk.risk_manager.evaluate_position_exit); solo el "
+                    "horizonte de dias habiles y la guardia de fin de semana le siguen aplicando. "
+                    "Requiere revision manual (ver dashboard, pestaña 'Abiertas', o "
+                    "ggal_bot/ops/manual_close.py).",
+                    symbol, elapsed, threshold,
+                )
+                self._position_missing_quote_warned.add(symbol)
+
     def _run_vol_arbitrage_cycle(self, spot: float) -> List[object]:
         """Ciclo bajo el modo original de arbitraje de volatilidad delta-neutral."""
+        self._check_vol_arbitrage_exits(spot)
         all_signals: List[object] = []
         for expiry, quotes in self.option_chain.quotes_by_expiry().items():
             # BUG REAL CORREGIDO (ver RiskConfig.max_option_quote_staleness_seconds):
@@ -871,9 +1029,11 @@ class GgalOptionsBot:
             total.total_quotes += d.total_quotes
             total.blocked_by_direction += d.blocked_by_direction
             total.blocked_by_holding_days += d.blocked_by_holding_days
+            total.blocked_by_min_days_to_expiry += d.blocked_by_min_days_to_expiry
             total.blocked_by_liquidity += d.blocked_by_liquidity
             total.blocked_by_obi += d.blocked_by_obi
             total.blocked_by_moneyness += d.blocked_by_moneyness
+            total.blocked_by_delta_band += d.blocked_by_delta_band
             total.evaluated_for_dislocation += d.evaluated_for_dislocation
             total.blocked_by_dislocation += d.blocked_by_dislocation
             total.qualified += d.qualified
@@ -885,12 +1045,13 @@ class GgalOptionsBot:
 
         logger.info(
             "Diagnostico escaneo de entradas [tendencia=%s]: %d cotizaciones evaluadas -> "
-            "bloqueadas por direccion tecnica=%d, horizonte semanal=%d, liquidez=%d, OBI=%d, "
-            "moneyness=%d; llegaron al chequeo de dislocacion de smile=%d (no alcanzaron el "
-            "umbral=%d, calificaron=%d).",
+            "bloqueadas por direccion tecnica=%d, horizonte semanal=%d, piso min. vencimiento=%d, "
+            "liquidez=%d, OBI=%d, moneyness=%d, banda de delta=%d; llegaron al chequeo de "
+            "dislocacion de smile=%d (no alcanzaron el umbral=%d, calificaron=%d).",
             total.trend, total.total_quotes, total.blocked_by_direction, total.blocked_by_holding_days,
-            total.blocked_by_liquidity, total.blocked_by_obi, total.blocked_by_moneyness,
-            total.evaluated_for_dislocation, total.blocked_by_dislocation, total.qualified,
+            total.blocked_by_min_days_to_expiry, total.blocked_by_liquidity, total.blocked_by_obi,
+            total.blocked_by_moneyness, total.blocked_by_delta_band, total.evaluated_for_dislocation,
+            total.blocked_by_dislocation, total.qualified,
         )
         if total.evaluated_for_dislocation == 0 and total.total_quotes > 0:
             logger.info(
@@ -1029,7 +1190,9 @@ class GgalOptionsBot:
         # entrada (esa base de comparacion es Position.greeks_per_unit,
         # congelada al fill).
         current_greeks = {q.symbol: q.greeks for q in self.option_chain.all_quotes() if q.greeks is not None}
-        exit_signals = self.strategy.build_exit_signals(self.portfolio, current_prices, now, current_greeks=current_greeks)
+        exit_signals = self.strategy.build_exit_signals(
+            self.portfolio, current_prices, now, current_greeks=current_greeks, trend=trend,
+        )
         all_signals.extend(exit_signals)
         for ex in exit_signals:
             logger.info("Salida [Long-First]: %s %s x%.2f - %s", ex.action, ex.symbol, ex.quantity, ex.reason)
@@ -1108,6 +1271,37 @@ class GgalOptionsBot:
                     )
                     self._act_on_entry_signal(es, spot)
 
+                # Spread de debito como ENTRADA NUEVA cuando la IV esta cara
+                # (MEJORA 2026-09-17, ver config.LongFirstConfig.
+                # enable_expensive_iv_spread_entry, apagado por defecto).
+                # Va DENTRO de este loop (no despues, como el paso 3 de
+                # completar spreads) porque necesita la `surface` de ESTE
+                # vencimiento puntual, igual que scan_entry_signals arriba.
+                #
+                # DELIBERADAMENTE SOLO SEÑALIZA/LOGUEA todavia, NO ejecuta
+                # ordenes: a diferencia de scan_spread_completion_signals
+                # (que solo agrega una pata corta a una larga YA confirmada,
+                # un solo envio de orden), esto requeriria coordinar DOS
+                # ordenes nuevas (comprar la larga + vender el wing) como
+                # una unidad, con su propio sizing contra el debito neto (no
+                # la prima simple) - superficie de ejecucion nueva que el
+                # usuario todavia no confirmo que quiere activa en modo
+                # shadow real. Ver WeeklyAsymmetricStrategy.
+                # scan_expensive_iv_spread_signals para la logica de
+                # deteccion, ya cubierta por tests.
+                if SETTINGS.long_first.enable_expensive_iv_spread_entry:
+                    expensive_spread_signals = self.strategy.scan_expensive_iv_spread_signals(
+                        surface, self.option_chain, self._recent_volumes, trend=trend,
+                        max_quote_age_seconds=SETTINGS.risk.max_option_quote_staleness_seconds,
+                        now=time.time(),
+                    )
+                    for sp in expensive_spread_signals:
+                        logger.info(
+                            "Señal [%s, spread de debito, SOLO LOG - ejecucion no implementada "
+                            "todavia]: comprar %s / vender %s (debito neto=%.2f) - %s",
+                            expiry, sp.long_symbol, sp.short_symbol, sp.net_debit_premium, sp.reason,
+                        )
+
             self._log_entry_scan_diagnostics_if_due(
                 entry_diagnostics_by_expiry, now, quote_availability_by_expiry=quote_availability_by_expiry,
             )
@@ -1132,6 +1326,33 @@ class GgalOptionsBot:
                         sp.action, sp.short_symbol, sp.long_symbol, sp.reason,
                     )
                     self._act_on_spread_completion_signal(sp, spot)
+
+            # -- 4) Spread de debito como ENTRADA NUEVA cuando la IV esta cara
+            # (MEJORA 2026-09-17, ver config.LongFirstConfig.
+            # enable_expensive_iv_spread_entry, apagado por defecto).
+            #
+            # DELIBERADAMENTE SOLO SEÑALIZA/LOGUEA todavia, NO ejecuta ordenes:
+            # a diferencia de scan_spread_completion_signals (que solo agrega
+            # una pata corta a una larga YA confirmada, un solo envio de
+            # orden), esto requeriria coordinar DOS ordenes nuevas (comprar la
+            # larga + vender el wing) como una unidad, con su propio sizing
+            # contra el debito neto (no la prima simple) - superficie de
+            # ejecucion nueva que el usuario todavia no confirmo que quiere
+            # activa en modo shadow real. Ver WeeklyAsymmetricStrategy.
+            # scan_expensive_iv_spread_signals para la logica de deteccion,
+            # ya cubierta por tests.
+            if SETTINGS.long_first.enable_expensive_iv_spread_entry:
+                expensive_spread_signals = self.strategy.scan_expensive_iv_spread_signals(
+                    surface, self.option_chain, self._recent_volumes, trend=trend,
+                    max_quote_age_seconds=SETTINGS.risk.max_option_quote_staleness_seconds,
+                    now=time.time(),
+                )
+                for sp in expensive_spread_signals:
+                    logger.info(
+                        "Señal [spread de debito, SOLO LOG - ejecucion no implementada todavia]: "
+                        "comprar %s / vender %s (debito neto=%.2f) - %s",
+                        sp.long_symbol, sp.short_symbol, sp.net_debit_premium, sp.reason,
+                    )
 
         return all_signals
 
@@ -1358,17 +1579,43 @@ class GgalOptionsBot:
         IMPORTANTE (bug real detectado corriendo el bot en modo shadow): la
         señal de smile_dislocation persiste mientras la sonrisa no se
         corrija, así que scan_for_signals() la va a re-emitir en TODOS los
-        ciclos siguientes. Sin las dos guardas de abajo, el bot reentraba la
+        ciclos siguientes. Sin las guardas de abajo, el bot reentraba la
         MISMA base una y otra vez (una orden nueva cada ciclo, sin límite),
         porque nunca quedaba registro de que ya se había operado esa señal.
         Las guardas son deliberadamente simples (una base por vez, sin
-        pyramideo) - no implementan una logica de salida/take-profit; cerrar
-        la posicion cuando la sonrisa se normalice sigue siendo un TODO
-        aparte (ver README).
+        pyramideo) - no implementan una logica de salida/take-profit propia
+        de esta señal (esa la aporta _check_vol_arbitrage_exits, MEJORA
+        2026-09-17, ver VolArbitrageConfig.__doc__: antes de esa mejora,
+        "cerrar la posicion cuando la sonrisa se normalice" era un TODO sin
+        resolver).
+
+        Guarda 0 (MEJORA 2026-09-17, ver VolArbitrageConfig.
+        reentry_cooldown_seconds y _check_vol_arbitrage_exits): con la
+        salida automatica por stop_loss ya activa, la MISMA señal
+        persistente de arriba puede volver a calificar en el ciclo
+        siguiente al cierre - sin este cooldown, el bot reabriria la base
+        recien stopeada de inmediato, encadenando stops en vez de esperar a
+        que la sonrisa se normalice de verdad (ver analisis real de
+        GFGC7600OC en el export de trades 2026-09-17T17-13). Default
+        (reentry_cooldown_seconds=None) preserva el comportamiento previo a
+        esta mejora (sin cooldown).
         """
         quote = self.option_chain.get(signal.symbol)
         if quote is None or quote.book.bid <= 0 or quote.book.ask <= 0:
             return
+
+        # Guarda 0: base todavia en cooldown de reentrada tras un stop_loss
+        # reciente (ver docstring de arriba y VolArbitrageConfig.
+        # reentry_cooldown_seconds).
+        cooldown_cfg = SETTINGS.vol_arbitrage.reentry_cooldown_seconds
+        if cooldown_cfg is not None:
+            cooldown_until = self._vol_arbitrage_reentry_cooldown_until.get(signal.symbol)
+            if cooldown_until is not None and time.time() < cooldown_until:
+                logger.debug(
+                    "Señal %s ignorada: base en cooldown de reentrada tras stop_loss (faltan %.0fs).",
+                    signal.symbol, cooldown_until - time.time(),
+                )
+                return
 
         # Guarda 1: ya hay una orden de esta misma base en vigilancia
         # (todavia sin fill/cancel resuelto) - no duplicar la exposicion
@@ -1442,6 +1689,15 @@ class GgalOptionsBot:
                 # importar que estrategia este activa, porque sin esto
                 # ningun Stop Loss/Take Profit/horizonte semanal es evaluable.
                 entry_price=state.avg_fill_price, entry_time=datetime.now(timezone.utc),
+                # FIX 2026-09-17 (ver VolArbitrageConfig en config.py): antes
+                # esto quedaba en None, que "por convencion" el resto del
+                # bot trata como "weekly_asymmetric" (ver comentario en
+                # Position.strategy_tag) - una posicion de este modo podia
+                # terminar invisible para SU PROPIA gestion de riesgo y a la
+                # vez adoptable por otra estrategia sin que nadie lo
+                # decidiera. Tag explicito: aisla sus Griegas/capital/
+                # salidas igual que ya se hace con "scalping".
+                strategy_tag="vol_arbitrage",
             ))
 
     def _act_on_exit_signal(self, signal, spot: float, strategy_tag: str = "weekly_asymmetric") -> None:
@@ -1699,12 +1955,23 @@ class GgalOptionsBot:
         )
 
         if state.status is OrderStatus.FILLED and quote.greeks is not None:
+            # option_type/trend_at_entry (MEJORA 2026-09-17, ver
+            # config.LongFirstConfig.enable_trend_reversal_exit): se leen de
+            # la propia EntrySignal (poblados por
+            # WeeklyAsymmetricStrategy.scan_entry_signals/ScalpingStrategy
+            # equivalente) - getattr() defensivo porque signal puede ser
+            # cualquier dataclass de señal de entrada existente que no
+            # tenga estos campos (ninguno de los actuales carece de ellos,
+            # pero evita un AttributeError duro si se agrega uno nuevo).
+            signal_option_type = getattr(signal, "option_type", None)
             new_pos = Position(
                 symbol=signal.symbol, quantity=sizing.contracts,
                 multiplier=SETTINGS.instruments.option_multiplier,
                 greeks_per_unit=quote.greeks, expiry=quote.expiry,
                 entry_price=state.avg_fill_price, entry_time=datetime.now(timezone.utc),
                 strategy_tag=strategy_tag,
+                option_type=getattr(signal_option_type, "value", signal_option_type),
+                trend_at_entry=getattr(signal, "trend_context", None) or None,
             )
             self.portfolio.add(new_pos)
             new_pos.contract_key = (

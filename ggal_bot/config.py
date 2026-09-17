@@ -351,6 +351,37 @@ class RiskConfig:
     # delta-hedger la siguen usando con su ultimo valor conocido).
     max_option_quote_staleness_seconds: float = _env_float("GGAL_BOT_MAX_OPTION_STALENESS_SECONDS", 90.0)
 
+    # Alerta ACTIVA por posicion sin cotizacion vigente (MEJORA 2026-09-17,
+    # a pedido explicito del usuario, misma tanda que VolArbitrageConfig).
+    # Hasta esta mejora, que una base con una posicion abierta desapareciera
+    # de la cadena vigente (vencio del universo de vencimientos, la cadena
+    # cayo sola, etc.) solo se hacia visible de forma PASIVA en el
+    # dashboard (ver dashboard/app.py, caption "Sin cotizacion actual" en la
+    # pestaña "Abiertas") - y ese dashboard depende de reconstruir
+    # shadow_trades.csv, no del estado vivo del bot, asi que requiere que
+    # alguien lo abra para notarlo. El riesgo real (VERIFICADO por lectura
+    # de risk/risk_manager.py:evaluate_position_exit): con
+    # current_price=None, Stop Loss/Take Profit/toma de ganancia parcial/
+    # compresion de vega simplemente se OMITEN para esa posicion (no
+    # "fallan seguro") - solo el horizonte de dias habiles y la guardia de
+    # fin de semana (que no dependen del precio) le siguen aplicando. Ver
+    # run_bot.py:GgalOptionsBot._warn_positions_without_valid_quote.
+    #
+    # Deliberadamente un umbral, no instantaneo: una base puede quedar sin
+    # punta operable por un instante (poll individual fallido) sin que eso
+    # sea todavia motivo de alerta - mismo criterio de "caida sostenida, no
+    # un fallo puntual" que max_market_data_staleness_seconds arriba.
+    # None desactiva esta alerta por completo (ningun logger.warning nuevo)
+    # - se deja en un valor por defecto (no None) porque esta mejora es
+    # PURO LOGGING/OBSERVABILIDAD (no cierra posiciones, no bloquea
+    # entradas, no cambia ninguna decision de trading): a diferencia de los
+    # flags de comportamiento nuevos de este archivo (que preservan
+    # comportamiento apagados por default), no hay ningun comportamiento
+    # de trading previo que este cambio pudiera alterar.
+    stale_quote_warning_seconds: Optional[float] = (
+        _env_float("GGAL_BOT_STALE_QUOTE_WARNING_SECONDS", 300.0) or None
+    )
+
 
 # ---------------------------------------------------------------------------
 # Kill switch y limites de riesgo CENTRALIZADOS a nivel de portfolio
@@ -689,6 +720,36 @@ class LongFirstConfig:
     # llegado, sin importar cuantos dias lleve abierta. Ver la nota de
     # riesgo junto a ese flag.
     max_holding_business_days: Optional[int] = _env_int("GGAL_BOT_MAX_HOLDING_BUSINESS_DAYS", 0) or None
+
+    # --- Piso de liquidez/vencimiento minimo para ENTRAR (MEJORA 2026-09-17) ---
+    # BUG REAL VERIFICADO (ver analisis de logs del 2026-09-09/10 y del
+    # export 2026-09-17T17-13_export.csv): con max_holding_business_days en
+    # None (sin limite, AJUSTE 2026-09-07 de arriba), el bot puede entrar en
+    # CUALQUIER vencimiento con profundidad, incluido uno demasiado cercano
+    # para tener mercado real (evidencia real: vencimiento de esta semana
+    # sin oferta, Octubre con spreads 2-3%, Diciembre con spreads del 50%).
+    # Quitar el horizonte de arriba resolvio el problema de "no hay
+    # suficientes quotes para escanear" pero reabrio este otro: nada impide
+    # elegir una base sin mercado real simplemente porque paso el filtro de
+    # dislocacion.
+    #
+    # Este campo es la contrapartida deliberada: un piso de dias HABILES a
+    # vencimiento por DEBAJO del cual una cotizacion NUNCA se considera para
+    # una entrada nueva, sin importar que tan atractiva luzca su
+    # dislocacion de smile. Default None (sin piso, backward-compatible):
+    # cualquiera que no configure esto ve el comportamiento de siempre. Se
+    # deja a criterio explicito del usuario fijar el valor (ej. ~20-25 dias
+    # habiles, discutido en la conversacion sobre el indicador SuperTrend AI
+    # del 2026-09-10) - DATA INSUFFICIENT para fijar un default propio sin
+    # que el usuario lo confirme.
+    #
+    # NO reemplaza risk_manager.check_liquidity() (spread/volumen del libro
+    # vigente, ya aplicado en scan_entry_signals) - lo complementa: liquidez
+    # de HOY puede estar bien y aun asi ser un vencimiento que va a perder
+    # profundidad antes de poder salir con orden.
+    min_business_days_to_expiry_for_entry: Optional[int] = (
+        _env_int("GGAL_BOT_MIN_BUSINESS_DAYS_TO_EXPIRY_FOR_ENTRY", 0) or None
+    )
     # NOTA DE RIESGO (leer junto con el cambio de arriba, 2026-09-07): este
     # flag sigue en True por defecto - fuerza el cierre de CUALQUIER
     # posicion todos los viernes cuyo vencimiento sea posterior a ese
@@ -813,9 +874,86 @@ class LongFirstConfig:
     require_level_confirmation: bool = _env_bool("GGAL_BOT_REQUIRE_LEVEL_CONFIRMATION", False)
     level_threshold_vol_points: float = _env_float("GGAL_BOT_LONGFIRST_LEVEL_THRESHOLD", 5.0)
 
+    # --- Filtro de entrada ADICIONAL por banda de delta (MEJORA 2026-09-17) ---
+    # A pedido explicito del usuario (conversacion sobre el indicador
+    # SuperTrend AI, 2026-09-10): "en vez de fijar un strike nominal (que se
+    # desactualiza si el spot se mueve), yo apuntaria a una banda de delta
+    # (ej. 0.40-0.55 para la opcion comprada) - mantiene la exposicion
+    # consistente mes a mes". El delta ya se calculaba (ver
+    # models/black_scholes.py::Greeks.delta) pero solo se usaba para
+    # rankear candidatas por convexidad (convexity_score) - nunca como
+    # filtro de admision.
+    #
+    # Deliberadamente ADITIVO (se suma al filtro de moneyness existente, no
+    # lo reemplaza) y apagado por defecto (`enabled=False`): a diferencia de
+    # la Mejora 1 (vol_arbitrage) esto NO corrige un bug ya demostrado, es
+    # un cambio de criterio de seleccion de strike que el usuario todavia no
+    # confirmo que quiere en produccion. `delta_band_min`/`delta_band_max`
+    # se comparan contra abs(delta) (un put ATM tiene delta negativo, la
+    # banda se piensa en magnitud, igual que se la describe habitualmente en
+    # la jerga de opciones).
+    enable_delta_band_filter: bool = _env_bool("GGAL_BOT_ENABLE_DELTA_BAND_FILTER", False)
+    delta_band_min: float = _env_float("GGAL_BOT_DELTA_BAND_MIN", 0.40)
+    delta_band_max: float = _env_float("GGAL_BOT_DELTA_BAND_MAX", 0.55)
+
     # --- Spreads (Bull Call / Bear Put): pata corta solo tras la larga confirmada ---
     enable_spread_completion: bool = _env_bool("GGAL_BOT_ENABLE_SPREAD_COMPLETION", True)
     spread_wing_moneyness_pct: float = _env_float("GGAL_BOT_SPREAD_WING_MONEYNESS_PCT", 0.05)
+
+    # --- Spread de DEBITO como entrada nueva cuando la IV esta CARA (MEJORA 2026-09-17) ---
+    # A pedido explicito del usuario (conversacion sobre el indicador
+    # SuperTrend AI, 2026-09-10): hasta esta mejora, una base con
+    # dislocacion de smile POSITIVA (IV cara respecto de la curva) nunca
+    # generaba ninguna señal - scan_entry_signals() solo actua sobre
+    # dislocaciones negativas (IV barata). scan_spread_completion_signals()
+    # existe hace tiempo pero SOLO financia una pata larga YA CONFIRMADA en
+    # el portafolio (uso defensivo/de cap) - nunca se disparaba *porque* la
+    # IV estuviera cara. Esta mejora agrega esa rama faltante:
+    # WeeklyAsymmetricStrategy.scan_expensive_iv_spread_signals() arma AMBAS
+    # patas de un spread de debito (comprar el strike cercano, vender uno
+    # mas OTM via _find_wing_quote, reutilizado tal cual) como ENTRADA
+    # NUEVA, cuando la dislocacion supera este umbral en sentido "cara".
+    #
+    # Deliberadamente apagado por defecto (`enabled=False`): es la mejora
+    # mas especulativa de esta tanda (dos ordenes coordinadas en vez de una,
+    # superficie de ejecucion nueva) - el usuario debe confirmarla
+    # explicitamente despues de revisar el codigo, no arrancar activa sola.
+    # `expensive_iv_spread_threshold_vol_points` usa el mismo default
+    # (3.0) que VolatilityArbitrageStrategy.smile_threshold_vol_points para
+    # "cara" (ver strategy/vol_arbitrage.py) - mismo umbral ya usado en el
+    # bot para esa lectura, no un numero inventado nuevo.
+    enable_expensive_iv_spread_entry: bool = _env_bool("GGAL_BOT_ENABLE_EXPENSIVE_IV_SPREAD_ENTRY", False)
+    expensive_iv_spread_threshold_vol_points: float = _env_float(
+        "GGAL_BOT_EXPENSIVE_IV_SPREAD_THRESHOLD", 3.0
+    )
+
+    # --- Salida por reversion de tendencia (MEJORA 2026-09-17, misma tanda) ---
+    # A pedido explicito del usuario (conversacion sobre el indicador
+    # SuperTrend AI, 2026-09-10: "si la tendencia se da vuelta en contra de
+    # la posicion, hay que salir aunque el stop de prima todavia no se haya
+    # tocado"). Hasta esta mejora, build_exit_signals() solo cerraba una
+    # posicion por Stop Loss/Take Profit/horizonte/guardia de fin de
+    # semana/compresion de vega - todas medidas sobre la PRIMA o el
+    # calendario, nunca sobre si la tesis direccional que motivo la entrada
+    # (ver Position.trend_at_entry, poblado en run_bot.py:
+    # _act_on_entry_signal desde EntrySignal.trend_context) segui vigente.
+    #
+    # Definicion deliberadamente ESTRICTA (ver
+    # WeeklyAsymmetricStrategy._trend_has_reversed): solo dispara cuando la
+    # tendencia vigente paso al EXTREMO CONTRARIO del que motivo la entrada
+    # (BULLISH->BEARISH para una CALL, BEARISH->BULLISH para una PUT) - una
+    # lectura NEUTRAL de por medio (fading, no reversion confirmada) NO
+    # dispara esta salida, para no cerrar posiciones sanas ante ruido de
+    # corto plazo del filtro tecnico. Una posicion abierta bajo NEUTRAL
+    # (dislocacion extrema, sin tesis direccional) tampoco puede disparar
+    # esta salida (no hay tendencia de entrada de la cual "reversar").
+    #
+    # Apagado por defecto (`enabled=False`): cambia CUANDO se cierra una
+    # posicion ya ganadora en Griegas/prima segun el filtro tecnico vigente,
+    # el usuario debe confirmarlo explicitamente antes de que rija en
+    # produccion (mismo criterio que enable_delta_band_filter/
+    # enable_expensive_iv_spread_entry de arriba).
+    enable_trend_reversal_exit: bool = _env_bool("GGAL_BOT_ENABLE_TREND_REVERSAL_EXIT", False)
 
     # --- Confirmacion de microestructura (ver models/microstructure.py) ---
     # Order Book Imbalance = (bid_size - ask_size) / (bid_size + ask_size).
@@ -849,6 +987,100 @@ class LongFirstConfig:
     # pueda dispararse en absoluto - ver risk_manager.evaluate_vega_decay_exit.
     vega_decay_exit_ratio: float = _env_float("GGAL_BOT_VEGA_DECAY_EXIT_RATIO", 0.20)
     vega_decay_min_holding_hours: float = _env_float("GGAL_BOT_VEGA_DECAY_MIN_HOLDING_HOURS", 3.0)
+
+
+@dataclass
+class VolArbitrageConfig:
+    """
+    Gestion de riesgo para el modo "vol_arbitrage" (arbitraje de volatilidad
+    delta-neutral original, ver strategy/vol_arbitrage.py) - NO-GO de
+    produccion desde 2026-09-08 (ver run_bot.py.__init__), solo corre en
+    shadow.
+
+    BUG REAL VERIFICADO (2026-09-16/17, ver analisis del export
+    2026-09-17T17-13_export.csv y confirmacion por log de produccion):
+    _run_vol_arbitrage_cycle() (run_bot.py) UNICAMENTE escaneaba señales de
+    entrada - nunca evaluaba ninguna condicion de salida sobre posiciones ya
+    abiertas. VolatilityArbitrageStrategy.scan_for_signals() SI emite una
+    señal "sell" cuando la IV se encarece, pero _act_on_signal() la
+    descartaba sin mas en cuanto ya existia una posicion en esa base
+    (Guarda 2) - el propio docstring de _act_on_signal ya admitia esto como
+    TODO ("cerrar la posicion cuando la sonrisa se normalice sigue siendo un
+    TODO aparte"). Ademas, esas posiciones se guardaban con
+    Position.strategy_tag=None, que "por convencion" se trata como
+    "weekly_asymmetric" en el resto del bot (ver _act_on_signal) - es decir,
+    quedaban invisibles para SU PROPIA estrategia pero potencialmente
+    adoptables por otra, un estado ambiguo real (ver fix de tag explicito
+    en _act_on_signal).
+
+    Consecuencia real (shadow, no produccion real): GFGC8000OC (6 lotes
+    comprados 2026-09-02/03, 58 contratos en total) quedo sin ningun stop
+    ni horizonte durante ~13 dias mientras la prima colapsaba de ~163-186 a
+    55.24 (-66% a -70%), hasta que un stop_loss disparo el 2026-09-16
+    10:47:18 UTC (log verificado: "Salida GFGC8000OC [reason=stop_loss]...
+    requested_qty=58.00") recien cuando la posicion volvio a tener
+    cotizacion vigente evaluable. Perdida (shadow): -$681.053.
+
+    Esta config agrega el mismo mecanismo de proteccion ya validado en
+    LongFirstConfig (Stop Loss/Take Profit sobre la prima, horizonte de
+    dias habiles, guardia de fin de semana), reutilizando
+    RiskManager.evaluate_position_exit() tal cual - deliberadamente MINIMO
+    (sin tiered stop ni toma de ganancia parcial: vol_arbitrage no tiene la
+    misma disciplina direccional que weekly_asymmetric, el objetivo aca es
+    que ninguna posicion quede sin NINGUN corte, no replicar el motor de
+    salida completo del otro modo).
+
+    `enabled=True` por defecto: a diferencia de otros flags nuevos de este
+    archivo (que preservan comportamiento existente apagados), esto CORRIGE
+    un bug de riesgo real ya demostrado con evidencia - dejarlo apagado por
+    defecto reproduciria el mismo problema para cualquiera que reactive
+    vol_arbitrage sin conocer este historial.
+    """
+    enabled: bool = _env_bool("GGAL_BOT_VOL_ARBITRAGE_ENABLE_EXIT_MANAGEMENT", True)
+    stop_loss_pct: float = _env_float("GGAL_BOT_VOL_ARBITRAGE_STOP_LOSS_PCT", 0.50)
+    take_profit_pct: float = _env_float("GGAL_BOT_VOL_ARBITRAGE_TAKE_PROFIT_PCT", 1.00)
+    # None = sin limite (mismo default historico que LongFirstConfig.
+    # max_holding_business_days) - DATA INSUFFICIENT para fijar un numero de
+    # dias optimo sin evidencia propia de este modo; queda a criterio
+    # explicito del usuario configurarlo.
+    max_holding_business_days: Optional[int] = (
+        _env_int("GGAL_BOT_VOL_ARBITRAGE_MAX_HOLDING_BUSINESS_DAYS", 0) or None
+    )
+    weekend_theta_guard_enabled: bool = _env_bool("GGAL_BOT_VOL_ARBITRAGE_WEEKEND_THETA_GUARD", True)
+
+    # --- Cooldown de reentrada tras stop_loss (MEJORA 2026-09-17, misma tanda) ---
+    # A pedido explicito del usuario ("revisar el codigo... y analizar a
+    # fondo como mejorar la estrategia del bot", sobre el patron de
+    # reentradas de GFGC7600OC en el export de trades 2026-09-17T17-13:
+    # 54 operaciones, -$121.233,10, muchas con duraciones de apenas 20-30
+    # segundos). VERIFICADO por lectura de codigo que esas duraciones tan
+    # cortas NO pueden explicarse por vega_decay_exit (exige
+    # vega_decay_min_holding_hours=3.0, muy por encima de 20-30s) ni por
+    # build_exit_signals() de weekly_asymmetric "adoptando" la posicion
+    # (ese ciclo NUNCA corre mientras GGAL_BOT_ACTIVE_STRATEGY=vol_arbitrage
+    # - ver run_bot.py.recompute_cycle) - el cierre real de esas 54
+    # operaciones historicas es, con la evidencia disponible, DATA
+    # INSUFFICIENT para atribuirlo con certeza (lo mas probable, dado que
+    # antes de esta misma tanda de mejoras vol_arbitrage no tenia NINGUNA
+    # salida automatica, es intervencion manual del usuario).
+    #
+    # Lo que SI cambia con esta tanda de mejoras: _check_vol_arbitrage_exits
+    # (arriba) ahora SI cierra automaticamente por stop_loss. Como
+    # VolatilityArbitrageStrategy.scan_for_signals() re-emite la MISMA
+    # dislocacion persistente todos los ciclos mientras la sonrisa no se
+    # corrija (ver docstring de run_bot.py._act_on_signal), sin este
+    # cooldown el bot podria reabrir la base recien stopeada en el
+    # ciclo INMEDIATAMENTE siguiente - encadenando stops contra una IV que
+    # probablemente todavia no se normalizo, un patron de reentrada nuevo
+    # que esta mejora previene. None (default) = sin cooldown, idéntico al
+    # comportamiento de _check_vol_arbitrage_exits recien agregado (esta
+    # mejora es un AJUSTE FINO de esa otra, no un cambio de comportamiento
+    # independiente) - DATA INSUFFICIENT para fijar un numero de segundos
+    # optimo sin datos propios de este modo tras la Mejora 1; queda a
+    # criterio explicito del usuario configurarlo.
+    reentry_cooldown_seconds: Optional[float] = (
+        _env_float("GGAL_BOT_VOL_ARBITRAGE_REENTRY_COOLDOWN_SECONDS", 0.0) or None
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -933,6 +1165,23 @@ class ScalpingConfig:
     # octubre en vez de solo los proximos 3 dias habiles), sin tocar en
     # absoluto la disciplina intradia de salida.
     max_holding_business_days: Optional[int] = _env_int("GGAL_BOT_SCALPING_MAX_HOLDING_BUSINESS_DAYS", 0) or None
+    # Mismo mecanismo que LongFirstConfig.min_business_days_to_expiry_for_entry
+    # (mismo nombre de atributo, ver nota de "Filtro de entrada" arriba de
+    # esta clase - scan_entry_signals es generico sobre self.cfg). Default
+    # None (sin piso): Scalping ya filtra por minutos/cierre EOD del lado de
+    # salida, asi que este piso es opcional aca, no una correccion de un bug
+    # ya demostrado como en weekly_asymmetric.
+    min_business_days_to_expiry_for_entry: Optional[int] = (
+        _env_int("GGAL_BOT_SCALPING_MIN_BUSINESS_DAYS_TO_EXPIRY_FOR_ENTRY", 0) or None
+    )
+    # Mismo mecanismo que LongFirstConfig.enable_delta_band_filter (mismo
+    # nombre de atributo, ver nota de "Filtro de entrada" arriba de esta
+    # clase). Default apagado: un scalp de minutos ya elige por moneyness
+    # estrecho (moneyness_band_pct=0.10 arriba), no hay evidencia propia de
+    # Scalping que justifique cambiarlo.
+    enable_delta_band_filter: bool = _env_bool("GGAL_BOT_SCALPING_ENABLE_DELTA_BAND_FILTER", False)
+    delta_band_min: float = _env_float("GGAL_BOT_SCALPING_DELTA_BAND_MIN", 0.40)
+    delta_band_max: float = _env_float("GGAL_BOT_SCALPING_DELTA_BAND_MAX", 0.55)
     require_level_confirmation: bool = _env_bool("GGAL_BOT_SCALPING_REQUIRE_LEVEL_CONFIRMATION", False)
     level_threshold_vol_points: float = _env_float("GGAL_BOT_SCALPING_LEVEL_THRESHOLD", 5.0)
     enable_obi_filter: bool = _env_bool("GGAL_BOT_SCALPING_ENABLE_OBI_FILTER", True)
@@ -1211,6 +1460,7 @@ class Settings:
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     technical_analysis: TechnicalAnalysisConfig = field(default_factory=TechnicalAnalysisConfig)
     scalping: ScalpingConfig = field(default_factory=ScalpingConfig)
+    vol_arbitrage: VolArbitrageConfig = field(default_factory=VolArbitrageConfig)
 
 
 SETTINGS = Settings()

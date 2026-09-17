@@ -32,6 +32,20 @@ class Position:
     entry_price: Optional[float] = None
     entry_time: Optional[datetime] = None
 
+    # Metadata de entrada ADICIONAL (MEJORA 2026-09-17, ver
+    # config.LongFirstConfig.enable_trend_reversal_exit y
+    # strategy/weekly_asymmetric.py:_trend_has_reversed): que tipo de
+    # opcion es ("call"/"put", ver models/black_scholes.OptionType.value) y
+    # que lectura de tendencia 1D (data/technical_analysis.py) estaba
+    # vigente al momento del fill - ambos None por defecto (compatibilidad
+    # hacia atras: ninguna posicion existente, incluida la de produccion
+    # abierta antes de este campo, tiene esta metadata poblada). Sin estos
+    # dos campos, build_exit_signals() simplemente nunca evalua la salida
+    # por reversion de tendencia para esa posicion (mismo criterio que
+    # entry_price/entry_time de arriba para Stop Loss/Take Profit).
+    option_type: Optional[str] = None
+    trend_at_entry: Optional[str] = None
+
     # Marca de que ESTRATEGIA abrio esta posicion (ver config.ScalpingConfig
     # y strategy/scalping.py): None (default, compatibilidad hacia atras)
     # se trata como "weekly_asymmetric" en todos los puntos que filtran por

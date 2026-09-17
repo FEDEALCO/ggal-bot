@@ -662,6 +662,100 @@ def test_scan_entry_signals_excludes_bases_outside_moneyness_band():
     assert all(s.symbol != "GFGC4400O" for s in signals)
 
 
+def test_scan_entry_signals_excludes_bases_below_min_days_to_expiry_floor():
+    """
+    MEJORA 2026-09-17 (ver config.LongFirstConfig.
+    min_business_days_to_expiry_for_entry): con max_holding_business_days en
+    None (sin limite, comportamiento real de produccion desde 2026-09-07),
+    nada impedia entrar en un vencimiento demasiado CERCANO para tener
+    mercado real. Con el piso configurado, una base cuyo days_business este
+    por debajo se descarta ANTES de llegar al chequeo de dislocacion, sin
+    importar que tan barata luzca.
+    """
+    cfg = _default_config(max_holding_business_days=None, min_business_days_to_expiry_for_entry=10)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    spot = 5200.0
+    quotes = [
+        _quote("GFGC5000O", 5000, 0.45, spot, days_biz=3),    # barata, pero vence demasiado pronto
+        _quote("GFGC5100O", 5100, 0.45, spot, days_biz=15),   # barata y con horizonte suficiente
+        _quote("GFGC5300O", 5300, 0.58, spot, days_biz=3),
+        _quote("GFGC6100O", 6100, 0.58, spot, days_biz=15),
+    ]
+    surface = VolatilitySurface(quotes)
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+    )
+    assert all(s.symbol != "GFGC5000O" for s in signals)
+    assert any(s.symbol == "GFGC5100O" for s in signals)
+    # GFGC5000O y GFGC5300O comparten days_biz=3 (por debajo del piso de 10)
+    assert strategy.last_scan_diagnostics.blocked_by_min_days_to_expiry == 2
+
+
+def test_scan_entry_signals_delta_band_filter_excludes_outside_band_when_enabled():
+    """
+    MEJORA 2026-09-17 (ver config.LongFirstConfig.enable_delta_band_filter):
+    apagado por defecto (comportamiento identico a siempre); habilitado,
+    filtra ADEMAS del moneyness por abs(delta) dentro de la banda
+    configurada.
+    """
+    cfg = _default_config(enable_delta_band_filter=True, delta_band_min=0.40, delta_band_max=0.55)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    spot = 5200.0
+    quotes = [
+        _quote("GFGC5100O", 5100, 0.45, spot, days_biz=3, greeks={"delta": 0.48, "gamma": 0.001, "vega": 2.0, "theta": -1.0}),
+        _quote("GFGC5150O", 5150, 0.45, spot, days_biz=3, greeks={"delta": 0.20, "gamma": 0.001, "vega": 2.0, "theta": -1.0}),  # fuera de banda
+        _quote("GFGC5250O", 5250, 0.58, spot, days_biz=3),  # sin Griegas -> descartada por este filtro
+        _quote("GFGC6100O", 6100, 0.58, spot, days_biz=3, greeks={"delta": 0.50, "gamma": 0.001, "vega": 2.0, "theta": -1.0}),
+    ]
+    surface = VolatilitySurface(quotes)
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+    )
+    assert any(s.symbol == "GFGC5100O" for s in signals)
+    assert all(s.symbol != "GFGC5150O" for s in signals)
+    assert all(s.symbol != "GFGC5250O" for s in signals)
+    assert strategy.last_scan_diagnostics.blocked_by_delta_band == 2
+
+
+def test_scan_entry_signals_delta_band_filter_default_off_preserves_behavior():
+    cfg = _default_config()  # enable_delta_band_filter no seteado -> False
+    assert cfg.enable_delta_band_filter is False
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    spot = 5200.0
+    quotes = [
+        # Delta MUY fuera de cualquier banda razonable, y sin Griegas en el
+        # tercero - ninguna de las dos cosas debe filtrar nada con el flag apagado.
+        _quote("GFGC5100O", 5100, 0.45, spot, days_biz=3, greeks={"delta": 0.05, "gamma": 0.001, "vega": 2.0, "theta": -1.0}),
+        _quote("GFGC5300O", 5300, 0.58, spot, days_biz=3),
+        _quote("GFGC6100O", 6100, 0.58, spot, days_biz=3),
+    ]
+    surface = VolatilitySurface(quotes)
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+    )
+    assert any(s.symbol == "GFGC5100O" for s in signals)
+    assert strategy.last_scan_diagnostics.blocked_by_delta_band == 0
+
+
+def test_scan_entry_signals_min_days_to_expiry_default_none_preserves_behavior():
+    """Default None = sin piso: una base a solo 1 dia habil del vencimiento sigue calificando como antes."""
+    cfg = _default_config()  # min_business_days_to_expiry_for_entry no seteado -> None
+    assert cfg.min_business_days_to_expiry_for_entry is None
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    spot = 5200.0
+    quotes = [
+        _quote("GFGC5000O", 5000, 0.45, spot, days_biz=1),
+        _quote("GFGC5300O", 5300, 0.58, spot, days_biz=1),
+        _quote("GFGC6100O", 6100, 0.58, spot, days_biz=1),
+    ]
+    surface = VolatilitySurface(quotes)
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+    )
+    assert any(s.symbol == "GFGC5000O" for s in signals)
+    assert strategy.last_scan_diagnostics.blocked_by_min_days_to_expiry == 0
+
+
 def test_scan_entry_signals_ranks_by_convexity_score_descending():
     cfg = _default_config()
     strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
@@ -1167,6 +1261,110 @@ def test_scan_spread_completion_signals_disabled_by_config():
 
 
 # ---------------------------------------------------------------------------
+# strategy/weekly_asymmetric.py: scan_expensive_iv_spread_signals (MEJORA
+# 2026-09-17, ver docstring de SpreadOpenSignal/config.LongFirstConfig.
+# enable_expensive_iv_spread_entry)
+# ---------------------------------------------------------------------------
+
+def _expensive_iv_setup(long_bid=150.0, long_ask=160.0, wing_bid=90.0, wing_ask=100.0):
+    """
+    Smile sintetico PLANO (misma IV=0.45 en todos los strikes de relleno,
+    ver test_scan_entry_signals_ranks_by_convexity_score_descending para el
+    patron de smile con curvatura real) para que la curva ajustada quede
+    ~0.45 en todo el rango; la base candidata queda 10 vol points POR
+    ENCIMA (0.55) - "cara" en vez de "barata" - bien por encima del
+    threshold default (3.0). El wing (mismo vencimiento, strike mas OTM)
+    se cotiza con mid mas bajo que el largo por defecto, para que el
+    spread resulte en debito neto positivo (parametrizable via los
+    bid/ask para el test que necesita lo opuesto).
+    """
+    spot = 5200.0
+    # Wing a 5500 vs. largo a 5200 = diferencia de 300 puntos de strike,
+    # por encima del piso que exige el spread_wing_moneyness_pct default
+    # de _default_config (0.05 * 5200 = 260) - a diferencia de
+    # test_scan_spread_completion_signals_picks_further_otm_wing_for_bull_call_spread,
+    # que si necesita overridear ese parametro porque su wing esta mas
+    # cerca (5400).
+    filler_strikes = [4700, 4900, 5000, 5300, 5600, 5700]
+    filler = [_quote(f"GFGC{k}O", k, 0.45, spot, days_biz=3) for k in filler_strikes]
+    long_quote = _quote(
+        "GFGC5200O", 5200, 0.55, spot, days_biz=3, bid=long_bid, ask=long_ask,
+    )
+    wing_quote = _quote(
+        "GFGC5500O", 5500, 0.45, spot, days_biz=3, bid=wing_bid, ask=wing_ask,
+    )
+    chain = OptionChain()
+    chain.upsert_quote(long_quote)
+    chain.upsert_quote(wing_quote)
+    surface_quotes = filler + [long_quote]
+    surface = VolatilitySurface(surface_quotes)
+    volumes = {q.symbol: 1000.0 for q in surface_quotes + [wing_quote]}
+    return surface, chain, volumes
+
+
+def test_scan_expensive_iv_spread_signals_disabled_by_default():
+    cfg = _default_config()  # enable_expensive_iv_spread_entry no seteado -> False
+    assert cfg.enable_expensive_iv_spread_entry is False
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    surface, chain, volumes = _expensive_iv_setup()
+    signals = strategy.scan_expensive_iv_spread_signals(surface, chain, volumes, trend="BULLISH")
+    assert signals == []
+
+
+def test_scan_expensive_iv_spread_signals_generates_debit_spread_when_enabled_and_expensive():
+    cfg = _default_config(enable_expensive_iv_spread_entry=True, expensive_iv_spread_threshold_vol_points=3.0)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    surface, chain, volumes = _expensive_iv_setup()  # long mid=155, wing mid=95 -> debito neto=60
+    signals = strategy.scan_expensive_iv_spread_signals(surface, chain, volumes, trend="BULLISH")
+    assert len(signals) == 1
+    signal = signals[0]
+    assert signal.long_symbol == "GFGC5200O"
+    assert signal.short_symbol == "GFGC5500O"
+    assert signal.action == "open_debit_spread"
+    assert signal.iv_dislocation_vol_points > cfg.expensive_iv_spread_threshold_vol_points
+    assert signal.net_debit_premium == 60.0
+    assert "Bull Call Spread" in signal.reason
+    assert signal.trend_context == "BULLISH"
+
+
+def test_scan_expensive_iv_spread_signals_neutral_trend_no_signal():
+    """Igual que scan_spread_completion_signals: sin conviccion direccional no se asume el riesgo neto del spread."""
+    cfg = _default_config(enable_expensive_iv_spread_entry=True)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    surface, chain, volumes = _expensive_iv_setup()
+    signals = strategy.scan_expensive_iv_spread_signals(surface, chain, volumes, trend="NEUTRAL")
+    assert signals == []
+
+
+def test_scan_expensive_iv_spread_signals_bearish_trend_ignores_call_candidate():
+    """Una base CALL cara no genera Bull Call Spread bajo BEARISH (direccion contraria)."""
+    cfg = _default_config(enable_expensive_iv_spread_entry=True)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    surface, chain, volumes = _expensive_iv_setup()
+    signals = strategy.scan_expensive_iv_spread_signals(surface, chain, volumes, trend="BEARISH")
+    assert signals == []
+
+
+def test_scan_expensive_iv_spread_signals_no_signal_when_net_debit_not_positive():
+    """Si el wing quedara mas caro que la base larga (debito neto <= 0), el patron no aplica y no se genera señal."""
+    cfg = _default_config(enable_expensive_iv_spread_entry=True)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    # wing (mid=165) mas caro que el largo (mid=155) -> net_debit = 155-165 = -10
+    surface, chain, volumes = _expensive_iv_setup(wing_bid=160.0, wing_ask=170.0)
+    signals = strategy.scan_expensive_iv_spread_signals(surface, chain, volumes, trend="BULLISH")
+    assert signals == []
+
+
+def test_scan_expensive_iv_spread_signals_below_threshold_no_signal():
+    """Dislocacion positiva pero por debajo del umbral configurado no debe generar señal."""
+    cfg = _default_config(enable_expensive_iv_spread_entry=True, expensive_iv_spread_threshold_vol_points=50.0)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    surface, chain, volumes = _expensive_iv_setup()  # dislocacion ~10 vol points, muy por debajo de 50
+    signals = strategy.scan_expensive_iv_spread_signals(surface, chain, volumes, trend="BULLISH")
+    assert signals == []
+
+
+# ---------------------------------------------------------------------------
 # strategy/weekly_asymmetric.py: build_exit_signals
 # ---------------------------------------------------------------------------
 
@@ -1204,6 +1402,122 @@ def test_build_exit_signals_produces_stop_loss_signal():
     assert signals[0].reason == "stop_loss"
     assert signals[0].action == "sell_to_close"
     assert signals[0].quantity == 5
+
+
+# ---------------------------------------------------------------------------
+# build_exit_signals: salida por reversion de tendencia (MEJORA 2026-09-17,
+# ver config.LongFirstConfig.enable_trend_reversal_exit y
+# WeeklyAsymmetricStrategy._trend_has_reversed)
+# ---------------------------------------------------------------------------
+
+def test_build_exit_signals_trend_reversal_closes_call_position_when_trend_flips_bearish():
+    cfg = _default_config(enable_trend_reversal_exit=True)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    portfolio = Portfolio()
+    now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    portfolio.add(Position(
+        symbol="GFGC5200O", quantity=5, multiplier=100.0,
+        entry_price=100.0, entry_time=now - timedelta(hours=1), expiry=date(2026, 9, 4),
+        option_type="call", trend_at_entry="BULLISH",
+    ))
+    # Precio de la prima sin cambios (no dispara Stop Loss/Take Profit):
+    # lo unico que debe gatillar el cierre aca es la reversion de tendencia.
+    signals = strategy.build_exit_signals(
+        portfolio, current_prices={"GFGC5200O": 100.0}, now=now, trend="BEARISH",
+    )
+    assert len(signals) == 1
+    assert signals[0].reason == "trend_reversal_exit"
+    assert signals[0].action == "sell_to_close"
+    assert signals[0].quantity == 5
+
+
+def test_build_exit_signals_trend_reversal_closes_put_position_when_trend_flips_bullish():
+    cfg = _default_config(enable_trend_reversal_exit=True)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    portfolio = Portfolio()
+    now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    portfolio.add(Position(
+        symbol="GFPV5200O", quantity=3, multiplier=100.0,
+        entry_price=100.0, entry_time=now - timedelta(hours=1), expiry=date(2026, 9, 4),
+        option_type="put", trend_at_entry="BEARISH",
+    ))
+    signals = strategy.build_exit_signals(
+        portfolio, current_prices={"GFPV5200O": 100.0}, now=now, trend="BULLISH",
+    )
+    assert len(signals) == 1
+    assert signals[0].reason == "trend_reversal_exit"
+
+
+def test_build_exit_signals_trend_reversal_disabled_by_default_preserves_behavior():
+    """enable_trend_reversal_exit no seteado -> False: una reversion completa no debe cerrar nada."""
+    cfg = _default_config()
+    assert cfg.enable_trend_reversal_exit is False
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    portfolio = Portfolio()
+    now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    portfolio.add(Position(
+        symbol="GFGC5200O", quantity=5, multiplier=100.0,
+        entry_price=100.0, entry_time=now - timedelta(hours=1), expiry=date(2026, 9, 4),
+        option_type="call", trend_at_entry="BULLISH",
+    ))
+    signals = strategy.build_exit_signals(
+        portfolio, current_prices={"GFGC5200O": 100.0}, now=now, trend="BEARISH",
+    )
+    assert signals == []
+
+
+def test_build_exit_signals_trend_reversal_neutral_current_trend_does_not_trigger():
+    """Pasar de BULLISH a NEUTRAL es 'fading', no una reversion confirmada al extremo contrario - no debe cerrar."""
+    cfg = _default_config(enable_trend_reversal_exit=True)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    portfolio = Portfolio()
+    now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    portfolio.add(Position(
+        symbol="GFGC5200O", quantity=5, multiplier=100.0,
+        entry_price=100.0, entry_time=now - timedelta(hours=1), expiry=date(2026, 9, 4),
+        option_type="call", trend_at_entry="BULLISH",
+    ))
+    signals = strategy.build_exit_signals(
+        portfolio, current_prices={"GFGC5200O": 100.0}, now=now, trend="NEUTRAL",
+    )
+    assert signals == []
+
+
+def test_build_exit_signals_trend_reversal_skipped_without_entry_metadata():
+    """Una posicion sin option_type/trend_at_entry (legado, anterior a estos campos) nunca dispara esta salida."""
+    cfg = _default_config(enable_trend_reversal_exit=True)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    portfolio = Portfolio()
+    now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    portfolio.add(Position(
+        symbol="GFGC5200O", quantity=5, multiplier=100.0,
+        entry_price=100.0, entry_time=now - timedelta(hours=1), expiry=date(2026, 9, 4),
+        # sin option_type/trend_at_entry (default None)
+    ))
+    signals = strategy.build_exit_signals(
+        portfolio, current_prices={"GFGC5200O": 100.0}, now=now, trend="BEARISH",
+    )
+    assert signals == []
+
+
+def test_build_exit_signals_trend_reversal_yields_priority_to_stop_loss():
+    """Si Stop Loss YA dispara este mismo ciclo, la razon reportada debe seguir siendo 'stop_loss' (prioridad)."""
+    cfg = _default_config(enable_trend_reversal_exit=True, stop_loss_pct=0.50)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    portfolio = Portfolio()
+    now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    portfolio.add(Position(
+        symbol="GFGC5200O", quantity=5, multiplier=100.0,
+        entry_price=100.0, entry_time=now - timedelta(hours=1), expiry=date(2026, 9, 4),
+        option_type="call", trend_at_entry="BULLISH",
+    ))
+    # -60% de la prima: dispara Stop Loss (umbral 50%) Y la tendencia
+    # tambien se reversó (BULLISH->BEARISH) en el mismo ciclo.
+    signals = strategy.build_exit_signals(
+        portfolio, current_prices={"GFGC5200O": 40.0}, now=now, trend="BEARISH",
+    )
+    assert len(signals) == 1
+    assert signals[0].reason == "stop_loss"
 
 
 # ---------------------------------------------------------------------------
@@ -1630,6 +1944,10 @@ ALL_TESTS = [
     test_scan_entry_signals_excludes_bases_beyond_weekly_horizon,
     test_scan_entry_signals_includes_bases_beyond_horizon_when_limit_disabled,
     test_scan_entry_signals_excludes_bases_outside_moneyness_band,
+    test_scan_entry_signals_excludes_bases_below_min_days_to_expiry_floor,
+    test_scan_entry_signals_delta_band_filter_excludes_outside_band_when_enabled,
+    test_scan_entry_signals_delta_band_filter_default_off_preserves_behavior,
+    test_scan_entry_signals_min_days_to_expiry_default_none_preserves_behavior,
     test_scan_entry_signals_ranks_by_convexity_score_descending,
     test_scan_spread_completion_signals_empty_without_confirmed_long_position,
     test_scan_spread_completion_signals_requires_positive_quantity_not_just_any_position,
@@ -1651,9 +1969,21 @@ ALL_TESTS = [
     test_scan_spread_completion_signals_neutral_trend_never_completes_spreads,
     test_scan_spread_completion_signals_bearish_trend_ignores_call_spread,
     test_scan_spread_completion_signals_disabled_by_config,
+    test_scan_expensive_iv_spread_signals_disabled_by_default,
+    test_scan_expensive_iv_spread_signals_generates_debit_spread_when_enabled_and_expensive,
+    test_scan_expensive_iv_spread_signals_neutral_trend_no_signal,
+    test_scan_expensive_iv_spread_signals_bearish_trend_ignores_call_candidate,
+    test_scan_expensive_iv_spread_signals_no_signal_when_net_debit_not_positive,
+    test_scan_expensive_iv_spread_signals_below_threshold_no_signal,
     test_build_exit_signals_skips_positions_missing_entry_metadata,
     test_build_exit_signals_ignores_non_long_positions,
     test_build_exit_signals_produces_stop_loss_signal,
+    test_build_exit_signals_trend_reversal_closes_call_position_when_trend_flips_bearish,
+    test_build_exit_signals_trend_reversal_closes_put_position_when_trend_flips_bullish,
+    test_build_exit_signals_trend_reversal_disabled_by_default_preserves_behavior,
+    test_build_exit_signals_trend_reversal_neutral_current_trend_does_not_trigger,
+    test_build_exit_signals_trend_reversal_skipped_without_entry_metadata,
+    test_build_exit_signals_trend_reversal_yields_priority_to_stop_loss,
     test_scan_entry_signals_obi_filter_blocks_extreme_sell_side_imbalance,
     test_scan_entry_signals_obi_filter_allows_normal_imbalance,
     test_scan_entry_signals_obi_filter_disabled_ignores_imbalance,
