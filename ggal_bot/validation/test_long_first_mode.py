@@ -1903,6 +1903,286 @@ def test_bot_act_on_exit_signal_partial_profit_take_reduces_quantity_and_sets_fl
         SETTINGS.shadow.enabled = original_shadow
 
 
+# ---------------------------------------------------------------------------
+# MEJORAS 2026-09-28: z-score adaptativo, costo de ejecucion, blackout de
+# earnings, override ADR/CCL (todas SE SUMAN a los filtros existentes,
+# apagadas por defecto en _default_config() salvo que el test las active
+# explicitamente - ver docstrings en config.py y strategy/weekly_asymmetric.py).
+# ---------------------------------------------------------------------------
+
+def test_scan_entry_signals_zscore_filter_blocks_without_enough_history():
+    """Con el filtro activado, una base sin historia de z-score (None) debe bloquearse - la
+    ausencia de informacion nunca abre riesgo nuevo (mismo criterio que el resto de los filtros)."""
+    cfg = _default_config(enable_zscore_filter=True, zscore_threshold=1.5)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    quotes = _bullish_smile_quotes()
+    surface = VolatilitySurface(quotes)
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+        dislocation_zscore=None,
+    )
+    assert not any(s.symbol == "GFGC5150O" for s in signals)
+    assert strategy.last_scan_diagnostics.blocked_by_zscore > 0
+
+
+def test_scan_entry_signals_zscore_filter_blocks_when_not_extreme_enough():
+    cfg = _default_config(enable_zscore_filter=True, zscore_threshold=1.5)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    quotes = _bullish_smile_quotes()
+    surface = VolatilitySurface(quotes)
+    # z=-1.0 no alcanza el umbral configurado (-1.5): debe bloquear.
+    zscores = {q.symbol: -1.0 for q in quotes}
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+        dislocation_zscore=zscores,
+    )
+    assert not any(s.symbol == "GFGC5150O" for s in signals)
+
+
+def test_scan_entry_signals_zscore_filter_allows_extreme_zscore():
+    cfg = _default_config(enable_zscore_filter=True, zscore_threshold=1.5)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    quotes = _bullish_smile_quotes()
+    surface = VolatilitySurface(quotes)
+    # z=-2.0 supera el umbral (mas negativo que -1.5): debe permitir la señal
+    # para la base que ya califica por dislocacion absoluta (GFGC5150O).
+    zscores = {q.symbol: -2.0 for q in quotes}
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+        dislocation_zscore=zscores,
+    )
+    assert any(s.symbol == "GFGC5150O" for s in signals)
+
+
+def test_scan_entry_signals_zscore_filter_disabled_ignores_missing_history():
+    """Con el flag apagado (default), no pasar dislocation_zscore no debe bloquear nada -
+    comportamiento identico al de antes de esta mejora."""
+    cfg = _default_config(enable_zscore_filter=False)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    quotes = _bullish_smile_quotes()
+    surface = VolatilitySurface(quotes)
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+    )
+    assert any(s.symbol == "GFGC5150O" for s in signals)
+    assert strategy.last_scan_diagnostics.blocked_by_zscore == 0
+
+
+def test_scan_entry_signals_execution_cost_filter_blocks_thin_wide_book():
+    """Un libro con spread ancho y ask_size chico (costo estimado alto) debe bloquear
+    la señal aunque la dislocacion de IV sea real - filtro de calidad de ejecucion."""
+    cfg = _default_config(enable_execution_cost_filter=True, execution_cost_max_pct=0.08)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    quotes = _bullish_smile_quotes()
+    for q in quotes:
+        if q.symbol == "GFGC5150O":
+            # mid=50, spread=40 -> half_spread_pct=0.40; muy por encima de 0.08.
+            q.book.bid = 30.0
+            q.book.ask = 70.0
+            q.book.ask_size = 5.0
+    surface = VolatilitySurface(quotes)
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+    )
+    assert not any(s.symbol == "GFGC5150O" for s in signals)
+    assert strategy.last_scan_diagnostics.blocked_by_execution_cost > 0
+
+
+def test_scan_entry_signals_execution_cost_filter_allows_tight_book():
+    cfg = _default_config(enable_execution_cost_filter=True, execution_cost_max_pct=0.08)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    quotes = _bullish_smile_quotes()
+    for q in quotes:
+        if q.symbol == "GFGC5150O":
+            # mid=100, spread=10 -> half_spread_pct=0.05; ask_size grande -> impacto despreciable.
+            # bid_size se sube igual que ask_size para no disparar el filtro OBI (no es lo que este test aisla).
+            q.book.bid = 95.0
+            q.book.ask = 105.0
+            q.book.bid_size = 500.0
+            q.book.ask_size = 500.0
+    surface = VolatilitySurface(quotes)
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+    )
+    assert any(s.symbol == "GFGC5150O" for s in signals)
+
+
+def test_scan_entry_signals_execution_cost_filter_disabled_preserves_behavior():
+    cfg = _default_config(enable_execution_cost_filter=False)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    quotes = _bullish_smile_quotes()
+    for q in quotes:
+        if q.symbol == "GFGC5150O":
+            q.book.bid = 30.0
+            q.book.ask = 70.0
+            q.book.ask_size = 5.0
+    surface = VolatilitySurface(quotes)
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+    )
+    assert any(s.symbol == "GFGC5150O" for s in signals)
+    assert strategy.last_scan_diagnostics.blocked_by_execution_cost == 0
+
+
+def test_scan_entry_signals_earnings_blackout_blocks_everything_when_enabled():
+    cfg = _default_config(enable_earnings_blackout=True)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    quotes = _bullish_smile_quotes()
+    surface = VolatilitySurface(quotes)
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+        earnings_blackout=True,
+    )
+    assert signals == []
+    diag = strategy.last_scan_diagnostics
+    assert diag.blocked_by_earnings_blackout == len(quotes)
+
+
+def test_scan_entry_signals_earnings_blackout_noop_outside_window():
+    cfg = _default_config(enable_earnings_blackout=True)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    quotes = _bullish_smile_quotes()
+    surface = VolatilitySurface(quotes)
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+        earnings_blackout=False,
+    )
+    assert any(s.symbol == "GFGC5150O" for s in signals)
+
+
+def test_scan_entry_signals_earnings_blackout_disabled_ignores_flag_even_if_true():
+    """Con el flag de config apagado, aunque el llamador pase earnings_blackout=True
+    (ej. bug en run_bot.py calculando la fecha), no debe bloquear nada - el gate es
+    SIEMPRE `earnings_blackout and cfg.enable_earnings_blackout`."""
+    cfg = _default_config(enable_earnings_blackout=False)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    quotes = _bullish_smile_quotes()
+    surface = VolatilitySurface(quotes)
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+        earnings_blackout=True,
+    )
+    assert any(s.symbol == "GFGC5150O" for s in signals)
+
+
+def test_scan_entry_signals_adr_ccl_tightens_to_extreme_when_contradicting_trend():
+    """
+    ADR/CCL BEARISH mientras `trend` (tecnico 1D) lee BULLISH: para el CALL
+    (soportado por `trend`) debe exigirse el umbral EXTREMO en vez del
+    normal, nunca bloquear de plano (mismo patron que Momentum Shift).
+    GFGC5150O tiene una dislocacion de ~-3.9 vol pts: pasa el umbral normal
+    (3.0) pero no el extremo (6.0) -> debe dejar de calificar.
+    """
+    cfg = _default_config(enable_adr_ccl_filter=True)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    quotes = _bullish_smile_quotes()
+    surface = VolatilitySurface(quotes)
+    signals_without_adr = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+    )
+    assert any(s.symbol == "GFGC5150O" for s in signals_without_adr)  # baseline: califica bajo umbral normal
+
+    signals_with_adr = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+        adr_ccl_trend="BEARISH",
+    )
+    assert not any(s.symbol == "GFGC5150O" for s in signals_with_adr)
+
+
+def test_scan_entry_signals_adr_ccl_no_effect_when_agreeing_with_trend():
+    cfg = _default_config(enable_adr_ccl_filter=True)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    quotes = _bullish_smile_quotes()
+    surface = VolatilitySurface(quotes)
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+        adr_ccl_trend="BULLISH",
+    )
+    assert any(s.symbol == "GFGC5150O" for s in signals)
+
+
+def test_scan_entry_signals_adr_ccl_disabled_ignores_provided_trend():
+    cfg = _default_config(enable_adr_ccl_filter=False)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    quotes = _bullish_smile_quotes()
+    surface = VolatilitySurface(quotes)
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+        adr_ccl_trend="BEARISH",
+    )
+    assert any(s.symbol == "GFGC5150O" for s in signals)
+
+
+# ---------------------------------------------------------------------------
+# risk/position_sizer.py: sizing por conviccion (MEJORA 2026-09-28, ver
+# config.LongFirstConfig.enable_conviction_sizing).
+# ---------------------------------------------------------------------------
+
+def test_conviction_multiplier_disabled_is_always_one():
+    cfg = _default_config(enable_conviction_sizing=False)
+    sizer = PositionSizer(max_capital_ars=1_000_000.0, max_risk_pct_per_trade=0.20, option_multiplier=100.0)
+    sizer.conviction_sizing_enabled = getattr(cfg, "enable_conviction_sizing", False)
+    assert sizer.conviction_multiplier_for(9.0) == 1.0
+    assert sizer.conviction_multiplier_for(None) == 1.0
+
+
+def test_conviction_multiplier_at_reference_is_one():
+    sizer = PositionSizer(max_capital_ars=1_000_000.0, max_risk_pct_per_trade=0.20, option_multiplier=100.0)
+    sizer.conviction_sizing_enabled = True
+    sizer.conviction_sizing_reference_vol_points = 3.0
+    sizer.conviction_sizing_min_multiplier = 0.5
+    sizer.conviction_sizing_max_multiplier = 1.5
+    assert sizer.conviction_multiplier_for(3.0) == 1.0
+    assert sizer.conviction_multiplier_for(-3.0) == 1.0  # abs()
+
+
+def test_conviction_multiplier_scales_up_and_clamps_to_max():
+    sizer = PositionSizer(max_capital_ars=1_000_000.0, max_risk_pct_per_trade=0.20, option_multiplier=100.0)
+    sizer.conviction_sizing_enabled = True
+    sizer.conviction_sizing_reference_vol_points = 3.0
+    sizer.conviction_sizing_min_multiplier = 0.5
+    sizer.conviction_sizing_max_multiplier = 1.5
+    # 6.0 / 3.0 = 2.0x crudo, pero el techo configurado es 1.5x.
+    assert sizer.conviction_multiplier_for(6.0) == 1.5
+
+
+def test_conviction_multiplier_scales_down_and_clamps_to_min():
+    sizer = PositionSizer(max_capital_ars=1_000_000.0, max_risk_pct_per_trade=0.20, option_multiplier=100.0)
+    sizer.conviction_sizing_enabled = True
+    sizer.conviction_sizing_reference_vol_points = 3.0
+    sizer.conviction_sizing_min_multiplier = 0.5
+    sizer.conviction_sizing_max_multiplier = 1.5
+    # 1.5 / 3.0 = 0.5x crudo, coincide exactamente con el piso configurado.
+    assert sizer.conviction_multiplier_for(1.5) == 0.5
+
+
+def test_conviction_multiplier_without_valid_reference_is_one():
+    sizer = PositionSizer(max_capital_ars=1_000_000.0, max_risk_pct_per_trade=0.20, option_multiplier=100.0)
+    sizer.conviction_sizing_enabled = True
+    sizer.conviction_sizing_reference_vol_points = None
+    assert sizer.conviction_multiplier_for(9.0) == 1.0
+
+
+def test_compute_contracts_applies_conviction_multiplier_to_allocated_capital():
+    sizer = PositionSizer(max_capital_ars=1_000_000.0, max_risk_pct_per_trade=0.20, option_multiplier=100.0)
+    # Baseline (multiplicador 1.0): capital_asignado=200,000; prima=350 -> costo/contrato=35,000 -> 5 contratos.
+    baseline = sizer.compute_contracts(premium_price=350.0, conviction_multiplier=1.0)
+    assert baseline.contracts == 5
+    assert baseline.capital_allocated_ars == 200_000.0
+
+    # Con 1.5x: capital_asignado=300,000 -> 300,000/35,000 = 8.57 -> floor = 8.
+    boosted = sizer.compute_contracts(premium_price=350.0, conviction_multiplier=1.5)
+    assert boosted.contracts == 8
+    assert boosted.capital_allocated_ars == 300_000.0
+
+
+def test_compute_contracts_rejects_non_positive_conviction_multiplier():
+    sizer = PositionSizer(max_capital_ars=1_000_000.0, max_risk_pct_per_trade=0.20, option_multiplier=100.0)
+    result = sizer.compute_contracts(premium_price=350.0, conviction_multiplier=0.0)
+    assert result.contracts == 0
+    assert result.rejected_reason == "conviction_multiplier_invalido"
+
+
 ALL_TESTS = [
     test_position_sizer_applies_floor_division_formula,
     test_position_sizer_rejects_when_capital_insufficient_for_one_contract,
@@ -2002,6 +2282,26 @@ ALL_TESTS = [
     test_build_exit_signals_partial_profit_take_yields_to_full_close_reason,
     test_bot_act_on_exit_signal_full_close_zeroes_position,
     test_bot_act_on_exit_signal_partial_profit_take_reduces_quantity_and_sets_flag,
+    test_scan_entry_signals_zscore_filter_blocks_without_enough_history,
+    test_scan_entry_signals_zscore_filter_blocks_when_not_extreme_enough,
+    test_scan_entry_signals_zscore_filter_allows_extreme_zscore,
+    test_scan_entry_signals_zscore_filter_disabled_ignores_missing_history,
+    test_scan_entry_signals_execution_cost_filter_blocks_thin_wide_book,
+    test_scan_entry_signals_execution_cost_filter_allows_tight_book,
+    test_scan_entry_signals_execution_cost_filter_disabled_preserves_behavior,
+    test_scan_entry_signals_earnings_blackout_blocks_everything_when_enabled,
+    test_scan_entry_signals_earnings_blackout_noop_outside_window,
+    test_scan_entry_signals_earnings_blackout_disabled_ignores_flag_even_if_true,
+    test_scan_entry_signals_adr_ccl_tightens_to_extreme_when_contradicting_trend,
+    test_scan_entry_signals_adr_ccl_no_effect_when_agreeing_with_trend,
+    test_scan_entry_signals_adr_ccl_disabled_ignores_provided_trend,
+    test_conviction_multiplier_disabled_is_always_one,
+    test_conviction_multiplier_at_reference_is_one,
+    test_conviction_multiplier_scales_up_and_clamps_to_max,
+    test_conviction_multiplier_scales_down_and_clamps_to_min,
+    test_conviction_multiplier_without_valid_reference_is_one,
+    test_compute_contracts_applies_conviction_multiplier_to_allocated_capital,
+    test_compute_contracts_rejects_non_positive_conviction_multiplier,
 ]
 
 

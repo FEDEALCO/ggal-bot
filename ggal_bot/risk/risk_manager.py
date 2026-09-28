@@ -75,6 +75,41 @@ class RiskManager:
             return "Griegas dentro de limite."
         return f"LIMITE EXCEDIDO: {', '.join(breaches)} | totales={totals}"
 
+    def projected_greeks_breach(
+        self, current_totals: Dict[str, float], added_greeks: Dict[str, float], budget_fraction: float,
+    ) -> Optional[str]:
+        """
+        Presupuesto PREVENTIVO de Griegas (MEJORA 2026-09-28, ver
+        config.RiskConfig.enable_preemptive_greeks_budget): a diferencia de
+        should_halt_new_positions (que evalua los totales YA vigentes ANTES
+        de sumar la posicion nueva), esto proyecta `current_totals +
+        added_greeks` y devuelve un texto describiendo que dimension
+        superaria `budget_fraction * limite duro` - None si ninguna la
+        superaria. `budget_fraction` NUNCA debe superar 1.0 en la practica
+        (seria equivalente o mas laxo que el limite duro existente), pero
+        no se lo fuerza aca - es responsabilidad de quien configura el
+        valor (ver docstring de RiskConfig).
+
+        SE SUMA al chequeo existente (should_halt_new_positions), nunca lo
+        reemplaza: esta guarda puede rechazar una entrada que
+        should_halt_new_positions todavia habria aceptado (esa es
+        precisamente la idea: frenar ANTES de llegar al muro duro, no
+        despues).
+        """
+        projected_vega = current_totals.get("vega", 0.0) + added_greeks.get("vega", 0.0)
+        projected_gamma = current_totals.get("gamma", 0.0) + added_greeks.get("gamma", 0.0)
+        breaches = []
+        if abs(projected_vega) > self.limits.max_vega_total * budget_fraction:
+            breaches.append(f"vega proyectado={projected_vega:.2f}")
+        if abs(projected_gamma) > self.limits.max_gamma_total * budget_fraction:
+            breaches.append(f"gamma proyectado={projected_gamma:.2f}")
+        if not breaches:
+            return None
+        return (
+            f"PRESUPUESTO PREVENTIVO EXCEDIDO ({budget_fraction:.0%} del limite duro): "
+            f"{', '.join(breaches)}"
+        )
+
     # -----------------------------------------------------------------------
     # Modo Long-First / Weekly Asymmetric (ver config.LongFirstConfig y
     # strategy/weekly_asymmetric.py): Stop Loss / Take Profit / horizonte

@@ -8,6 +8,7 @@ antes de operar en vivo. Las credenciales NUNCA se hardcodean aca: se leen
 de variables de entorno (ver .env.example) via python-dotenv.
 """
 
+import logging
 import os
 import sys
 from dataclasses import dataclass, field
@@ -69,6 +70,35 @@ def _env_bool(name: str, default: bool) -> bool:
 def _env_str(name: str, default: str) -> str:
     raw = os.getenv(name, "")
     return raw if raw != "" else default
+
+
+def _env_date_list(name: str, default: Tuple[date, ...] = ()) -> Tuple[date, ...]:
+    """
+    Lista de fechas ISO (YYYY-MM-DD) separadas por coma, ej.
+    "2026-11-06,2027-02-19" (MEJORA 2026-09-28, blackout de earnings - ver
+    LongFirstConfig.earnings_dates). Deliberadamente SIN ninguna fecha
+    hardcodeada por defecto: no hay forma de conocer con certeza, desde este
+    codigo, el calendario real de resultados de Grupo Financiero Galicia -
+    inventar fechas seria fabricar un dato, exactamente lo que este proyecto
+    evita en cada auditoria. Una fecha individual que no parsea como ISO se
+    ignora (se loguea un warning), en vez de tirar abajo todo el arranque
+    del bot por un typo en la variable de entorno.
+    """
+    raw = os.getenv(name, "")
+    if raw.strip() == "":
+        return tuple(default)
+    parsed = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            parsed.append(date.fromisoformat(token))
+        except ValueError:
+            logging.getLogger("ggal_bot.config").warning(
+                "%s: no se pudo interpretar %r como fecha ISO (YYYY-MM-DD) - se ignora.", name, token,
+            )
+    return tuple(parsed)
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +411,28 @@ class RiskConfig:
     stale_quote_warning_seconds: Optional[float] = (
         _env_float("GGAL_BOT_STALE_QUOTE_WARNING_SECONDS", 300.0) or None
     )
+
+    # --- Presupuesto PREVENTIVO de Griegas por entrada (MEJORA 2026-09-28) ---
+    # A pedido explicito del usuario ("mejor trader quant... presupuesto de
+    # riesgo agregado en vez de esperar al muro duro"): hasta esta mejora, el
+    # unico chequeo de Griegas en la entrada era should_halt_new_positions
+    # (RiskManager.check_greeks_limits) contra los totales YA vigentes ANTES
+    # de sumar la posicion nueva - una entrada podia empujar el total de
+    # vega/gamma MUY por encima del limite duro en un solo salto (y de hecho
+    # es exactamente el patron real observado: cientos de REJECT por
+    # greeks_limit_exceeded concentrados en los dias de mayor actividad, ver
+    # analisis del export 2026-09-28). Esta guarda es ADICIONAL (se SUMA al
+    # chequeo existente, no lo reemplaza): proyecta los totales de la
+    # estrategia CON la posicion nueva ya sumada (contratos*griega_por_unidad,
+    # ver risk/risk_manager.py::RiskManager.projected_greeks_breach) y
+    # rechaza si eso superaria una FRACCION del limite duro (nunca el limite
+    # en si, que sigue siendo el ultimo resorte) - la idea es frenar ANTES de
+    # llegar al muro, no reemplazar el muro. DATA INSUFFICIENT para calibrar
+    # la fraccion optima sin datos propios de esta mejora; 0.85 es un piso de
+    # arranque razonable (deja un 15% de margen), a criterio explicito del
+    # usuario ajustarlo con lo que se observe.
+    enable_preemptive_greeks_budget: bool = _env_bool("GGAL_BOT_ENABLE_PREEMPTIVE_GREEKS_BUDGET", False)
+    preemptive_greeks_budget_fraction: float = _env_float("GGAL_BOT_PREEMPTIVE_GREEKS_BUDGET_FRACTION", 0.85)
 
 
 # ---------------------------------------------------------------------------
@@ -988,6 +1040,116 @@ class LongFirstConfig:
     vega_decay_exit_ratio: float = _env_float("GGAL_BOT_VEGA_DECAY_EXIT_RATIO", 0.20)
     vega_decay_min_holding_hours: float = _env_float("GGAL_BOT_VEGA_DECAY_MIN_HOLDING_HOURS", 3.0)
 
+    # --- Filtro de dislocacion RELATIVA por z-score (MEJORA 2026-09-28) ---
+    # A pedido explicito del usuario ("mejor trader quant... exprime tu
+    # capacidad al maximo"). smile_threshold_vol_points (arriba) es un
+    # umbral FIJO en puntos de vol absolutos: no distingue una base que
+    # SIEMPRE tiene 2-3 vol pts de ruido de smile de una que de golpe se
+    # desvio muy por fuera de su propio comportamiento reciente - la
+    # segunda es la candidata mas fuerte a una dislocacion genuina, la
+    # primera es solo ruido estructural de ese book en particular. Mismo
+    # mecanismo que YA existe (ver data/iv_mean_reversion.py:
+    # IVMeanReversionTracker) para la salida de reversion de Scalping, pero
+    # ahi deliberadamente confinado a ese modo para no romper el diseño
+    # stateless de WeeklyAsymmetricStrategy (ver su docstring). Esta mejora
+    # lo trae TAMBIEN como filtro de ENTRADA para weekly_asymmetric, con el
+    # mismo patron de inyeccion que `trend`/`momentum_shift` (el estado del
+    # tracker vive en run_bot.py, WeeklyAsymmetricStrategy solo recibe el
+    # z-score ya calculado - ver GgalOptionsBot._dislocation_tracker):
+    # SE SUMA al umbral fijo existente, nunca lo reemplaza - una base debe
+    # seguir pasando smile_threshold_vol_points Y, si esta habilitado,
+    # tener ademas un z-score por debajo de -zscore_threshold contra su
+    # propia ventana reciente. Apagado por defecto: DATA INSUFFICIENT para
+    # calibrar zscore_threshold sin datos propios de este filtro todavia.
+    enable_zscore_filter: bool = _env_bool("GGAL_BOT_ENABLE_ZSCORE_FILTER", False)
+    zscore_window_seconds: float = _env_float("GGAL_BOT_ZSCORE_WINDOW_SECONDS", 1800.0)
+    zscore_min_samples: int = _env_int("GGAL_BOT_ZSCORE_MIN_SAMPLES", 10)
+    zscore_threshold: float = _env_float("GGAL_BOT_ZSCORE_THRESHOLD", 1.5)
+
+    # --- Sizing por CONVICCION de la señal (MEJORA 2026-09-28) ---
+    # A pedido explicito del usuario. Hoy risk/position_sizer.py::
+    # PositionSizer asigna la MISMA fraccion de capital
+    # (max_risk_pct_per_trade) a toda señal que califica, sin importar si la
+    # dislocacion de IV es apenas la minima exigida o mucho mas extrema.
+    # Con esto habilitado, el capital asignado se escala por
+    # |dislocacion| / conviction_sizing_reference_vol_points, acotado entre
+    # conviction_sizing_min_multiplier y conviction_sizing_max_multiplier
+    # (ver PositionSizer.conviction_multiplier_for). None en
+    # conviction_sizing_reference_vol_points (default) cae a
+    # smile_threshold_vol_points de arriba: una señal que recien alcanza el
+    # umbral minimo queda en 1.0x (sizing identico al actual), y solo una
+    # dislocacion MAS extrema que el umbral escala hacia arriba - nunca
+    # hacia abajo del baseline actual salvo que se configure explicitamente
+    # un min_multiplier < 1.0. Apagado por defecto: DATA INSUFFICIENT para
+    # calibrar el rango optimo sin el historial de win-rate por magnitud de
+    # dislocacion que el logger de mercado (MEJORA 2026-09-28, ver
+    # data/market_snapshot_log.py) recien empieza a construir.
+    enable_conviction_sizing: bool = _env_bool("GGAL_BOT_ENABLE_CONVICTION_SIZING", False)
+    conviction_sizing_reference_vol_points: Optional[float] = (
+        _env_float("GGAL_BOT_CONVICTION_SIZING_REFERENCE_VOL_POINTS", 0.0) or None
+    )
+    conviction_sizing_min_multiplier: float = _env_float("GGAL_BOT_CONVICTION_SIZING_MIN_MULTIPLIER", 0.5)
+    conviction_sizing_max_multiplier: float = _env_float("GGAL_BOT_CONVICTION_SIZING_MAX_MULTIPLIER", 1.5)
+
+    # --- Costo de ejecucion estimado (MEJORA 2026-09-28) ---
+    # A pedido explicito del usuario. El libro de opciones de GGAL en BYMA
+    # es delgado: check_liquidity() (risk/risk_manager.py) hoy es un
+    # pasa/no-pasa binario (spread relativo y tamaño minimo de punta), sin
+    # estimar CUANTO costaria realmente cruzar ese spread. Este filtro
+    # estima un costo en % de la prima (mitad del spread relativo, que se
+    # paga siempre al cruzar al ask; mas un termino de impacto que crece
+    # cuando el tamaño de punta mostrado es chico, proxy de cuanto se
+    # moveria el precio si el tamaño real operado excede lo mostrado - ver
+    # WeeklyAsymmetricStrategy._estimate_execution_cost_pct) y descarta la
+    # señal si ese costo estimado supera execution_cost_max_pct de la prima.
+    # LIMITACION EXPLICITA: al momento del scan todavia no se conoce la
+    # cantidad de contratos final (eso lo decide PositionSizer despues, con
+    # el capital disponible real) - el termino de impacto asume el peor
+    # caso razonable (1 contrato contra el tamaño de punta mostrado), no un
+    # calculo exacto contra la cantidad que se vaya a pedir. Apagado por
+    # defecto.
+    enable_execution_cost_filter: bool = _env_bool("GGAL_BOT_ENABLE_EXECUTION_COST_FILTER", False)
+    execution_cost_impact_coefficient: float = _env_float("GGAL_BOT_EXECUTION_COST_IMPACT_COEFFICIENT", 0.02)
+    execution_cost_max_pct: float = _env_float("GGAL_BOT_EXECUTION_COST_MAX_PCT", 0.08)
+
+    # --- Filtro cruzado ADR (NYSE: GGAL) / dolar CCL implicito (MEJORA 2026-09-28) ---
+    # A pedido explicito del usuario, marcado HYPOTHESIS (no VERIFIED): el
+    # ADR cotiza en USD y cierra en un horario distinto al de BYMA, asi que
+    # un movimiento fuerte del ADR (ajustado por el CCL implicito) durante
+    # la noche PODRIA anticipar el gap de apertura local - pero este codigo
+    # NO integra ninguna fuente de datos en vivo del ADR/CCL (no hay forma
+    # de verificar un endpoint real sin credenciales, y fabricar una
+    # integracion sin poder probarla contra el proveedor real seria
+    # exactamente el tipo de dato inventado que este proyecto evita). Lo que
+    # se agrega aca es el PUNTO DE EXTENSION: si algun llamador futuro
+    # inyecta una lectura ("BULLISH"/"BEARISH"/"NEUTRAL", igual que `trend`)
+    # y esta habilitado, un option_type que CONTRADIGA esa lectura exige el
+    # umbral EXTREMO en vez del normal (mismo patron ya usado para NEUTRAL/
+    # Momentum Shift) en lugar de bloquearse de plano - nunca reemplaza al
+    # filtro de `trend` existente, solo lo endurece cuando ambas lecturas
+    # discrepan. Apagado por defecto (y sin ningun efecto mientras nadie
+    # inyecte `adr_ccl_trend` real).
+    enable_adr_ccl_filter: bool = _env_bool("GGAL_BOT_ENABLE_ADR_CCL_FILTER", False)
+
+    # --- Blackout de earnings / eventos conocidos (MEJORA 2026-09-28) ---
+    # A pedido explicito del usuario. La IV de GGAL casi seguro tiene una
+    # prima de evento antes de resultados trimestrales de Grupo Financiero
+    # Galicia que se desinfla despues del anuncio - una base "barata" un dia
+    # antes de earnings puede estar barata PORQUE el mercado todavia no
+    # precio el evento, no por una ineficiencia real. earnings_dates queda
+    # deliberadamente VACIO por defecto (ver _env_date_list): no hay forma
+    # de conocer con certeza, desde este codigo, el calendario real de
+    # resultados - cargarlo es responsabilidad explicita del usuario via
+    # GGAL_BOT_EARNINGS_DATES ("2026-11-06,2027-02-19", ISO separado por
+    # coma). Con la lista vacia (default), este filtro es un no-op completo
+    # aunque enable_earnings_blackout este en True. Bloquea TODA entrada
+    # nueva (no solo el lado que perdiera con el evento) durante la ventana,
+    # porque la prima de evento puede inflar la IV de ambos lados del
+    # smile por igual.
+    enable_earnings_blackout: bool = _env_bool("GGAL_BOT_ENABLE_EARNINGS_BLACKOUT", False)
+    earnings_dates: Tuple[date, ...] = field(default_factory=lambda: _env_date_list("GGAL_BOT_EARNINGS_DATES"))
+    earnings_blackout_days_before: int = _env_int("GGAL_BOT_EARNINGS_BLACKOUT_DAYS_BEFORE", 2)
+
 
 @dataclass
 class VolArbitrageConfig:
@@ -1439,6 +1601,31 @@ class TechnicalAnalysisConfig:
     enable_momentum_shift_override: bool = _env_bool("GGAL_BOT_TA_ENABLE_MOMENTUM_OVERRIDE", True)
     momentum_shift_lookback_bars: int = _env_int("GGAL_BOT_TA_MOMENTUM_LOOKBACK_BARS", 3)
     momentum_shift_rsi_delta: float = _env_float("GGAL_BOT_TA_MOMENTUM_RSI_DELTA", 8.0)
+
+    # --- Vol realizada robusta a saltos (MEJORA 2026-09-28) ---
+    # A pedido explicito del usuario. LongFirstConfig.require_level_confirmation
+    # espera un `hv_estimate` (vol realizada de referencia) para comparar
+    # contra el nivel promedio de IV del vencimiento (ver
+    # models/volatility_surface.py::VolatilitySurface.level_dislocation) -
+    # VERIFICADO por grep que, hasta esta mejora, run_bot.py NUNCA pasaba
+    # ese parametro (`hv_estimate` quedaba siempre en None), asi que
+    # require_level_confirmation era un no-op completo aunque estuviera en
+    # True. Esta mejora conecta un estimador real, reusando las MISMAS
+    # velas 1D ya cacheadas por TechnicalAnalysisEngine para la tendencia
+    # (sin pegarle a una fuente de datos nueva) - ver
+    # TechnicalAnalysisEngine.hv_estimate() y models/realized_vol.py. El
+    # GGAL en pesos tiene saltos discretos por eventos de
+    # devaluacion/CCL que NO son volatilidad en el sentido de difusion
+    # continua - un estimador close-to-close ingenuo (varianza de retornos)
+    # los trata igual que ruido normal y queda "inflado" durante semanas
+    # despues de un solo salto. bipower_realized_vol (ver ese modulo) es
+    # jump-robust POR CONSTRUCCION: multiplica retornos ADYACENTES en vez de
+    # elevarlos al cuadrado, asi que un retorno aislado enorme se pondera
+    # contra sus vecinos (tipicamente chicos), no contra si mismo. Apagado
+    # por defecto: cambia el resultado de un chequeo que hoy es puro no-op,
+    # asi que activarlo es una decision de comportamiento nuevo, no un
+    # ajuste neutro.
+    enable_jump_robust_hv: bool = _env_bool("GGAL_BOT_ENABLE_JUMP_ROBUST_HV", False)
 
 
 # ---------------------------------------------------------------------------

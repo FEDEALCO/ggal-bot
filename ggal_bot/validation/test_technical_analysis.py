@@ -31,6 +31,7 @@ import math
 from datetime import date, datetime, timedelta, timezone
 
 from ggal_bot.config import TechnicalAnalysisConfig
+from ggal_bot.models.realized_vol import bipower_realized_vol
 from ggal_bot.data import technical_analysis as ta
 from ggal_bot.data.technical_analysis import (
     DailyBar,
@@ -430,6 +431,54 @@ def test_engine_force_refresh_bypasses_cache():
     assert snap2 is not snap1
 
 
+# ---------------------------------------------------------------------------
+# TechnicalAnalysisEngine.hv_estimate (MEJORA 2026-09-28, ver
+# config.TechnicalAnalysisConfig.enable_jump_robust_hv y
+# models/realized_vol.py::bipower_realized_vol)
+# ---------------------------------------------------------------------------
+
+def test_hv_estimate_none_when_flag_disabled():
+    cfg = _test_cfg(data_source="synthetic", enable_jump_robust_hv=False, lookback_bars=80)
+    engine = TechnicalAnalysisEngine(config=cfg)
+    engine.refresh(now=datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc))
+    assert engine.hv_estimate() is None
+
+
+def test_hv_estimate_none_without_any_refresh_yet():
+    """Con el flag habilitado pero sin ningun refresh() corrido todavia, no hay barras
+    cacheadas: debe devolver None, nunca fabricar un valor con datos que no tiene."""
+    cfg = _test_cfg(data_source="synthetic", enable_jump_robust_hv=True, lookback_bars=80)
+    engine = TechnicalAnalysisEngine(config=cfg)
+    assert engine.hv_estimate() is None
+
+
+def test_hv_estimate_returns_bipower_value_once_bars_are_cached():
+    cfg = _test_cfg(data_source="synthetic", enable_jump_robust_hv=True, lookback_bars=80)
+    engine = TechnicalAnalysisEngine(config=cfg)
+    engine.refresh(now=datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc))
+    hv = engine.hv_estimate()
+    assert hv is not None
+    assert hv > 0.0
+    # Debe coincidir exactamente con bipower_realized_vol sobre las mismas barras cacheadas
+    # (mismo calculo, no una aproximacion distinta) - ver docstring de hv_estimate().
+    closes = [b.close for b in engine._last_bars]
+    assert hv == bipower_realized_vol(closes)
+
+
+def test_hv_estimate_updates_after_forced_refresh_recomputes_bars():
+    cfg = _test_cfg(data_source="synthetic", enable_jump_robust_hv=True, lookback_bars=80,
+                     refresh_interval_seconds=3600.0)
+    engine = TechnicalAnalysisEngine(config=cfg)
+    t0 = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    engine.refresh(now=t0)
+    hv1 = engine.hv_estimate()
+    engine.refresh(now=t0 + timedelta(minutes=1), force=True)  # nuevas barras sinteticas (sin seed fijo)
+    hv2 = engine.hv_estimate()
+    assert hv1 is not None and hv2 is not None
+    closes = [b.close for b in engine._last_bars]
+    assert hv2 == bipower_realized_vol(closes)  # siempre coincide con las barras cacheadas VIGENTES
+
+
 ALL_TESTS = [
     test_ema_matches_manual_calculation,
     test_ema_insufficient_data_returns_all_none,
@@ -457,6 +506,10 @@ ALL_TESTS = [
     test_engine_refresh_caches_within_interval,
     test_engine_refresh_recomputes_after_interval_elapses,
     test_engine_force_refresh_bypasses_cache,
+    test_hv_estimate_none_when_flag_disabled,
+    test_hv_estimate_none_without_any_refresh_yet,
+    test_hv_estimate_returns_bipower_value_once_bars_are_cached,
+    test_hv_estimate_updates_after_forced_refresh_recomputes_bars,
 ]
 
 

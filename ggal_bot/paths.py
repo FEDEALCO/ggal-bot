@@ -46,5 +46,15 @@ POSITION_EVENTS_LOG = LOGS_DIR / "position_events.csv"
 # arranque, exactamente el tipo de gap que esta fase busca cerrar.
 KILL_SWITCH_STATE_FILE = STATE_DIR / "kill_switch.json"
 
+# MEJORA 2026-09-28 (a pedido explicito del usuario, "mejor trader quant...
+# exprime tu capacidad al maximo" - ver ggal_bot/data/market_snapshot_log.py):
+# snapshot append-only de TODA la cadena de opciones (spot/IV/griegas/book)
+# en cada ciclo. Antes de esta mejora no existia NINGUN historial de
+# mercado persistido (solo fills y eventos de lifecycle, ambos a nivel de
+# TRADE) - sin esto, cualquier cambio de umbral/modelo solo se podia
+# validar desplegando a shadow y esperando dias por un export nuevo. Este
+# archivo es lo que permite, de ahora en mas, backtestear offline.
+MARKET_SNAPSHOT_LOG = LOGS_DIR / "market_snapshots.csv"
+
 for _dir in (LOGS_DIR, STATE_DIR, DATA_DIR):
     _dir.mkdir(parents=True, exist_ok=True)

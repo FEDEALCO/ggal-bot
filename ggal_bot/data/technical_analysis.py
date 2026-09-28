@@ -55,6 +55,7 @@ except ImportError:  # pragma: no cover - degradado igual que en live_shadow_fee
 
 from ggal_bot.config import SETTINGS
 from ggal_bot.data.http_utils import http_get_json
+from ggal_bot.models.realized_vol import bipower_realized_vol
 
 logger = logging.getLogger("ggal_bot.technical_analysis")
 
@@ -629,6 +630,7 @@ class TechnicalAnalysisEngine:
         self.cfg = config if config is not None else SETTINGS.technical_analysis
         self._last_snapshot: Optional[TechnicalSnapshot] = None
         self._last_refresh_at: Optional[datetime] = None
+        self._last_bars: List[DailyBar] = []
 
     def refresh(self, now: Optional[datetime] = None, force: bool = False) -> TechnicalSnapshot:
         """
@@ -649,6 +651,7 @@ class TechnicalAnalysisEngine:
         snapshot = compute_technical_snapshot(bars, self.cfg, data_source=source_name)
         self._last_snapshot = snapshot
         self._last_refresh_at = now
+        self._last_bars = bars
         return snapshot
 
     def get_daily_trend_signal(self) -> str:
@@ -664,3 +667,20 @@ class TechnicalAnalysisEngine:
 
     def last_snapshot(self) -> Optional[TechnicalSnapshot]:
         return self._last_snapshot
+
+    def hv_estimate(self) -> Optional[float]:
+        """
+        Vol realizada de referencia (MEJORA 2026-09-28, ver
+        config.TechnicalAnalysisConfig.enable_jump_robust_hv y
+        models/realized_vol.py::bipower_realized_vol) calculada sobre las
+        MISMAS velas 1D ya cacheadas por refresh() para la tendencia (sin
+        pegarle a ninguna fuente de datos nueva). None si el flag esta
+        apagado (comportamiento identico al de antes de esta mejora: nadie
+        llamaba a este metodo, asi que run_bot.py nunca le pasaba
+        `hv_estimate` a scan_entry_signals) o si todavia no hay barras
+        cacheadas (ningun refresh() corrido todavia).
+        """
+        if not self.cfg.enable_jump_robust_hv or not self._last_bars:
+            return None
+        closes = [b.close for b in self._last_bars]
+        return bipower_realized_vol(closes)

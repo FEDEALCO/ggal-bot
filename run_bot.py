@@ -29,7 +29,7 @@ import logging
 import signal
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Dict, List, Optional
 
 from ggal_bot.config import SETTINGS, VALID_STRATEGIES
@@ -41,6 +41,8 @@ from ggal_bot.models.implied_vol import ImpliedVolatilityCalculator
 from ggal_bot.models.volatility_surface import VolatilitySurface
 from ggal_bot.portfolio.portfolio import Portfolio, Position
 from ggal_bot.portfolio.event_journal import PositionEventJournal
+from ggal_bot.data.market_snapshot_log import MarketSnapshotLogger
+from ggal_bot.data.dislocation_history import DislocationHistoryTracker
 from ggal_bot.portfolio.reconciliation import (
     ReconciliationUnavailable,
     reconstruct_positions_from_shadow_log,
@@ -197,6 +199,15 @@ class GgalOptionsBot:
             self.strategy = WeeklyAsymmetricStrategy(self.risk_manager, config=SETTINGS.long_first)
             self.position_sizer = PositionSizer()
             self.technical_engine = TechnicalAnalysisEngine(config=SETTINGS.technical_analysis)
+            # Ventana rodante de dislocacion de smile por simbolo + z-score
+            # (MEJORA 2026-09-28, ver config.LongFirstConfig.
+            # enable_zscore_filter y data/dislocation_history.py) -
+            # INDEPENDIENTE de la de Scalping (self.scalping_iv_tracker mas
+            # abajo, si existe), nunca compartida.
+            self._dislocation_tracker = DislocationHistoryTracker(
+                max_window_seconds=SETTINGS.long_first.zscore_window_seconds,
+                min_samples=SETTINGS.long_first.zscore_min_samples,
+            )
         # Ultimo TechnicalSnapshot ya logueado (por identidad de objeto, ver
         # _run_weekly_asymmetric_cycle) - evita repetir la misma linea de
         # "Tendencia 1D GGAL: ..." en cada ciclo mientras el cache del motor
@@ -384,6 +395,13 @@ class GgalOptionsBot:
         # ggal_bot/portfolio/event_journal.py) --------------------------------
         self.position_event_journal = PositionEventJournal()
 
+        # -- Snapshot de mercado (MEJORA 2026-09-28, ver
+        # ggal_bot/data/market_snapshot_log.py) - corre SIEMPRE, sin importar
+        # la estrategia activa (mismo criterio que position_event_journal
+        # arriba y _warn_positions_without_valid_quote): es la base para
+        # poder backtestear offline cualquier mejora futura.
+        self.market_snapshot_log = MarketSnapshotLogger()
+
         # -- Kill switch centralizado (Fase 5.3, ver ggal_bot/risk/kill_switch.py) --
         self.kill_switch = KillSwitch()
 
@@ -539,6 +557,26 @@ class GgalOptionsBot:
         if staleness is None:
             return False
         return staleness > SETTINGS.risk.max_market_data_staleness_seconds
+
+    def _is_earnings_blackout(self, today: date) -> bool:
+        """
+        Blackout de earnings (MEJORA 2026-09-28, ver
+        config.LongFirstConfig.enable_earnings_blackout/earnings_dates/
+        earnings_blackout_days_before): True si `today` cae dentro de la
+        ventana [fecha_earnings - earnings_blackout_days_before,
+        fecha_earnings] para alguna fecha configurada. Con
+        `earnings_dates` vacio (default, ver _env_date_list) esto es
+        siempre False, sin importar el valor de enable_earnings_blackout -
+        no hay ninguna fecha inventada contra la cual bloquear.
+        """
+        cfg = SETTINGS.long_first
+        if not getattr(cfg, "enable_earnings_blackout", False):
+            return False
+        for earnings_date in getattr(cfg, "earnings_dates", ()):
+            days_before = (earnings_date - today).days
+            if 0 <= days_before <= cfg.earnings_blackout_days_before:
+                return True
+        return False
 
     # -- Conexion y arranque -------------------------------------------------
 
@@ -749,6 +787,15 @@ class GgalOptionsBot:
         # este ciclo) y ANTES del kill switch/dispatch de estrategia, para
         # que la alerta sea lo mas temprana posible dentro del ciclo.
         self._warn_positions_without_valid_quote()
+
+        # Snapshot de mercado (MEJORA 2026-09-28, ver
+        # data/market_snapshot_log.py): corre SIEMPRE, sin importar la
+        # estrategia activa (mismo criterio que la alerta de arriba) - se
+        # ubica DESPUES de recompute_all (cadena ya actualizada este ciclo)
+        # para que cada fila refleje IV/griegas recien calculados, no los
+        # del ciclo anterior. Un fallo de disco al loguear esto nunca debe
+        # tumbar el ciclo de trading real (ver MarketSnapshotLogger._write_rows).
+        self.market_snapshot_log.log_quotes(self.option_chain.all_quotes())
 
         # Kill switch centralizado (Fase 5.3, ver ggal_bot/risk/kill_switch.py):
         # se evalua ANTES de correr el escaneo de entradas de este ciclo,
@@ -1121,6 +1168,12 @@ class GgalOptionsBot:
         # -- 0) Tendencia 1D (filtro direccional obligado) ----------------------
         trend = Trend.NEUTRAL.value
         momentum_shift: Optional[str] = None
+        # Vol realizada de referencia (MEJORA 2026-09-28, ver
+        # config.TechnicalAnalysisConfig.enable_jump_robust_hv y
+        # TechnicalAnalysisEngine.hv_estimate) - se degrada a None bajo el
+        # MISMO criterio que `trend`/`momentum_shift` mas abajo (datos
+        # sinteticos no pueden confirmar ni gatillar ninguna decision real).
+        hv_estimate: Optional[float] = None
         if self.technical_engine is not None:
             try:
                 snapshot = self.technical_engine.refresh(now=now)
@@ -1147,6 +1200,8 @@ class GgalOptionsBot:
                 if snapshot.data_source == "synthetic":
                     trend = Trend.NEUTRAL.value
                     momentum_shift = None
+                else:
+                    hv_estimate = self.technical_engine.hv_estimate()
                 # refresh() devuelve el MISMO objeto (misma identidad) mientras
                 # el cache siga vigente (ver refresh_interval_seconds, tipicamente
                 # 1h) - se loguea solo cuando cambia la instancia (o sea, cuando
@@ -1225,6 +1280,10 @@ class GgalOptionsBot:
         # -- 2) Entradas nuevas (recien despues de reconciliar salidas) ---------
         entry_diagnostics_by_expiry: Dict[object, object] = {}
         quote_availability_by_expiry: Dict[object, Dict[str, int]] = {}
+        # Blackout de earnings (MEJORA 2026-09-28, ver
+        # config.LongFirstConfig.enable_earnings_blackout): un solo chequeo
+        # por ciclo, reusado para todos los vencimientos de abajo.
+        earnings_blackout = self._is_earnings_blackout(now.date())
         if not market_data_stale:
             for expiry, quotes in self.option_chain.quotes_by_expiry().items():
                 # Vencimiento forzado (a pedido explicito del usuario,
@@ -1258,8 +1317,27 @@ class GgalOptionsBot:
                 if len(valid_quotes) < 3:
                     continue
                 surface = VolatilitySurface(valid_quotes)
+
+                # z-score de dislocacion (MEJORA 2026-09-28, ver
+                # config.LongFirstConfig.enable_zscore_filter): se alimenta
+                # el tracker con TODAS las valid_quotes de este vencimiento
+                # (no solo las que terminan calificando), mismo criterio que
+                # IVMeanReversionTracker en Scalping - antes de aplicar
+                # ningun filtro. Con el flag apagado, se salta el trabajo
+                # por completo (el parametro queda en None, identico a no
+                # pasarlo).
+                dislocation_zscore = None
+                if SETTINGS.long_first.enable_zscore_filter:
+                    dislocation_zscore = {}
+                    for q in valid_quotes:
+                        dislocation = surface.smile_dislocation(q)
+                        self._dislocation_tracker.update(q.symbol, dislocation, now=now)
+                        dislocation_zscore[q.symbol] = self._dislocation_tracker.zscore(q.symbol)
+
                 entry_signals = self.strategy.scan_entry_signals(
-                    surface, self._recent_volumes, trend=trend, momentum_shift=momentum_shift,
+                    surface, self._recent_volumes, hv_estimate=hv_estimate,
+                    trend=trend, momentum_shift=momentum_shift,
+                    dislocation_zscore=dislocation_zscore, earnings_blackout=earnings_blackout,
                 )
                 if self.strategy.last_scan_diagnostics is not None:
                     entry_diagnostics_by_expiry[expiry] = self.strategy.last_scan_diagnostics
@@ -1937,9 +2015,19 @@ class GgalOptionsBot:
             return
 
         sizer = position_sizer if position_sizer is not None else self.position_sizer
+        # Sizing por CONVICCION (MEJORA 2026-09-28, ver
+        # risk/position_sizer.py::PositionSizer.conviction_multiplier_for):
+        # 1.0 (no-op) si el flag esta apagado o `signal` no trae
+        # iv_dislocation_vol_points (getattr defensivo - ScalpingStrategy
+        # tambien produce EntrySignal, mismo dataclass, asi que siempre lo
+        # trae hoy, pero no se asume para una señal futura distinta).
+        conviction_multiplier = sizer.conviction_multiplier_for(
+            getattr(signal, "iv_dislocation_vol_points", None),
+        )
         sizing = sizer.compute_contracts(
             premium_price=signal.premium_reference,
             capital_available_ars=self._capital_available_ars(strategy_tag),
+            conviction_multiplier=conviction_multiplier,
         )
         if not sizing.is_tradeable:
             logger.info("Señal %s descartada por sizing (%s).", signal.symbol, sizing.rejected_reason)
@@ -1948,6 +2036,26 @@ class GgalOptionsBot:
                 side="buy", reason=f"sizing_not_tradeable: {sizing.rejected_reason}",
             )
             return
+
+        # Presupuesto PREVENTIVO de Griegas (MEJORA 2026-09-28, ver
+        # config.RiskConfig.enable_preemptive_greeks_budget y
+        # risk/risk_manager.py::RiskManager.projected_greeks_breach): a
+        # diferencia del chequeo de arriba (totales YA vigentes ANTES de
+        # esta entrada), esto proyecta los totales CON la cantidad real ya
+        # sizeada (sizing.contracts) sumada - se ubica DESPUES del sizing a
+        # proposito, porque recien aca se conoce la cantidad real.
+        if SETTINGS.risk.enable_preemptive_greeks_budget and quote.greeks is not None:
+            added_greeks = {k: v * sizing.contracts for k, v in quote.greeks.items()}
+            breach = rm.projected_greeks_breach(
+                totals, added_greeks, SETTINGS.risk.preemptive_greeks_budget_fraction,
+            )
+            if breach is not None:
+                logger.info("Señal %s descartada por presupuesto preventivo de Griegas: %s", signal.symbol, breach)
+                self.position_event_journal.log_event(
+                    "REJECT", symbol=signal.symbol, strategy_tag=strategy_tag,
+                    side="buy", reason=f"greeks_budget_preemptive: {breach}",
+                )
+                return
 
         state = self.mid_price_exec.submit(
             symbol=signal.symbol, book=quote.book, side=OrderSide.BUY, quantity=sizing.contracts,

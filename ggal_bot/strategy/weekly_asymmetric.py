@@ -115,13 +115,34 @@ from datetime import date, datetime
 from typing import Dict, List, Optional
 
 from ggal_bot.config import SETTINGS
-from ggal_bot.data.option_chain import OptionChain, OptionQuote
+from ggal_bot.data.option_chain import OptionChain, OptionQuote, OrderBookSnapshot
 from ggal_bot.data.technical_analysis import MomentumShift, Trend
 from ggal_bot.models.black_scholes import OptionType
 from ggal_bot.models.microstructure import passes_obi_filter
 from ggal_bot.models.volatility_surface import VolatilitySurface
 from ggal_bot.portfolio.portfolio import Portfolio
 from ggal_bot.risk.risk_manager import RiskManager
+
+
+def _estimate_execution_cost_pct(
+    book: OrderBookSnapshot, impact_coefficient: float = 0.02,
+) -> Optional[float]:
+    """
+    Estimacion de costo de ejecucion (MEJORA 2026-09-28, ver
+    config.LongFirstConfig.enable_execution_cost_filter), como fraccion de
+    la prima (mid): mitad del spread relativo (lo que se paga siempre al
+    cruzar al ask desde el mid) mas un termino de impacto que crece cuando
+    el tamaño de punta mostrado (ask_size) es chico - proxy de cuanto se
+    moveria el precio si el tamaño realmente operado excede lo mostrado,
+    NO una medicion exacta (ver LIMITACION en config.py: al momento del
+    scan todavia no se conoce la cantidad final de contratos). None si el
+    book no tiene mid valido (bid/ask invalidos).
+    """
+    if book.mid <= 0 or book.ask_size <= 0:
+        return None
+    half_spread_pct = (book.spread / 2.0) / book.mid
+    impact_pct = impact_coefficient / book.ask_size
+    return half_spread_pct + impact_pct
 
 
 @dataclass
@@ -214,6 +235,9 @@ class EntryScanDiagnostics:
     blocked_by_delta_band: int = 0      # ver config.LongFirstConfig.enable_delta_band_filter
     evaluated_for_dislocation: int = 0  # llegaron al chequeo de smile (pasaron todos los filtros anteriores)
     blocked_by_dislocation: int = 0     # llegaron pero no alcanzaron el umbral vigente (normal o extremo bajo NEUTRAL)
+    blocked_by_zscore: int = 0          # MEJORA 2026-09-28: ver config.LongFirstConfig.enable_zscore_filter
+    blocked_by_execution_cost: int = 0  # MEJORA 2026-09-28: ver config.LongFirstConfig.enable_execution_cost_filter
+    blocked_by_earnings_blackout: int = 0  # MEJORA 2026-09-28: ver config.LongFirstConfig.enable_earnings_blackout
     qualified: int = 0                  # generaron EntrySignal
     trend: str = ""
     closest_miss_symbol: Optional[str] = None
@@ -238,6 +262,9 @@ class WeeklyAsymmetricStrategy:
         hv_estimate: Optional[float] = None,
         trend: str = Trend.NEUTRAL.value,
         momentum_shift: Optional[str] = None,
+        dislocation_zscore: Optional[Dict[str, float]] = None,
+        earnings_blackout: bool = False,
+        adr_ccl_trend: Optional[str] = None,
     ) -> List[EntrySignal]:
         """
         `trend`: lectura vigente de data.technical_analysis.get_daily_trend_signal()
@@ -256,9 +283,38 @@ class WeeklyAsymmetricStrategy:
         smile (el mismo que ya rige bajo NEUTRAL) en vez del normal - se
         relaja la prohibicion estricta sin resignar la disciplina de
         tendencia (ver docstring del modulo y config.TechnicalAnalysisConfig).
+
+        `dislocation_zscore` (MEJORA 2026-09-28, ver
+        config.LongFirstConfig.enable_zscore_filter y
+        data/dislocation_history.py::DislocationHistoryTracker): dict
+        {symbol: z-score} ya calculado por el llamador (mismo patron de
+        inyeccion que `trend` - este modulo sigue sin guardar ningun estado
+        propio). Con el flag apagado (default), este parametro se ignora
+        por completo.
+
+        `earnings_blackout` (MEJORA 2026-09-28, ver
+        config.LongFirstConfig.enable_earnings_blackout): True bloquea
+        TODA entrada nueva de este scan (calculado por el llamador contra
+        `earnings_dates`/`earnings_blackout_days_before` - este modulo no
+        conoce ninguna fecha de calendario, solo el booleano ya resuelto).
+
+        `adr_ccl_trend` (MEJORA 2026-09-28, HYPOTHESIS no verificada, ver
+        config.LongFirstConfig.enable_adr_ccl_filter): lectura direccional
+        externa opcional ("BULLISH"|"BEARISH"|"NEUTRAL", mismo formato que
+        `trend`) derivada del ADR (NYSE:GGAL) y el dolar CCL implicito -
+        este modulo NO la calcula ni la obtiene, solo la consume si el
+        llamador la inyecta. Cuando esta habilitado y discrepa de `trend`
+        para un `option_type` dado, exige el umbral EXTREMO en vez del
+        normal (mismo patron que Momentum Shift), nunca bloquea de plano.
         """
         cfg = self.cfg
         ta_cfg = SETTINGS.technical_analysis
+
+        diag = EntryScanDiagnostics(total_quotes=len(surface.quotes), trend=trend)
+        if earnings_blackout and getattr(cfg, "enable_earnings_blackout", False):
+            diag.blocked_by_earnings_blackout = len(surface.quotes)
+            self.last_scan_diagnostics = diag
+            return []
 
         level_ok = True
         if cfg.require_level_confirmation and hv_estimate is not None:
@@ -281,6 +337,16 @@ class WeeklyAsymmetricStrategy:
             elif trend == Trend.BULLISH.value and momentum_shift == MomentumShift.EARLY_BEARISH_REVERSAL.value:
                 momentum_override_type = OptionType.PUT  # contrario a BULLISH
 
+        # ADR/CCL (MEJORA 2026-09-28, ver docstring de arriba y
+        # config.LongFirstConfig.enable_adr_ccl_filter): "lado natural" que
+        # esa lectura externa respalda, si esta habilitada y provista.
+        adr_ccl_supported_type: Optional[OptionType] = None
+        if getattr(cfg, "enable_adr_ccl_filter", False) and adr_ccl_trend:
+            if adr_ccl_trend == Trend.BULLISH.value:
+                adr_ccl_supported_type = OptionType.CALL
+            elif adr_ccl_trend == Trend.BEARISH.value:
+                adr_ccl_supported_type = OptionType.PUT
+
         def _smile_threshold_for(option_type: OptionType) -> Optional[float]:
             """
             Umbral de dislocacion de smile a exigir para `option_type` bajo
@@ -289,18 +355,31 @@ class WeeklyAsymmetricStrategy:
             reversion temprana que lo habilite).
             """
             if not ta_cfg.enabled:
-                return normal_threshold  # filtro tecnico desactivado por config: comportamiento pre-modulo
-            if trend == Trend.BULLISH.value:
+                threshold = normal_threshold  # filtro tecnico desactivado por config: comportamiento pre-modulo
+            elif trend == Trend.BULLISH.value:
                 if option_type is OptionType.CALL:
-                    return normal_threshold
-                return extreme_threshold if momentum_override_type is option_type else None
-            if trend == Trend.BEARISH.value:
+                    threshold = normal_threshold
+                else:
+                    return extreme_threshold if momentum_override_type is option_type else None
+            elif trend == Trend.BEARISH.value:
                 if option_type is OptionType.PUT:
-                    return normal_threshold
-                return extreme_threshold if momentum_override_type is option_type else None
-            return extreme_threshold  # NEUTRAL
+                    threshold = normal_threshold
+                else:
+                    return extreme_threshold if momentum_override_type is option_type else None
+            else:
+                threshold = extreme_threshold  # NEUTRAL
 
-        diag = EntryScanDiagnostics(total_quotes=len(surface.quotes), trend=trend)
+            # ADR/CCL discrepa de `trend` para este option_type: endurece a
+            # extremo en vez de bloquear - nunca afloja nada (si `threshold`
+            # ya era extreme_threshold via NEUTRAL/momentum override, esto
+            # no lo cambia).
+            if (
+                adr_ccl_supported_type is not None
+                and adr_ccl_supported_type is not option_type
+                and threshold < extreme_threshold
+            ):
+                threshold = extreme_threshold
+            return threshold
 
         candidates: List[EntrySignal] = []
         for q in surface.quotes:
@@ -388,9 +467,38 @@ class WeeklyAsymmetricStrategy:
             if not level_ok:
                 continue
 
+            # Filtro de dislocacion RELATIVA por z-score (MEJORA 2026-09-28,
+            # ver docstring de arriba y config.LongFirstConfig.
+            # enable_zscore_filter): SE SUMA al umbral fijo de arriba, nunca
+            # lo reemplaza - una base ya paso smile_threshold_vol_points en
+            # puntos absolutos, esto exige ADEMAS que sea anomala contra su
+            # propia ventana reciente. Sin historia suficiente todavia
+            # (z is None) se descarta por este filtro (ausencia de
+            # informacion nunca abre riesgo nuevo), igual que cualquier
+            # otro filtro de calidad de este metodo.
+            if getattr(cfg, "enable_zscore_filter", False):
+                z = (dislocation_zscore or {}).get(q.symbol)
+                if z is None or z > -cfg.zscore_threshold:
+                    diag.blocked_by_zscore += 1
+                    continue
+
             premium = q.book.mid
             if premium <= 0:
                 continue
+
+            # Costo de ejecucion estimado (MEJORA 2026-09-28, ver docstring
+            # de config.LongFirstConfig.enable_execution_cost_filter):
+            # descarta una base cuyo costo esperado de cruzar el spread +
+            # impacto por tamaño de punta chico ya se comeria una fraccion
+            # relevante de la prima, aunque la dislocacion de IV sea real.
+            if getattr(cfg, "enable_execution_cost_filter", False):
+                execution_cost_pct = _estimate_execution_cost_pct(
+                    q.book, impact_coefficient=cfg.execution_cost_impact_coefficient,
+                )
+                if execution_cost_pct is None or execution_cost_pct > cfg.execution_cost_max_pct:
+                    diag.blocked_by_execution_cost += 1
+                    continue
+
             greeks = q.greeks or {}
             convexity_score = (abs(greeks.get("gamma", 0.0)) + abs(greeks.get("vega", 0.0)) / 100.0) / premium
 

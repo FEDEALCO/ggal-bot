@@ -73,20 +73,62 @@ class PositionSizer:
         )
         self.min_contracts = min_contracts if min_contracts is not None else cfg.min_contracts_per_trade
 
+        # --- Sizing por CONVICCION de la señal (MEJORA 2026-09-28, ver
+        # config.LongFirstConfig.enable_conviction_sizing) --- getattr()
+        # defensivo: esta clase la reusan otras estrategias (ver
+        # ScalpingConfig, que hoy no tiene estos campos) pasando un `cfg`
+        # distinto de SETTINGS.long_first en teoria - aunque hoy siempre se
+        # construye contra SETTINGS.long_first (self.cfg no se guarda), este
+        # patron evita un AttributeError si eso cambiara.
+        self.conviction_sizing_enabled = getattr(cfg, "enable_conviction_sizing", False)
+        self.conviction_sizing_reference_vol_points = getattr(
+            cfg, "conviction_sizing_reference_vol_points", None,
+        ) or getattr(cfg, "smile_threshold_vol_points", None)
+        self.conviction_sizing_min_multiplier = getattr(cfg, "conviction_sizing_min_multiplier", 1.0)
+        self.conviction_sizing_max_multiplier = getattr(cfg, "conviction_sizing_max_multiplier", 1.0)
+
+    def conviction_multiplier_for(self, iv_dislocation_vol_points: Optional[float]) -> float:
+        """
+        Multiplicador de capital asignado en funcion de la magnitud de la
+        dislocacion de IV que motivo la señal (ver docstring de
+        config.LongFirstConfig.enable_conviction_sizing). 1.0 (no-op,
+        idem sizing actual) si el flag esta apagado, si no hay dislocacion
+        provista, o si no hay una referencia valida contra la cual escalar.
+        """
+        if not self.conviction_sizing_enabled or iv_dislocation_vol_points is None:
+            return 1.0
+        reference = self.conviction_sizing_reference_vol_points
+        if not reference or reference <= 0:
+            return 1.0
+        raw_multiplier = abs(iv_dislocation_vol_points) / reference
+        return max(self.conviction_sizing_min_multiplier, min(self.conviction_sizing_max_multiplier, raw_multiplier))
+
     def compute_contracts(
         self,
         premium_price: float,
         capital_available_ars: Optional[float] = None,
         max_risk_pct_override: Optional[float] = None,
+        conviction_multiplier: float = 1.0,
     ) -> SizingResult:
         """
         `capital_available_ars`: capital LIBRE actual (capital total menos
         lo ya comprometido en posiciones abiertas), si el llamador lo
         trackea (ej. run_bot.py deduciendo lo ya usado esta semana). Si se
         omite, se asume el capital maximo configurado completo.
+
+        `conviction_multiplier` (MEJORA 2026-09-28, ver
+        conviction_multiplier_for() arriba): escala el capital asignado a
+        ESTE trade especifico. Default 1.0 (comportamiento identico al de
+        antes de esta mejora para cualquier llamador que no lo pase) -
+        nunca se acota aca de nuevo (ya viene acotado de
+        conviction_multiplier_for si el llamador lo uso), pero un valor
+        negativo o cero se trata como "sin asignacion" (mismo criterio que
+        una prima invalida), nunca como asignar capital negativo.
         """
         if premium_price is None or premium_price <= 0:
             return SizingResult(0, 0.0, 0.0, 0.0, rejected_reason="prima_invalida")
+        if conviction_multiplier <= 0:
+            return SizingResult(0, 0.0, 0.0, 0.0, rejected_reason="conviction_multiplier_invalido")
 
         capital_base = capital_available_ars if capital_available_ars is not None else self.max_capital_ars
         # Nunca por encima del techo configurado, aunque el llamador pase un
@@ -94,7 +136,7 @@ class PositionSizer:
         capital_base = max(0.0, min(capital_base, self.max_capital_ars))
 
         risk_pct = max_risk_pct_override if max_risk_pct_override is not None else self.max_risk_pct_per_trade
-        capital_allocated = capital_base * risk_pct
+        capital_allocated = capital_base * risk_pct * conviction_multiplier
 
         cost_per_contract = premium_price * self.option_multiplier
         if cost_per_contract <= 0:
