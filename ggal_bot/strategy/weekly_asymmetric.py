@@ -206,6 +206,52 @@ class ExitSignal:
 
 
 @dataclass
+class CandidateFunnelRecord:
+    """
+    Un registro POR CANDIDATA evaluada en un scan_entry_signals() (MEJORA
+    2026-09-29, a pedido explicito del usuario: "logger de embudo
+    estructurado (universo completo de candidatas por ciclo con spread,
+    profundidad, griegas, delta y que filtros paso cada una)"). Opt-in
+    (ver LongFirstConfig.enable_signal_funnel_log, default False) - cuando
+    esta apagado, `EntryScanDiagnostics.candidate_funnel` queda vacio y
+    esta clase no se instancia, sin ningun costo adicional sobre el
+    comportamiento pre-existente (EntryScanDiagnostics agregado, sin
+    detalle por candidata, sigue calculandose exactamente igual).
+
+    `blocked_at`: nombre del PRIMER filtro que descarto esta candidata
+    (mismo orden secuencial que los contadores de EntryScanDiagnostics,
+    ver el bucle de scan_entry_signals) o None si califico (genero
+    EntrySignal). Como los filtros son secuenciales con "continue"
+    temprano, "que filtros paso" = todos los anteriores a `blocked_at` en
+    ese mismo orden - no hace falta un dict aparte por filtro.
+
+    Todos los campos de mercado/griegas vienen DIRECTO de OptionQuote/
+    OrderBookSnapshot en el momento de la evaluacion - nunca se fabrica un
+    valor: si `q.greeks`/`q.iv` todavia no estaban calculados este ciclo,
+    quedan en None tal cual.
+    """
+    symbol: str
+    option_type: str
+    strike: float
+    expiry: Optional[date]
+    days_business: int
+    spot_ref: Optional[float]
+    bid: Optional[float]
+    ask: Optional[float]
+    bid_size: Optional[float]
+    ask_size: Optional[float]
+    spread_abs: Optional[float]
+    spread_relative: Optional[float]
+    iv: Optional[float]
+    delta: Optional[float]
+    gamma: Optional[float]
+    vega: Optional[float]
+    theta: Optional[float]
+    dislocation_vol_points: Optional[float]
+    blocked_at: Optional[str]  # None = califico (qualified)
+
+
+@dataclass
 class EntryScanDiagnostics:
     """
     Diagnostico PURO de scan_entry_signals(): NO cambia ningun umbral ni
@@ -245,6 +291,7 @@ class EntryScanDiagnostics:
     closest_miss_dislocation: Optional[float] = None          # dislocation real observada (mas negativo = mas barata)
     closest_miss_threshold_required: Optional[float] = None   # -smile_threshold exigido para esa opcion puntual
     closest_miss_shortfall_vol_points: Optional[float] = None  # cuanto le falto en puntos de vol (siempre >= 0)
+    candidate_funnel: List[CandidateFunnelRecord] = field(default_factory=list)  # ver LongFirstConfig.enable_signal_funnel_log
 
 
 class WeeklyAsymmetricStrategy:
@@ -329,6 +376,23 @@ class WeeklyAsymmetricStrategy:
         diag = EntryScanDiagnostics(total_quotes=len(surface.quotes), trend=trend)
         if earnings_blackout and getattr(cfg, "enable_earnings_blackout", False):
             diag.blocked_by_earnings_blackout = len(surface.quotes)
+            if getattr(cfg, "enable_signal_funnel_log", False):
+                for q in surface.quotes:
+                    greeks = q.greeks or {}
+                    bid, ask = q.book.bid, q.book.ask
+                    spread_abs = (ask - bid) if (ask is not None and bid is not None) else None
+                    mid = q.book.mid
+                    diag.candidate_funnel.append(CandidateFunnelRecord(
+                        symbol=q.symbol, option_type=getattr(q.option_type, "value", q.option_type),
+                        strike=q.strike, expiry=q.expiry, days_business=q.days_business,
+                        spot_ref=q.spot_ref, bid=bid, ask=ask,
+                        bid_size=q.book.bid_size, ask_size=q.book.ask_size,
+                        spread_abs=spread_abs,
+                        spread_relative=(spread_abs / mid) if (spread_abs is not None and mid) else None,
+                        iv=q.iv, delta=greeks.get("delta"), gamma=greeks.get("gamma"),
+                        vega=greeks.get("vega"), theta=greeks.get("theta"),
+                        dislocation_vol_points=None, blocked_at="earnings_blackout",
+                    ))
             self.last_scan_diagnostics = diag
             return []
 
@@ -397,11 +461,36 @@ class WeeklyAsymmetricStrategy:
                 threshold = extreme_threshold
             return threshold
 
+        funnel_enabled = getattr(cfg, "enable_signal_funnel_log", False)
+
+        def _funnel_record(q, blocked_at: Optional[str], dislocation_value: Optional[float] = None) -> CandidateFunnelRecord:
+            greeks = q.greeks or {}
+            bid, ask = q.book.bid, q.book.ask
+            spread_abs = (ask - bid) if (ask is not None and bid is not None) else None
+            mid = q.book.mid
+            spread_relative = (spread_abs / mid) if (spread_abs is not None and mid) else None
+            return CandidateFunnelRecord(
+                symbol=q.symbol, option_type=getattr(q.option_type, "value", q.option_type),
+                strike=q.strike, expiry=q.expiry, days_business=q.days_business,
+                spot_ref=q.spot_ref, bid=bid, ask=ask,
+                bid_size=q.book.bid_size, ask_size=q.book.ask_size,
+                spread_abs=spread_abs, spread_relative=spread_relative,
+                iv=q.iv,
+                delta=greeks.get("delta"), gamma=greeks.get("gamma"),
+                vega=greeks.get("vega"), theta=greeks.get("theta"),
+                dislocation_vol_points=dislocation_value, blocked_at=blocked_at,
+            )
+
+        def _record_block(q, stage: str) -> None:
+            if funnel_enabled:
+                diag.candidate_funnel.append(_funnel_record(q, blocked_at=stage))
+
         candidates: List[EntrySignal] = []
         for q in surface.quotes:
             smile_threshold = _smile_threshold_for(q.option_type)
             if smile_threshold is None:
                 diag.blocked_by_direction += 1
+                _record_block(q, "direction")
                 continue  # filtro direccional tecnico: bajo BULLISH/BEARISH sin reversion temprana, ni se evalua
 
             # Horizonte de entrada: nunca se abre una posicion que exceda el
@@ -413,6 +502,7 @@ class WeeklyAsymmetricStrategy:
             # que tan lejano sea su vencimiento.
             if cfg.max_holding_business_days is not None and q.days_business > cfg.max_holding_business_days:
                 diag.blocked_by_holding_days += 1
+                _record_block(q, "holding_days")
                 continue
 
             # Piso de vencimiento minimo (MEJORA 2026-09-17, ver
@@ -425,6 +515,7 @@ class WeeklyAsymmetricStrategy:
             min_days_to_expiry = getattr(cfg, "min_business_days_to_expiry_for_entry", None)
             if min_days_to_expiry is not None and q.days_business < min_days_to_expiry:
                 diag.blocked_by_min_days_to_expiry += 1
+                _record_block(q, "min_days_to_expiry")
                 continue
 
             # Weekend theta guard coordinado con la entrada (FIX 2026-09-29,
@@ -448,11 +539,13 @@ class WeeklyAsymmetricStrategy:
                 )
             ):
                 diag.blocked_by_weekend_entry_guard += 1
+                _record_block(q, "weekend_entry_guard")
                 continue
 
             volume = recent_volumes.get(q.symbol, 0.0)
             if not self.risk_manager.check_liquidity(q.book, volume):
                 diag.blocked_by_liquidity += 1
+                _record_block(q, "liquidity")
                 continue
 
             # Confirmacion de microestructura (ver models/microstructure.py):
@@ -462,13 +555,16 @@ class WeeklyAsymmetricStrategy:
             # aislada/iliquida en un libro tan delgado como el de GGAL).
             if cfg.enable_obi_filter and not passes_obi_filter(q.book, cfg.min_obi_for_entry):
                 diag.blocked_by_obi += 1
+                _record_block(q, "obi")
                 continue
 
             if not q.spot_ref or q.spot_ref <= 0:
+                _record_block(q, "invalid_spot_ref")
                 continue
             log_moneyness = math.log(q.strike / q.spot_ref)
             if abs(log_moneyness) > cfg.moneyness_band_pct:
                 diag.blocked_by_moneyness += 1
+                _record_block(q, "moneyness")
                 continue  # fuera de la banda ATM/OTM cercana (convexidad objetivo)
 
             # Filtro ADICIONAL por banda de delta (MEJORA 2026-09-17, ver
@@ -483,6 +579,7 @@ class WeeklyAsymmetricStrategy:
                 delta = abs((q.greeks or {}).get("delta", 0.0)) if q.greeks is not None else None
                 if delta is None or not (cfg.delta_band_min <= delta <= cfg.delta_band_max):
                     diag.blocked_by_delta_band += 1
+                    _record_block(q, "delta_band")
                     continue
 
             diag.evaluated_for_dislocation += 1
@@ -502,8 +599,12 @@ class WeeklyAsymmetricStrategy:
                     diag.closest_miss_dislocation = dislocation
                     diag.closest_miss_threshold_required = -smile_threshold
                     diag.closest_miss_shortfall_vol_points = shortfall
+                if funnel_enabled:
+                    diag.candidate_funnel.append(_funnel_record(q, blocked_at="dislocation", dislocation_value=dislocation))
                 continue  # no esta "barata" (o no lo suficiente bajo NEUTRAL): NUNCA se genera señal de venta para abrir
             if not level_ok:
+                if funnel_enabled:
+                    diag.candidate_funnel.append(_funnel_record(q, blocked_at="level_confirmation", dislocation_value=dislocation))
                 continue
 
             # Filtro de dislocacion RELATIVA por z-score (MEJORA 2026-09-28,
@@ -519,10 +620,14 @@ class WeeklyAsymmetricStrategy:
                 z = (dislocation_zscore or {}).get(q.symbol)
                 if z is None or z > -cfg.zscore_threshold:
                     diag.blocked_by_zscore += 1
+                    if funnel_enabled:
+                        diag.candidate_funnel.append(_funnel_record(q, blocked_at="zscore", dislocation_value=dislocation))
                     continue
 
             premium = q.book.mid
             if premium <= 0:
+                if funnel_enabled:
+                    diag.candidate_funnel.append(_funnel_record(q, blocked_at="invalid_premium", dislocation_value=dislocation))
                 continue
 
             # Costo de ejecucion estimado (MEJORA 2026-09-28, ver docstring
@@ -536,6 +641,8 @@ class WeeklyAsymmetricStrategy:
                 )
                 if execution_cost_pct is None or execution_cost_pct > cfg.execution_cost_max_pct:
                     diag.blocked_by_execution_cost += 1
+                    if funnel_enabled:
+                        diag.candidate_funnel.append(_funnel_record(q, blocked_at="execution_cost", dislocation_value=dislocation))
                     continue
 
             greeks = q.greeks or {}
@@ -557,6 +664,8 @@ class WeeklyAsymmetricStrategy:
                 days_business_to_expiry=q.days_business, convexity_score=convexity_score,
                 trend_context=trend,
             ))
+            if funnel_enabled:
+                diag.candidate_funnel.append(_funnel_record(q, blocked_at=None, dislocation_value=dislocation))
 
         candidates.sort(key=lambda s: s.convexity_score, reverse=True)
         diag.qualified = len(candidates)

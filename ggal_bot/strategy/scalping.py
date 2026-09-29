@@ -119,11 +119,24 @@ class ScalpingStrategy:
             return candidates
 
         filtered: List[EntrySignal] = []
+        rejected_symbols: set = set()
         for candidate in candidates:
             book = order_books.get(candidate.symbol)
             if book is None or not passes_min_ask_depth(book, self.cfg.min_ask_size_for_entry):
+                rejected_symbols.add(candidate.symbol)
                 continue  # profundidad de ASK insuficiente para garantizar fill inmediato (ver microstructure.py)
             filtered.append(candidate)
+
+        # Reconcilia el embudo detallado (ver LongFirstConfig/ScalpingConfig.
+        # enable_signal_funnel_log): el filtro de profundidad de ASK de arriba
+        # es EXCLUSIVO de scalping, corre DESPUES del scan generico de
+        # WeeklyAsymmetricStrategy - una candidata que ese scan marco
+        # "blocked_at=None" (calificada) pero que este filtro descarta no
+        # deberia quedar registrada como calificada en el CSV del embudo.
+        if self.last_scan_diagnostics is not None and rejected_symbols:
+            for record in self.last_scan_diagnostics.candidate_funnel:
+                if record.blocked_at is None and record.symbol in rejected_symbols:
+                    record.blocked_at = "min_ask_depth"
         return filtered
 
     def build_exit_signals(

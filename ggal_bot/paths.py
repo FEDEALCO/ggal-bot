@@ -56,5 +56,15 @@ KILL_SWITCH_STATE_FILE = STATE_DIR / "kill_switch.json"
 # archivo es lo que permite, de ahora en mas, backtestear offline.
 MARKET_SNAPSHOT_LOG = LOGS_DIR / "market_snapshots.csv"
 
+# MEJORA 2026-09-29 (a pedido explicito del usuario, prioridad de despliegue
+# junto con MARKET_SNAPSHOT_LOG de arriba - ver REPORT.md §12.3/§12.5 punto 5
+# y ggal_bot/data/signal_funnel_log.py): embudo detallado de candidatas de
+# entrada por ciclo (universo completo, con spread/profundidad/griegas y que
+# filtro la descarto) - opt-in via LongFirstConfig/ScalpingConfig.
+# enable_signal_funnel_log, apagado por defecto. Archivo NUEVO, mismo
+# criterio que los de arriba (nunca se agregan columnas a un CSV de
+# produccion ya existente).
+SIGNAL_FUNNEL_LOG = LOGS_DIR / "signal_funnel.csv"
+
 for _dir in (LOGS_DIR, STATE_DIR, DATA_DIR):
     _dir.mkdir(parents=True, exist_ok=True)

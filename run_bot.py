@@ -42,6 +42,7 @@ from ggal_bot.models.volatility_surface import VolatilitySurface
 from ggal_bot.portfolio.portfolio import Portfolio, Position
 from ggal_bot.portfolio.event_journal import PositionEventJournal
 from ggal_bot.data.market_snapshot_log import MarketSnapshotLogger
+from ggal_bot.data.signal_funnel_log import SignalFunnelLogger
 from ggal_bot.data.dislocation_history import DislocationHistoryTracker
 from ggal_bot.portfolio.reconciliation import (
     ReconciliationUnavailable,
@@ -401,6 +402,15 @@ class GgalOptionsBot:
         # arriba y _warn_positions_without_valid_quote): es la base para
         # poder backtestear offline cualquier mejora futura.
         self.market_snapshot_log = MarketSnapshotLogger()
+
+        # -- Embudo de señales (MEJORA 2026-09-29, ver
+        # ggal_bot/data/signal_funnel_log.py y REPORT.md §12.3/§12.5 punto 5) -
+        # instanciado SIEMPRE (igual que market_snapshot_log arriba), pero solo
+        # escribe filas cuando LongFirstConfig/ScalpingConfig.
+        # enable_signal_funnel_log esta prendido (candidate_funnel viene vacio
+        # si no, ver weekly_asymmetric.py::scan_entry_signals) - costo cero
+        # con el flag apagado (default).
+        self.signal_funnel_log = SignalFunnelLogger()
 
         # -- Kill switch centralizado (Fase 5.3, ver ggal_bot/risk/kill_switch.py) --
         self.kill_switch = KillSwitch()
@@ -1342,6 +1352,9 @@ class GgalOptionsBot:
                 )
                 if self.strategy.last_scan_diagnostics is not None:
                     entry_diagnostics_by_expiry[expiry] = self.strategy.last_scan_diagnostics
+                    self.signal_funnel_log.log_funnel(
+                        "weekly_asymmetric", self.strategy.last_scan_diagnostics.candidate_funnel, now=now,
+                    )
                 all_signals.extend(entry_signals)
                 for es in entry_signals:
                     logger.info(
@@ -1530,6 +1543,10 @@ class GgalOptionsBot:
             entry_signals = self.scalping_strategy.scan_entry_signals(
                 surface, self._recent_volumes, order_books, trend=trend, now=now,
             )
+            if self.scalping_strategy.last_scan_diagnostics is not None:
+                self.signal_funnel_log.log_funnel(
+                    "scalping", self.scalping_strategy.last_scan_diagnostics.candidate_funnel, now=now,
+                )
             for es in entry_signals:
                 if open_scalping_positions >= SETTINGS.scalping.max_concurrent_positions:
                     break

@@ -1198,6 +1198,94 @@ def test_scan_entry_signals_diagnostics_identify_earlier_filter_as_bottleneck():
     assert diag.closest_miss_symbol is None  # nunca se llego a medir dislocacion
 
 
+def test_scan_entry_signals_funnel_log_disabled_by_default_leaves_candidate_funnel_empty():
+    """
+    Regresion de costo: LongFirstConfig.enable_signal_funnel_log default
+    False (ver REPORT.md SS12.5 punto 5) - con el flag apagado,
+    candidate_funnel debe quedar VACIO sin importar cuantas candidatas se
+    evaluen, para que el costo adicional sea cero salvo activacion
+    explicita.
+    """
+    cfg = _default_config()
+    assert cfg.enable_signal_funnel_log is False
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    spot = 5200.0
+    quotes = [
+        _quote("GFGC4900O", 4900, 0.60, spot, days_biz=3),
+        _quote("GFGC5050O", 5050, 0.57, spot, days_biz=3),
+        _quote("GFGC5200O", 5200, 0.45, spot, days_biz=3),   # calificaria
+        _quote("GFGC5350O", 5350, 0.57, spot, days_biz=3),
+        _quote("GFGC5500O", 5500, 0.60, spot, days_biz=3),
+    ]
+    surface = VolatilitySurface(quotes)
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+    )
+    assert any(s.symbol == "GFGC5200O" for s in signals)  # comportamiento sin cambios
+    assert strategy.last_scan_diagnostics.candidate_funnel == []
+
+
+def test_scan_entry_signals_funnel_log_enabled_records_one_row_per_candidate_with_market_data():
+    """
+    Con el flag activado, candidate_funnel debe tener EXACTAMENTE una fila
+    por cotizacion del universo (total_quotes), con blocked_at=None para la
+    que califico y el nombre del filtro real para las que no - y los datos
+    de mercado/spread de la fila deben venir de la cotizacion real, no
+    fabricados.
+    """
+    cfg = _default_config(enable_signal_funnel_log=True, moneyness_band_pct=0.03)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    spot = 5200.0
+    quotes = [
+        _quote("GFGC4900O", 4900, 0.60, spot, days_biz=3, bid=90.0, ask=110.0),  # fuera de moneyness
+        _quote("GFGC5050O", 5050, 0.57, spot, days_biz=3),
+        _quote("GFGC5200O", 5200, 0.45, spot, days_biz=3, bid=98.0, ask=102.0),  # target: califica
+        _quote("GFGC5350O", 5350, 0.57, spot, days_biz=3),
+        _quote("GFGC5500O", 5500, 0.60, spot, days_biz=3, bid=90.0, ask=110.0),  # fuera de moneyness
+    ]
+    surface = VolatilitySurface(quotes)
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+    )
+    assert any(s.symbol == "GFGC5200O" for s in signals)
+
+    funnel = strategy.last_scan_diagnostics.candidate_funnel
+    assert len(funnel) == len(quotes) == 5
+    by_symbol = {r.symbol: r for r in funnel}
+
+    qualified = by_symbol["GFGC5200O"]
+    assert qualified.blocked_at is None
+    assert qualified.bid == 98.0 and qualified.ask == 102.0
+    assert qualified.spread_abs == 4.0
+    assert abs(qualified.spread_relative - (4.0 / 100.0)) < 1e-9
+    assert qualified.iv == 0.45
+    assert qualified.dislocation_vol_points is not None
+
+    out_of_band = by_symbol["GFGC4900O"]
+    assert out_of_band.blocked_at == "moneyness"
+    assert out_of_band.bid == 90.0 and out_of_band.ask == 110.0
+    assert out_of_band.dislocation_vol_points is None  # nunca llego a ese chequeo
+
+
+def test_scan_entry_signals_funnel_log_records_blocked_by_direction():
+    """`blocked_at="direction"` para el option_type contrario a la tendencia, sin reversion de momentum."""
+    cfg = _default_config(enable_signal_funnel_log=True)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    spot = 5200.0
+    quotes = [
+        _quote("GFGV5150O", 5150, 0.45, spot, days_biz=3, option_type=OptionType.PUT),
+        _quote("GFGC4900O", 4900, 0.57, spot, days_biz=3),
+        _quote("GFGC5500O", 5500, 0.57, spot, days_biz=3),
+    ]
+    surface = VolatilitySurface(quotes)
+    strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH",
+    )
+    funnel = {r.symbol: r for r in strategy.last_scan_diagnostics.candidate_funnel}
+    assert funnel["GFGV5150O"].blocked_at == "direction"
+    assert funnel["GFGV5150O"].option_type == "put"
+
+
 def test_scan_entry_signals_technical_filter_disabled_ignores_trend():
     """Con GGAL_BOT_TECHNICAL_FILTER_ENABLED=false, el comportamiento debe ser identico al de antes de este modulo."""
     original_enabled = SETTINGS.technical_analysis.enabled
@@ -2400,6 +2488,9 @@ ALL_TESTS = [
     test_conviction_multiplier_without_valid_reference_is_one,
     test_compute_contracts_applies_conviction_multiplier_to_allocated_capital,
     test_compute_contracts_rejects_non_positive_conviction_multiplier,
+    test_scan_entry_signals_funnel_log_disabled_by_default_leaves_candidate_funnel_empty,
+    test_scan_entry_signals_funnel_log_enabled_records_one_row_per_candidate_with_market_data,
+    test_scan_entry_signals_funnel_log_records_blocked_by_direction,
 ]
 
 

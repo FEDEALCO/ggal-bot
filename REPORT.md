@@ -34,7 +34,7 @@ CERO costo de cruce de spread).**
 |---|---|---:|---:|---:|---:|
 | `weekly_asymmetric` | 2026-09-09 a 2026-09-25 (17 días) | 199 | **-86.637** | **-720.770** | 731,9% |
 | `scalping` | 2026-09-11 a 2026-09-25 (15 días) | 214 | **+188.246** | **-53.796** | 128,6% |
-| `vol_arbitrage` | 2026-09-04 a 2026-09-25 (22 días) | 577 | **-698.093** | **-1.879.222** | 169,2% |
+| `vol_arbitrage` 🔴 **INVALIDADO (ver §12.0)** | 2026-09-04 a 2026-09-25 (22 días) | ~~577~~ | ~~-698.093~~ | ~~-1.879.222~~ | ~~169,2%~~ |
 
 `scalping` es la única de las tres con PnL **bruto** positivo, pero el costo regulatorio mínimo
 (comisión + derecho de mercado + IVA, ~1,7% round-trip sobre el nocional, sin siquiera contar
@@ -413,13 +413,18 @@ pequeña, no se puede concluir con confianza que el horizonte corto sea sistemá
 ### 4.4 Tiempo de tenencia
 
 Ya cubierto en gran parte por el hallazgo de §4.0 (weekly_asymmetric: 196/199 trades duran menos
-de 1 hora, casi todos por el patrón de entrada-de-viernes). Para `vol_arbitrage`: 506/577 trades
-(87,7%) duran menos de 1 hora (+233.177 ARS sum, la única categoría de tenencia positiva), mientras
-que las posiciones sostenidas más de 3 días (23 trades) concentran la mayor pérdida individual
-(-640.490 ARS, -27.847 ARS/trade medio) — consistente con la hipótesis de exposición direccional no
-cubierta de §4.2: cuanto más tiempo sostenida la posición, más tiempo expuesta a la baja sostenida
-de GGAL. Ver §10.A para el corte específico ganadoras vs. perdedoras (tenencia y PnL bruto por
-grupo), agregado a pedido del usuario como diagnóstico previo a proponer un esquema de salida.
+de 1 hora, casi todos por el patrón de entrada-de-viernes).
+
+**🔴 INVALIDADO (ver §12.0) — todo el párrafo de `vol_arbitrage` de abajo usa el export N=577
+contaminado, retirado:** ~~Para `vol_arbitrage`: 506/577 trades (87,7%) duran menos de 1 hora
+(+233.177 ARS sum, la única categoría de tenencia positiva), mientras que las posiciones sostenidas
+más de 3 días (23 trades) concentran la mayor pérdida individual (-640.490 ARS, -27.847 ARS/trade
+medio) — consistente con la hipótesis de exposición direccional no cubierta de §4.2: cuanto más
+tiempo sostenida la posición, más tiempo expuesta a la baja sostenida de GGAL.~~ Con la muestra
+corregida (N=8 confirmados), no hay suficientes trades para medir ningún corte por tiempo de
+tenencia — queda como DATA INSUFFICIENT. Ver §10.A para el corte específico ganadoras vs.
+perdedoras (tenencia y PnL bruto por grupo), agregado a pedido del usuario como diagnóstico previo a
+proponer un esquema de salida — mismo alcance de invalidación, ver la nota en esa sección.
 
 ### 4.5 Hora de entrada (ART, UTC-3)
 
@@ -627,20 +632,20 @@ con los datos ya reconstruidos (`attribution.winner_loser_holding_profile`, nuev
 |---|---|---|---|---:|---:|---:|
 | weekly_asymmetric | 75 / 72 | 0,4 min | 0,4 min | +1.514 | -2.780 | 0,54 |
 | scalping | 102 / 77 | 0,3 min | 0,7 min | +2.633 | -1.043 | **2,52** |
-| vol_arbitrage | 244 / 230 | 0,4 min | 0,7 min | +2.880 | -6.090 | **0,47** |
+| `vol_arbitrage` 🔴 **INVALIDADO (ver §12.0)** | ~~244 / 230~~ | ~~0,4 min~~ | ~~0,7 min~~ | ~~+2.880~~ | ~~-6.090~~ | ~~**0,47**~~ |
 
-**Lectura, con cuidado de no sobre-interpretar:** la mediana de tenencia está dominada por el enorme
-volumen de trades de segundos (el patrón de §4.0 en `weekly_asymmetric`; una dinámica intradía
-similar parece predominar también en `scalping`/`vol_arbitrage` — HYPOTHESIS, no confirmado con la
-misma profundidad que §4.0). Por eso la mediana global no es muy informativa por sí sola. La señal
-más clara está en la COLA: `vol_arbitrage` tiene el peor payoff bruto (0,47 — las perdedoras pierden
-más del doble de lo que ganan las ganadoras) Y su bucket de tenencia >3 días ya identificado en §4.4
-concentra la peor pérdida promedio (-27.847 ARS/trade) — consistente con "deja correr las
-perdedoras" en la cola larga, aunque la mediana global no lo muestre. `scalping`, en cambio, ya tiene
-un payoff bruto FAVORABLE (2,52) — no muestra el patrón, y un esquema de salida asimétrico
-probablemente le aporte menos que a las otras dos. `weekly_asymmetric` está demasiado confundida por
-el patrón de §4.0 para sacar una conclusión limpia sobre esto en particular hasta que se corrija esa
-entrada.
+**🔴 La fila de `vol_arbitrage` de arriba usa el export N=577 contaminado — retirada.** Con la
+muestra corregida (N=8), no hay suficiente evidencia para calcular un payoff ganadora/perdedora
+confiable en ninguna dirección — queda como DATA INSUFFICIENT, no como "0,47" ni ningún otro valor.
+
+**Lectura, con cuidado de no sobre-interpretar (ahora limitada a `weekly_asymmetric`/`scalping`):**
+la mediana de tenencia está dominada por el enorme volumen de trades de segundos (el patrón de §4.0
+en `weekly_asymmetric`; una dinámica intradía similar parece predominar también en `scalping` —
+HYPOTHESIS, no confirmado con la misma profundidad que §4.0). Por eso la mediana global no es muy
+informativa por sí sola. `scalping` ya tiene un payoff bruto FAVORABLE (2,52) — no muestra el
+patrón de "dejar correr las perdedoras", y un esquema de salida asimétrico probablemente le aporte
+menos que a `weekly_asymmetric`. `weekly_asymmetric` está demasiado confundida por el patrón de
+§4.0 para sacar una conclusión limpia sobre esto en particular hasta que se corrija esa entrada.
 
 **Propuesta de esquema (opt-in, parámetros iniciales a confirmar):**
 
@@ -804,17 +809,24 @@ total de `vol_arbitrage` — 577 trades, -698.093 ARS bruto.)
    algo que no se puede verificar con estos datos), la porción de la estrategia que SÍ se puede medir
    sin ningún supuesto ya es neta negativa por sí sola.
 
-**Recomendación explícita, con la evidencia disponible: apagar `vol_arbitrage`** (que de hecho ya
-está en NO-GO de producción desde 2026-09-08, solo corre en shadow — ver docstring de
-`VolArbitrageConfig`). Un stop de tiempo (`max_holding_business_days` en 1, 2 o 3) es una mejora de
-riesgo real y recomendable igual (reduce la cola de pérdidas grandes, ver punto 1), pero **no
-alcanza para convertir la estrategia en neta positiva** con la evidencia de esta muestra — la fuente
-del problema no es únicamente la cola de trades largos, sino que la mayoría silenciosa de trades
-cortos ya pierde neto por costos sobre un edge bruto casi nulo (-16 a -78 ARS/trade, ver tabla).
-Antes de reconsiderar esto, haría falta el mismo tipo de evidencia nueva que para `weekly_asymmetric`
-(§4.0): datos post-fix, con Griegas reales por trade (para poder separar edge real de exposición
-direccional no cubierta, hipótesis ya planteada en §4.2) — es decir, depende del mismo despliegue de
-`market_snapshots.csv` + logger de embudo que ya es prioridad de Fase 1.
+**🔴 Recomendación INVALIDADA (ver §12.0) — no se sostiene con la evidencia de esta sección:**
+~~apagar `vol_arbitrage`~~ ~~(que de hecho ya está en NO-GO de producción desde 2026-09-08, solo
+corre en shadow — ver docstring de `VolArbitrageConfig`). Un stop de tiempo
+(`max_holding_business_days` en 1, 2 o 3) es una mejora de riesgo real y recomendable igual (reduce
+la cola de pérdidas grandes, ver punto 1), pero **no alcanza para convertir la estrategia en neta
+positiva** con la evidencia de esta muestra — la fuente del problema no es únicamente la cola de
+trades largos, sino que la mayoría silenciosa de trades cortos ya pierde neto por costos sobre un
+edge bruto casi nulo (-16 a -78 ARS/trade, ver tabla).~~
+
+**Estado real de `vol_arbitrage`, con la muestra corregida: N=8 trades confirmados — sin evidencia
+en ninguna dirección** (ni para mantenerla apagada por esta razón, ni para reactivarla). Los N=8
+dan PnL bruto +47.070 ARS con 0 rupturas de stop (ver §12.2), pero N=8 no alcanza para concluir
+nada — es simplemente insuficiente. `vol_arbitrage` sigue en NO-GO de producción por decisión del
+usuario (2026-09-29: "de acuerdo, queda apagada, no inviertas más tiempo en mejorarla"), **no**
+porque esta sección lo demuestre. Antes de poder medir esto de verdad, haría falta el mismo tipo de
+evidencia nueva que para `weekly_asymmetric` (§4.0): datos post-fix, con Griegas reales por trade —
+depende del mismo despliegue de `market_snapshots.csv` + logger de embudo que ya es prioridad de
+Fase 1 (ver §12.3 y §5 del pedido del usuario, ítem 5 de esta ronda).
 
 **Reproducibilidad:** `ggal_bot.backtest.run_vol_arbitrage_holding_cutoff_analysis()`, 0 tests
 nuevos de lógica de negocio propia (reutiliza `metrics.build_strategy_report` ya testeado) + 6 tests
@@ -1024,3 +1036,111 @@ existentes de `attribute_by_option_type_and_direction` y `premium_stop_breach_re
 la ronda anterior, `ggal_bot/validation/test_backtest_attribution.py`) se reutilizaron tal cual
 sobre los subconjuntos corregidos — no se escribió lógica de negocio nueva para esta sección, sólo
 el filtrado de contaminación.
+
+---
+
+## 13. Ronda 2026-09-29 (cuarta) — fix de `classify_strategy()`, doble conteo, invalidaciones, delta hedging y logger de embudo
+
+### 13.0 ¿El PnL Total del dashboard cuenta dos veces los trades mal etiquetados?
+
+**Respuesta corta: el KPI "PnL Total" en vivo del dashboard NO duplica nada — es una sola pasada
+FIFO sobre `shadow_trades.csv`.** Verificado por lectura de código:
+`dashboard/app.py` llama `pe.match_trades_fifo(fills)` UNA sola vez sobre el DataFrame completo de
+fills; cada fill se consume una sola vez en esa cola FIFO, sin importar qué `strategy` se le
+etiquete después (la etiqueta es un campo agregado post-hoc para mostrar/filtrar, no una partición
+que vuelva a correr el FIFO). `compute_summary()` suma sobre esa misma lista `closed_trades` una
+sola vez. El bug de `classify_strategy()` nunca duplicó ni omitió un fill — solo le puso la etiqueta
+equivocada.
+
+**Donde SÍ hay doble conteo real, cuantificado: si se suman los DOS EXPORTS por separado**
+(`export.csv`, generado por el mismo mecanismo `match_trades_fifo` pero export/filtrado aparte, y
+`export-lifecycle.csv`, generado por un mecanismo completamente distinto — el event journal). Estos
+dos archivos comparten 411 trades reales (197 de `weekly_asymmetric` + 214 de `scalping`) que
+aparecen una vez en cada uno:
+
+| | N | PnL bruto (ARS) |
+|---|---:|---:|
+| Duplicado en ambos exports (weekly_asymmetric) | 197 | -109.998 |
+| Duplicado en ambos exports (scalping) | 214 | +188.246 |
+| **Total que se cuenta DOS VECES si se suman los exports por separado** | **411** | **+78.248** |
+
+Si alguien sumara PnL bruto de `export.csv` (-698.093, N=577) + PnL bruto de `weekly_asymmetric`
+desde `export-lifecycle.csv` (-86.637, N=199) + PnL bruto de `scalping` desde `export-lifecycle.csv`
+(+188.246, N=214), el resultado (-596.485) ya tiene +78.248 ARS de doble conteo adentro (-13,1% de
+esa suma ingenua) — exactamente el error que casi cometo yo mismo en el análisis de la ronda
+anterior antes de cruzar los datos fila por fila. **Esto ya no puede volver a pasar en el
+dashboard/exports en vivo**: con el fix de abajo, cada trade tiene una única etiqueta de estrategia
+real, nunca dos.
+
+### 13.1 Fix de `classify_strategy()` — ya commiteado
+
+Al ponerme a escribir el fix pedido, encontré que **ya existía, sin commitear, en el workspace**:
+`dashboard/pnl_engine.py::classify_strategy_from_journal()` — cruza cada fill contra
+`logs/position_events.csv` por `client_order_id` (match exacto, no heurística) y devuelve el
+`strategy_tag` real; un fill sin match (anterior al deploy del journal) se etiqueta
+`"unknown_legacy"`, nunca `"vol_arbitrage"` por default. Lo verifiqué línea por línea, confirmé que
+no tenía tests, y le agregué 6 tests de regresión nuevos (incluida la regresión directa del bug
+real) antes de commitearlo — ver commit `4a64b22`. `dashboard/app.py` ya usaba la función nueva para
+las tablas "Cerradas"/"Abiertas" y el filtro de estrategia de la barra lateral. Suite completa:
+484/484 antes de este commit, todos verdes.
+
+### 13.2 Delta hedging: ¿las patas de cobertura quedan registradas?
+
+**Sí — verificado por lectura de código, no hace falta agregar ningún registro nuevo.**
+`DeltaHedgingEngine.execute_hedge()` (`ggal_bot/strategy/delta_hedger.py`) llama a
+`MidPriceExecutionEngine.submit()`, que llama a `self.order_gateway.send(request, ...)` — el MISMO
+`OrderGateway`/`ShadowAuditLogger` que cualquier otra orden de entrada/salida. En shadow mode, esto
+escribe un fill real en `logs/shadow_trades.csv` con el símbolo del subyacente — exactamente lo que
+`classify_strategy()`/`classify_strategy_from_journal()` ya reconocen como `"delta_hedge"` (chequeo
+`_is_underlying_symbol`, el primero en el orden de esa función, independiente del event journal). Lo
+que NO está registrado es el hedge en el Position Lifecycle Event Journal
+(`logs/position_events.csv`) — `_maybe_hedge()`/`execute_hedge()` nunca llaman a
+`position_event_journal.log_event()` (confirmado por grep: esas llamadas están únicamente en el
+código de entrada/salida de `weekly_asymmetric`/`scalping`) — pero esto no hace falta para
+clasificar el hedge, que ya se resuelve por símbolo antes de mirar el journal.
+
+**Lo que me falta para reconstruir el PnL combinado estrategia + cobertura de la ventana: el CSV
+`export.csv` que tengo excluye por completo las filas `"delta_hedge"`** (el `Counter` de su columna
+`Estrategia` da 577/577 = `"vol_arbitrage"`, cero filas de subyacente) — no sé si eso es porque el
+script que lo generó filtra por estrategia antes de exportar, o porque de casualidad no hubo
+rebalanceos en esa ventana (poco probable con `enable_delta_hedge` default `True`). **Para responder
+esto con datos reales hace falta uno de estos dos archivos: `logs/shadow_trades.csv` completo (el
+insumo crudo), o un re-export de `export.csv` que NO filtre por estrategia (que incluya las filas
+`delta_hedge`).** Sin eso, es DATA INSUFFICIENT — no lo voy a aproximar.
+
+### 13.3 Invalidaciones en REPORT.md — ya aplicadas
+
+Se marcaron con 🔴 **INVALIDADO** (tachado, no borrado) todos los números que dependían del export
+N=577 contaminado: la fila `vol_arbitrage` de la tabla de §3, el párrafo de `vol_arbitrage` en
+§4.4, la fila y lectura de `vol_arbitrage` en §10.A (payoff bruto 0,47 retirado), y la recomendación
+final de §11 (reemplazada por "N=8, sin evidencia en ninguna dirección" — ver §12 para el detalle
+completo). `vol_arbitrage` sigue en NO-GO de producción por decisión explícita del usuario, no
+porque estas secciones lo demuestren.
+
+### 13.4 Logger de embudo de señales — implementado, con tests, listo para desplegar junto con `market_snapshots.csv`
+
+**Nuevo módulo `ggal_bot/data/signal_funnel_log.py::SignalFunnelLogger`**, mismo patrón que
+`MarketSnapshotLogger`: un CSV append-only (`logs/signal_funnel.csv`) con una fila POR CANDIDATA
+evaluada en cada `scan_entry_signals()` (`weekly_asymmetric` y `scalping`, que reusa el mismo scan
+por composición) — símbolo, tipo, strike, vencimiento, spot, bid/ask/tamaños de punta/spread
+absoluto y relativo, IV, delta/gamma/vega/theta, dislocación de smile (si se llegó a calcular), y
+`blocked_at`: el nombre del PRIMER filtro que descartó esa candidata ese ciclo (vacío si calificó).
+Como los filtros son secuenciales con corte temprano, "qué filtros pasó" queda implícito en el orden
+(todos los anteriores a `blocked_at`, mismo orden que `EntryScanDiagnostics`).
+
+**Opt-in, costo cero apagado (default):** `LongFirstConfig.enable_signal_funnel_log` /
+`ScalpingConfig.enable_signal_funnel_log` (`GGAL_BOT_ENABLE_SIGNAL_FUNNEL_LOG` /
+`GGAL_BOT_SCALPING_ENABLE_SIGNAL_FUNNEL_LOG`, ambas `False` por default) — con el flag apagado,
+`EntryScanDiagnostics.candidate_funnel` queda vacío, ni siquiera se instancian los registros.
+Activarlas junto con el redeploy que confirme `market_snapshots.csv` es lo que pidió el usuario.
+Para scalping se reconcilia además su filtro EXCLUSIVO de profundidad de ASK (que corre después del
+scan genérico): una candidata que calificó en el scan base pero que scalping descarta por
+profundidad queda marcada `blocked_at="min_ask_depth"`, no como calificada.
+
+**14 tests nuevos** (3 en `test_long_first_mode.py`: flag apagado deja el embudo vacío, registro
+completo con datos de mercado reales por candidata, `blocked_at="direction"`; 3 en
+`test_scalping_mode.py`: flag apagado, reconciliación de rechazo por profundidad de ASK, calificada
+cuando la profundidad alcanza; 7 en `test_signal_funnel_log.py`, nuevo archivo, mismo patrón que
+`test_market_snapshot_log.py` + 1 para el header). Suite completa tras este cambio: 497/497 (pytest
+`ggal_bot/validation/`). Pendiente del lado del usuario: activar los dos env vars en Northflank y
+confirmar que `logs/signal_funnel.csv` empieza a crecer junto con `market_snapshots.csv`.

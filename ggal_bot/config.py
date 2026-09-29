@@ -891,6 +891,27 @@ class LongFirstConfig:
         "GGAL_BOT_WEEKEND_THETA_GUARD_BLOCK_NEW_ENTRIES", False
     )
 
+    # --- Logger de embudo de señales (MEJORA 2026-09-29, ver REPORT.md §12.3 y
+    # §12.5 punto 5) ---
+    # A pedido explicito del usuario ("logger de embudo estructurado: universo
+    # completo de candidatas por ciclo con spread, profundidad, griegas, delta
+    # y que filtros paso cada una"), prioridad de despliegue junto con
+    # market_snapshots.csv. Hasta esta mejora, `_log_entry_scan_diagnostics_if_due`
+    # (run_bot.py) solo logueaba un RESUMEN AGREGADO por logger.info() (conteos
+    # por filtro, nunca persistido) - suficiente para responder "¿cuantas se
+    # descartaron por moneyness?" pero no "¿CUALES, con que spread/griegas
+    # exactas, y en que orden de filtros?" - lo segundo es lo que hace falta
+    # para poder recalibrar un umbral offline sin esperar dias de shadow.
+    # Opt-in, default False: cuando esta activo, scan_entry_signals() llena
+    # EntryScanDiagnostics.candidate_funnel (ver weekly_asymmetric.py,
+    # CandidateFunnelRecord) con UN registro POR CANDIDATA evaluada este ciclo
+    # (calificada o no, con el nombre del primer filtro que la descarto);
+    # run_bot.py persiste esa lista a logs/signal_funnel.csv via
+    # ggal_bot.data.signal_funnel_log.SignalFunnelLogger, analogo a
+    # MarketSnapshotLogger. Con el flag apagado, el costo adicional es CERO
+    # (candidate_funnel queda vacio, ni siquiera se instancian los registros).
+    enable_signal_funnel_log: bool = _env_bool("GGAL_BOT_ENABLE_SIGNAL_FUNNEL_LOG", False)
+
     # --- Salida forzada, medida sobre la PRIMA pagada (no sobre el subyacente) ---
     stop_loss_pct: float = _env_float("GGAL_BOT_STOP_LOSS_PCT", 0.50)     # -50% de la prima -> cerrar
     take_profit_pct: float = _env_float("GGAL_BOT_TAKE_PROFIT_PCT", 1.00)  # +100% de la prima -> cerrar
@@ -1390,6 +1411,12 @@ class ScalpingConfig:
     # no el tamaño ABSOLUTO de la punta que la orden va a levantar).
     enable_min_ask_depth_filter: bool = _env_bool("GGAL_BOT_SCALPING_ENABLE_MIN_ASK_DEPTH_FILTER", True)
     min_ask_size_for_entry: float = _env_float("GGAL_BOT_SCALPING_MIN_ASK_SIZE", 30.0)
+
+    # Mismo mecanismo que LongFirstConfig.enable_signal_funnel_log (mismo
+    # nombre de atributo, scan_entry_signals es generico sobre self.cfg) -
+    # env var propia para poder activar el embudo detallado de scalping
+    # independientemente del de weekly_asymmetric. Default False.
+    enable_signal_funnel_log: bool = _env_bool("GGAL_BOT_SCALPING_ENABLE_SIGNAL_FUNNEL_LOG", False)
 
     # --- Salida forzada sobre la PRIMA (ver risk.risk_manager.RiskManager.
     # evaluate_scalping_exit) - umbrales mas ajustados que weekly_asymmetric

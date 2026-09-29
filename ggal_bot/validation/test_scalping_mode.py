@@ -481,6 +481,49 @@ def test_scan_entry_signals_missing_order_book_is_treated_as_failing_depth():
     assert signals == []
 
 
+def test_scan_entry_signals_funnel_log_disabled_by_default_leaves_candidate_funnel_empty():
+    cfg = _scalping_config(min_ask_size_for_entry=10.0)
+    assert cfg.enable_signal_funnel_log is False
+    strategy = ScalpingStrategy(_lenient_risk_manager(), config=cfg)
+    surface = _cheap_calls_surface()
+    order_books = {q.symbol: q.book for q in surface.quotes}
+    strategy.scan_entry_signals(surface, {}, order_books, trend="BULLISH")
+    assert strategy.last_scan_diagnostics.candidate_funnel == []
+
+
+def test_scan_entry_signals_funnel_log_reconciles_ask_depth_rejection():
+    """
+    Regresion especifica de scalping (ver strategy/scalping.py, bloque
+    "Reconcilia el embudo detallado"): GFGC6600O califica en el scan
+    generico de WeeklyAsymmetricStrategy (blocked_at=None) pero el filtro
+    de profundidad de ASK EXCLUSIVO de scalping lo descarta despues - el
+    embudo debe reflejar ese motivo real ("min_ask_depth"), no dejarlo
+    marcado como calificado.
+    """
+    cfg = _scalping_config(enable_signal_funnel_log=True, min_ask_size_for_entry=200.0)  # ask_size=50.0 en el fixture
+    strategy = ScalpingStrategy(_lenient_risk_manager(), config=cfg)
+    surface = _cheap_calls_surface()
+    order_books = {q.symbol: q.book for q in surface.quotes}
+    signals = strategy.scan_entry_signals(surface, {}, order_books, trend="BULLISH")
+    assert signals == []  # bloqueada por profundidad, igual que test_scan_entry_signals_ask_depth_filter_blocks_thin_book
+
+    funnel = {r.symbol: r for r in strategy.last_scan_diagnostics.candidate_funnel}
+    assert len(funnel) == 5
+    assert funnel["GFGC6600O"].blocked_at == "min_ask_depth"
+
+
+def test_scan_entry_signals_funnel_log_qualified_when_ask_depth_passes():
+    cfg = _scalping_config(enable_signal_funnel_log=True, min_ask_size_for_entry=10.0)
+    strategy = ScalpingStrategy(_lenient_risk_manager(), config=cfg)
+    surface = _cheap_calls_surface()
+    order_books = {q.symbol: q.book for q in surface.quotes}
+    signals = strategy.scan_entry_signals(surface, {}, order_books, trend="BULLISH")
+    assert any(s.symbol == "GFGC6600O" for s in signals)
+
+    funnel = {r.symbol: r for r in strategy.last_scan_diagnostics.candidate_funnel}
+    assert funnel["GFGC6600O"].blocked_at is None
+
+
 def test_scan_entry_signals_bearish_trend_only_considers_puts():
     cfg = _scalping_config(min_ask_size_for_entry=10.0)
     strategy = ScalpingStrategy(_lenient_risk_manager(), config=cfg)
@@ -857,6 +900,9 @@ ALL_TESTS = [
     test_scan_entry_signals_ask_depth_filter_allows_deep_book,
     test_scan_entry_signals_ask_depth_filter_disabled_ignores_depth,
     test_scan_entry_signals_missing_order_book_is_treated_as_failing_depth,
+    test_scan_entry_signals_funnel_log_disabled_by_default_leaves_candidate_funnel_empty,
+    test_scan_entry_signals_funnel_log_reconciles_ask_depth_rejection,
+    test_scan_entry_signals_funnel_log_qualified_when_ask_depth_passes,
     test_scan_entry_signals_bearish_trend_only_considers_puts,
     test_scan_entry_signals_diagnostics_exposed_from_base_scanner,
     test_scan_entry_signals_feeds_iv_tracker_even_for_filtered_quotes,
