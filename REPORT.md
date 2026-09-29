@@ -58,6 +58,20 @@ ventana — **N insuficiente para concluir nada sobre la estrategia real** (ni a
 La fila de arriba sigue siendo el registro fiel de lo que pasó; la sección §4.0 explica por qué casi
 todo ese resultado es ruido de un bug de coordinación, no una medición de la estrategia en sí.
 
+**🔴 ACTUALIZACIÓN 2026-09-29 (segunda) — la fila de `vol_arbitrage` de arriba (N=577,
+PnL bruto -698.093) está CONTAMINADA y debe tratarse como RETRACTADA.** Se encontró un bug real en
+`dashboard/pnl_engine.py::classify_strategy()` que etiqueta **todo** trade de opciones (sin
+importar qué estrategia lo abrió) como `"vol_arbitrage"`. De los 577 trades del export, 411 (197 +
+214) son duplicados exactos de trades ya contados en `weekly_asymmetric` y `scalping`
+respectivamente, y de los 166 restantes, 158 son de un período anterior a que existiera ningún
+mecanismo para verificar su estrategia real. Sólo **8 trades** pueden atribuirse a `vol_arbitrage`
+con confianza razonable, con PnL bruto **+47.070 ARS** (positivo, no negativo). Ver **§12** para el
+detalle completo, el alcance del bug (no afecta el riesgo en vivo, sólo el reporting/dashboard) y
+qué queda pendiente de verificar. **Todas las cifras de `vol_arbitrage` en §3, §4 y §11 de este
+documento deben leerse con esta salvedad** — no se corrigieron línea por línea todavía porque
+requieren rehacer el pipeline completo con la muestra corregida; §12 es la fuente de verdad
+mientras tanto.
+
 ---
 
 ## 1. Alcance de la Fase 0
@@ -429,12 +443,16 @@ retroactiva sobre trades nuevos. Queda como pendiente explícito, no descartado 
 
 ## 5. Interpretación por estrategia
 
-**`weekly_asymmetric`**: PnL bruto ligeramente negativo (-86.637 ARS / -435 ARS promedio/trade), pero
-esto **no** es un edge bruto uniformemente marginal — es la suma de un problema estructural
-identificado y cuantificado en §4.0 (194/199 trades son entradas de viernes auto-liquidadas por
-`weekend_theta_guard`, -609.077 ARS netos de costo por ~cero edge bruto) más un solo trade de stop
-loss grande (-84.929 ARS) y exposición direccional no cubierta en el resto (§4.2). El costo
-regulatorio (~1,7% round-trip) agrava todo lo anterior pero no es la causa raíz.
+**`weekly_asymmetric`**: PnL bruto ligeramente negativo (-86.637 ARS / -435 ARS promedio/trade) en la
+muestra cruda, pero esto **no** es un edge bruto uniformemente marginal ni una medición limpia de la
+estrategia — es casi enteramente un problema estructural identificado, cuantificado y **corregido**
+en §4.0: **196/199 trades (98,5%) eran entradas de viernes auto-liquidadas por
+`weekend_theta_guard`** (-618.472 ARS netos de costo por apenas +7.129 ARS de edge bruto, ~86% del
+PnL neto negativo total). El fix ya está implementado (opt-in, `weekend_theta_guard_block_new_entries`,
+ver §4.0/§9 punto 0) y, al excluir ese patrón, solo quedan **3 trades reales** en toda la ventana —
+insuficiente para evaluar la estrategia en sí (ni a favor ni en contra). El costo regulatorio
+(~1,7% round-trip) agravaba todo lo anterior pero nunca fue la causa raíz — la causa raíz era la
+falta de coordinación entre entrada y guard, ya resuelta.
 
 **`scalping`**: única con PnL bruto positivo (+188.246 ARS / +880 ARS promedio/trade) y sin ningún
 patrón problemático en §4 (motivo de salida, moneyness y DTE muestran edge bruto positivo en casi
@@ -710,6 +728,17 @@ sección de resultados/limitaciones en REPORT.md.
 
 ## 11. Item 1 (ronda 2026-09-29) — corte por tiempo de tenencia, solo `vol_arbitrage`
 
+**🔴 ADVERTENCIA (agregada tras el hallazgo de §12): toda esta sección usa el export N=577 que
+está contaminado — ver §12.** Los 577 trades incluyen 411 duplicados de `scalping`/
+`weekly_asymmetric` mal etiquetados y 158 trades de atribución desconocida (anteriores a que
+existiera forma de verificar su estrategia real); sólo 8 trades del export son atribuibles a
+`vol_arbitrage` con confianza. La recomendación de mantener `vol_arbitrage` apagada (§12 más abajo)
+se sostiene igual, pero por otro motivo (N=8 es insuficiente para concluir nada, no porque la
+muestra contaminada muestre una pérdida grande) — la lectura de "cola larga concentra el 98,7% de
+la pérdida" de abajo describe la mezcla de estrategias, no a `vol_arbitrage` en particular. Se deja
+la sección original sin reescribir (evidencia real de lo que el pipeline calculó ese día) pero no
+debe citarse como una medición de `vol_arbitrage`.
+
 **Pedido del usuario:** stop por tiempo (probar máximo de tenencia de 1, 2 y 3 días hábiles) + stop
 de pérdida en unidades de la prima, para `vol_arbitrage` únicamente. Si no da neta positiva en el
 escenario base, recomendar apagar la estrategia.
@@ -791,3 +820,207 @@ direccional no cubierta, hipótesis ya planteada en §4.2) — es decir, depende
 nuevos de lógica de negocio propia (reutiliza `metrics.build_strategy_report` ya testeado) + 6 tests
 nuevos de las funciones de corte en `attribution.py`. CSV completo:
 `fase0_vol_arbitrage_holding_cutoffs.csv`, adjunto en esta conversación.
+
+---
+
+## 12. Ronda 2026-09-29 (tercera) — bug de contaminación en el export de `vol_arbitrage`, y los dos chequeos pedidos ("antes que cualquier otra cosa")
+
+### 12.0 🔴 Hallazgo nuevo: `dashboard/pnl_engine.py::classify_strategy()` etiqueta TODO trade de
+### opciones como `"vol_arbitrage"`, sin importar qué estrategia lo abrió
+
+**VERIFICADO por lectura directa de código, no hipótesis.** `dashboard/pnl_engine.py` (líneas
+179-182):
+
+```python
+def classify_strategy(symbol: str) -> str:
+    if _is_underlying_symbol(symbol):
+        return "delta_hedge"
+    return "vol_arbitrage"
+```
+
+Esta función clasifica cualquier símbolo de opción como `"vol_arbitrage"` — no distingue si esa
+posición la abrió realmente `weekly_asymmetric`, `scalping` o `vol_arbitrage`. Se usa dentro de
+`match_trades_fifo()` (línea 278), que procesa el DataFrame completo de fills (las tres
+estrategias mezcladas) y es la función que arma tanto el CSV de "cierres reconstruidos"
+(`export.csv`, el que el usuario adjuntó como `vol_arbitrage`) como las tablas "Cierres" y
+"Posiciones abiertas" del dashboard Streamlit en vivo (`dashboard/app.py` líneas 104-107, 246-249,
+274-277) — **incluido el filtro de estrategia de la barra lateral** (línea 62), que por este bug
+sólo puede mostrar `"vol_arbitrage"` o `"delta_hedge"` como opciones para cualquier vista basada en
+`match_trades_fifo` (nunca `"weekly_asymmetric"` ni `"scalping"`, aunque esas estrategias sí operen
+opciones).
+
+**Impacto cuantificado (verificado por comparación fila a fila, clave = símbolo + hora de apertura
++ hora de cierre + PnL bruto redondeado):**
+
+| Subconjunto del export `vol_arbitrage` (N=577) | N | Cómo se identificó |
+|---|---:|---|
+| Duplicado exacto de un trade de `scalping` (lifecycle journal) | 214 | 100% de los 214 trades de `scalping` reaparecen acá, mal etiquetados |
+| Duplicado exacto de un trade de `weekly_asymmetric` (lifecycle journal) | 197 | 99% de los 199 trades de `weekly_asymmetric` reaparecen acá, mal etiquetados |
+| No aparece en el lifecycle journal, abierto **antes** de que existiera (`event_journal.py`, desplegado 2026-09-07 17:05 UTC, commit `b3397fd`) | 158 | Atribución **DATA INSUFFICIENT** — no hay manera de verificar con qué estrategia corrió el bot en ese período desde este entorno (no tengo acceso a Northflank ni al historial de variables de entorno) |
+| No aparece en el lifecycle journal, abierto **después** de que existiera | **8** | **Único subconjunto atribuible a `vol_arbitrage` con confianza razonable** — si hubiera sido `weekly_asymmetric`/`scalping`, el journal ya lo habría capturado |
+
+Por qué `vol_arbitrage` nunca aparece en el lifecycle journal aunque sí haya corrido: es **por
+diseño**, no un bug adicional — `run_bot.py` (comentario explícito, líneas ~663-677) documenta que
+bajo modo `"vol_arbitrage"` el bot deliberadamente no declara ningún `strategy_tag` gestionado. Eso
+es consistente con lo ya sabido (`Position.strategy_tag=None` se trata "por convención" como
+`weekly_asymmetric` en `reconciliation.py`) y es la razón de fondo por la que hasta ahora el export
+de 577 filas parecía "vol_arbitrage puro": nunca hubo forma independiente de contrastarlo hasta
+ahora, cuando se lo cruzó explícitamente contra el lifecycle journal.
+
+**Lo que este bug NO afecta — verificado, no supuesto:** revisé `ggal_bot/ops/manual_close.py` y
+`ggal_bot/portfolio/reconciliation.py` (los otros dos usos de `match_trades_fifo` fuera del
+dashboard) y ninguno de los dos consume la lista `closed` (la que trae el campo `strategy`
+contaminado) — ambos descartan ese valor de retorno (`_closed, open_lots = match_trades_fifo(...)`)
+y trabajan únicamente con `open_lots` para reconstruir la posición neta abierta. `reconciliation.py`
+además fija `strategy_tag=None` explícitamente al crear cada `Position` (línea 272), sin leer nada
+de `classify_strategy()`. **Conclusión: este bug es un problema de reporting/dashboard, no de
+gestión de riesgo en vivo** — no corrompe qué posiciones ve el kill switch, el position sizing ni el
+delta hedger al arrancar el bot.
+
+**Lo que queda pendiente (no lo puedo cerrar desde este entorno):** confirmar con qué
+`GGAL_BOT_ACTIVE_STRATEGY` corrió Northflank durante 2026-09-01 a 2026-09-07 (la ventana de los 158
+trades de atribución desconocida) — eso es historial de configuración/deploy que sólo el usuario
+puede mirar (panel de Northflank o sus propios registros de cuándo cambió esa variable). Sin eso,
+esos 158 trades quedan como **DATA INSUFFICIENT**, ni a favor ni en contra de `vol_arbitrage`.
+
+**Recomendación de fix (no implementada todavía — pido confirmación antes de tocar
+`dashboard/pnl_engine.py`, que es código de producción activo):** la forma correcta de arreglar
+`classify_strategy()` es dejar de inferir la estrategia por símbolo y en cambio leer el
+`strategy_tag` real ya persistido por `ggal_bot/portfolio/event_journal.py` desde que existe
+(2026-09-07), cruzando por `position_id`/`contract_key` en vez de adivinar por ticker. Esto solo
+resuelve el problema hacia adelante (no puede reconstruir retroactivamente los 158 trades
+anteriores a esa fecha) pero evita que seguer acumulándose. Lo dejo como propuesta, no como cambio
+aplicado.
+
+### 12.1 Chequeo 1 — desglose call/put × compra/venta (usando la muestra corregida)
+
+**Primer resultado, estructural y verificado: la columna "Dirección" es constante = `long`
+(compra) en el 100% de los trades de las tres estrategias, en toda la muestra.** No existe ni un
+solo trade "vendido" (`short`) en ninguno de los exports — el eje "× compra/venta" que pidió el
+usuario **colapsa a sólo call/put**, porque no hay contraparte vendida con la que comparar. Esto en
+sí mismo es información: ninguna de las tres estrategias tal como operaron en este período abre
+posiciones cortas de opciones.
+
+| Estrategia (muestra) | Bucket | N | PnL bruto (ARS) | Win rate bruto |
+|---|---|---:|---:|---:|
+| `weekly_asymmetric` (N=199, confiable) | call_long | 199 | -86.637 | 37,7% |
+| `scalping` (N=214, confiable) | call_long | 166 | +58.286 | 42,2% |
+| `scalping` (N=214, confiable) | put_long | 48 | +129.960 | 66,7% |
+| `vol_arbitrage` CONFIRMADO (N=8) | call_long | 8 | +47.071 | 75,0% |
+| `vol_arbitrage` atribución DESCONOCIDA (N=158) | call_long | 158 | -823.412 | 39,2% |
+
+**Respuesta directa a la hipótesis del usuario ("si la pérdida se concentra en calls compradas
+durante la baja de GGAL"):** en `weekly_asymmetric`, el 100% de los trades son calls compradas
+porque esa es la única operación que la estrategia abre (Long-First, ver `weekly_asymmetric.py`) —
+no hay puts ni ventas con qué comparar, así que "la pérdida se concentra en calls compradas" es
+cierto pero trivialmente (es el 100% del universo, no un patrón dentro de una muestra mixta). Para
+`vol_arbitrage`, el subconjunto confirmado (N=8) también es 100% calls compradas y da PnL
+**positivo** — no hay evidencia, en la muestra confiable, de que las calls compradas sean el
+origen del problema. El bloque de -823.412 ARS en calls (N=158) pertenece al subconjunto de
+atribución desconocida — no se le puede atribuir a `vol_arbitrage` con la evidencia actual.
+
+**¿Estas estrategias cubren delta? — VERIFICADO por lectura de código.** Existe
+`ggal_bot/strategy/delta_hedger.py::DeltaHedgingEngine`, real y activo: cubre el delta agregado del
+portfolio completo (no por posición individual), sólo actúa cuando el delta neto supera una banda
+de tolerancia (`delta_band`, default 150, `GGAL_BOT_DELTA_NEUTRAL_THRESHOLD`) — cubre el exceso por
+encima de la banda, no lo lleva a cero — y se invoca en cada ciclo desde `run_bot.py`
+(`self._maybe_hedge(totals, spot)`, línea ~847) **independientemente de qué estrategia esté
+activa**, gateado por `RiskConfig.enable_delta_hedge` (default `True`). Es decir: sí existe
+cobertura de delta a nivel de portfolio agregado, con una banda de tolerancia deliberada (no busca
+delta-neutralidad perfecta). **Lo que NO se puede verificar con los datos de Fase 0:** los exports
+de trades no incluyen las patas de cobertura (compra/venta del subyacente que hace el hedger), así
+que no hay forma de medir, con estos datos, si la cobertura fue efectiva o insuficiente durante la
+baja de GGAL — **DATA INSUFFICIENT**, requeriría cruzar `market_snapshots.csv`/logs de hedging
+reales (ver 12.3).
+
+### 12.2 Chequeo 2 — efectividad del stop de -50% de la prima
+
+Alcance literal del pedido del usuario ("estrategias que usan `evaluate_position_exit`"): eso
+excluye a `scalping`, que usa `evaluate_scalping_exit()` (un método separado, con su propio
+`stop_loss_pct=25%` vía `GGAL_BOT_SCALPING_STOP_LOSS_PCT`) — se muestra igual como referencia.
+
+| Estrategia (muestra) | Umbral | N con % calculable | N que rompió el umbral | PnL de las que rompieron (ARS) | % del PnL perdedor que explican | Peor caso |
+|---|---:|---:|---:|---:|---:|---:|
+| `weekly_asymmetric` (N=199, confiable, usa `evaluate_position_exit`) | -50% | 199 | **0** | 0 | 0% | -42,5% |
+| `vol_arbitrage` CONFIRMADO (N=8, usa `evaluate_position_exit`) | -50% | 8 | **0** | 0 | 0% | -15,4% |
+| `vol_arbitrage` atribución DESCONOCIDA (N=158, informativo únicamente) | -50% | 158 | 6 | -681.053 | 62,5% | -70,4% (mediana entre las que rompieron: -67,7%) |
+
+**Conclusión sobre la muestra confiable (weekly_asymmetric N=199 + vol_arbitrage confirmado N=8,
+total 207 trades reales que usan `evaluate_position_exit`): el stop de -50% se está respetando en
+el 100% de los casos verificables — 0 rupturas.** Esto contradice lo que el export contaminado
+sugería (6/577 rupturas, "48,6% del PnL perdedor" citado en la ronda anterior) — ese número
+correspondía en gran parte a la mezcla contaminada del §12.0, no a trades atribuibles con
+confianza.
+
+El bloque de 6 rupturas (N=158, atribución desconocida) sigue siendo una señal real de que **en
+algún momento, para alguna estrategia**, el stop no cortó a tiempo — no se puede descartar sin más
+investigación. Mecanismo más probable, ya verificado en el código (`risk_manager.py::
+evaluate_position_exit`, línea ~122 en adelante): la función compara el PnL% de la prima contra el
+umbral en cada ciclo usando el ÚLTIMO precio conocido (`current_price`) — si el precio de la opción
+saltara entre una evaluación y la siguiente (iliquidez, gap de fin de semana, falta de punta
+vigente), el precio de cierre efectivamente ejecutado podría quedar más allá del -50% para cuando
+se detecta y se ejecuta el cierre. Esto es **SUPPORTED, no VERIFIED**: la fórmula de comparación en
+sí es correcta (leída línea por línea), pero no tengo snapshots de precio por ciclo para esos 6
+trades específicos que permitan confirmar "gap" vs. descartar un bug real de otro tipo — requeriría
+`market_snapshots.csv` con cobertura de esas fechas (ver 12.3).
+
+### 12.3 ¿`market_snapshots.csv` y el logger de embudo están desplegados en Northflank?
+
+**Respuesta honesta, sin poder confirmar el lado de Northflank desde este entorno (no tengo acceso
+a esa infraestructura):**
+
+- **`market_snapshots.csv`: el código YA está implementado y cableado en `run_bot.py`** desde el
+  commit `d38eea7` ("Mejoras 2026-09-28: persistencia de mercado..."), con columnas que ya incluyen
+  bid/ask/spread por instrumento — lo necesario para medir spread real. **Lo que no puedo verificar
+  desde acá es si Northflank ya redesplegó ese commit y si el archivo está efectivamente escribiendo
+  filas en producción ahora mismo** — eso requiere mirar el filesystem/logs del contenedor de
+  Northflank, algo fuera del alcance de esta sesión. **Acción para el usuario:** confirmar en
+  Northflank (shell del contenedor o panel de logs) que `logs/market_snapshots.csv` existe y crece.
+- **El "logger de embudo de señales" (registro estructurado y persistente de cada candidato
+  evaluado, con motivo de pase/rechazo por fila) NO EXISTE como archivo, todavía.** Lo único que
+  existe hoy es `_log_entry_scan_diagnostics_if_due()` en `run_bot.py`: líneas de `logger.info()`
+  con un resumen agregado (conteos), no persistidas a ningún CSV/DB, no quedan disponibles para
+  análisis posterior — se pierden en los logs efímeros del contenedor. Esto es un gap real y
+  distinto de `market_snapshots.csv`, y sigue pendiente de implementar.
+
+**Si `market_snapshots.csv` no está corriendo en Northflank, confirmo que es la prioridad número
+uno** — sin spread real medido, no hay forma de validar si `scalping` (que ya tiene payoff bruto
+positivo, el caso más prometedor de las tres) es viable neto, y todo lo demás (incluyendo el módulo
+B de rupturas) depende de tener costos reales, no supuestos, para juzgar viabilidad.
+
+### 12.4 Comisión IOL — escala Gold, ¿hay mínimo por orden?
+
+**VERIFICADO (búsqueda web, tarifario oficial de IOL + fuente cruzada independiente, 2026-09-29):**
+la escala Gold/Platinum/Black (0,5% / 0,3% / 0,1% según volumen mensual operado) ya coincide con lo
+modelado en `costs.py`. **No existe un mínimo de comisión en pesos para operaciones de
+compra/venta de acciones u opciones en el mercado secundario de BYMA** (el único mínimo documentado
+es de $50+IVA, pero aplica solo a suscripciones primarias de acciones — no al caso de GGAL_BOT — y
+un mínimo de USD 2+IVA que aplica solo a operaciones en mercado de EE.UU., tampoco el caso). **Con
+nocionales de ~66.000 ARS en scalping, no hay comisión mínima que pese sobre el modelo de costos ya
+usado** — no hace falta ningún ajuste a `costs.py` por este motivo.
+
+### 12.5 Decisiones del usuario — registradas, no requieren código nuevo todavía
+
+- **`GGAL_BOT_WEEKEND_THETA_GUARD_BLOCK_NEW_ENTRIES=true` en shadow:** el fix ya existe en el
+  código (opt-in, default `False`, ver §4.0/§9), con test de regresión. Activarlo es una variable de
+  entorno a setear en el deploy de Northflank del usuario — no requiere ningún cambio de código
+  adicional de mi parte. Pendiente: que el usuario la setee en su panel de Northflank y redespliegue.
+- **`vol_arbitrage` queda apagada, sin más inversión de tiempo salvo que sea gratis mantenerla en
+  shadow para acumular datos:** de acuerdo — no se escribió código nuevo para "mejorar"
+  `vol_arbitrage` esta ronda, sólo el análisis forense de arriba.
+- **Filtro de régimen MERVAL/CCL vía GD30/GD30C (AL30/AL30C como control), sin índice bancario:**
+  confirmado y alineado con la verificación de disponibilidad de datos de CCL ya hecha (ronda
+  anterior, vía `GD30`/`GD30C`) — se usará este diseño al construir el módulo B.
+
+### Reproducibilidad de esta sección
+
+Script ad-hoc (no guardado como archivo permanente, reutiliza únicamente funciones ya testeadas de
+`ggal_bot/backtest/reconstruct.py` y `ggal_bot/backtest/attribution.py`): carga
+`export-lifecycle.csv` vía `load_lifecycle_journal_rows` + `reconstruct_lifecycle_trades` filtrado
+por `weekly_asymmetric`/`scalping`, carga `export.csv` vía `load_closed_trades_export`, compara por
+clave `(symbol, opened_at, closed_at, round(pnl_gross_ars, 2))`, separa el resto por fecha de
+apertura contra el timestamp del commit `b3397fd` (despliegue de `event_journal.py`). Los tests
+existentes de `attribute_by_option_type_and_direction` y `premium_stop_breach_report` (agregados en
+la ronda anterior, `ggal_bot/validation/test_backtest_attribution.py`) se reutilizaron tal cual
+sobre los subconjuntos corregidos — no se escribió lógica de negocio nueva para esta sección, sólo
+el filtrado de contaminación.

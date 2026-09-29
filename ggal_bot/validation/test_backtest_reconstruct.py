@@ -223,6 +223,35 @@ def test_load_closed_trades_export_excludes_rows_with_inconsistent_pnl():
         path.unlink(missing_ok=True)
 
 
+def test_load_closed_trades_export_populates_direction_from_column():
+    """FIX 2026-09-29 (chequeo direccional §4.2): la columna 'Direccion' del export de cierres ahora se conserva en Trade.direction."""
+    path = _write_csv([
+        ["GFGC5000O", "vol_arbitrage", "long", "10", "2026-09-01 10:00:00", "2026-09-02 10:00:00", "100.0", "120.0", "20000", "20.0", "86400"],
+        ["GFGC5000O", "vol_arbitrage", "short", "10", "2026-09-01 10:00:00", "2026-09-02 10:00:00", "120.0", "100.0", "20000", "20.0", "86400"],
+    ], _CLOSED_HEADER)
+    try:
+        trades = load_closed_trades_export(path)
+        assert len(trades) == 2
+        assert trades[0].direction == "long"
+        assert trades[1].direction == "short"
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_reconstruct_lifecycle_trades_populates_direction_from_entry_side():
+    """FIX 2026-09-29 (chequeo direccional §4.2): 'Lado' de la primera pata de ENTRY se normaliza a long/short en Trade.direction."""
+    path = _write_csv([
+        ["2026-09-01T10:00:00+00:00", "ENTRY", "GFGC5000O", "weekly_asymmetric", "pos1", "k", "buy", "10", "10", "100.0", "entrada", ""],
+        ["2026-09-05T10:00:00+00:00", "CLOSE", "GFGC5000O", "weekly_asymmetric", "pos1", "k", "sell", "-10", "0", "120.0", "take_profit", ""],
+    ], _LIFECYCLE_HEADER)
+    try:
+        rows = load_lifecycle_journal_rows(path)
+        trades, _, _ = reconstruct_lifecycle_trades(rows)
+        assert trades[0].direction == "long"
+    finally:
+        path.unlink(missing_ok=True)
+
+
 ALL_TESTS = [
     test_load_lifecycle_journal_rows_maps_spanish_headers_and_sorts_chronologically,
     test_reconstruct_lifecycle_trades_simple_entry_and_close,
@@ -234,6 +263,8 @@ ALL_TESTS = [
     test_reconstruct_lifecycle_trades_ignores_reject_rows_without_position_id,
     test_load_closed_trades_export_parses_and_validates_pnl,
     test_load_closed_trades_export_excludes_rows_with_inconsistent_pnl,
+    test_load_closed_trades_export_populates_direction_from_column,
+    test_reconstruct_lifecycle_trades_populates_direction_from_entry_side,
 ]
 
 

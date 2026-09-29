@@ -185,6 +185,27 @@ def attribute_by_close_reason(trades: Sequence[Trade]) -> List[AttributionBucket
     return _bucketize(trades, lambda t: bucket_close_reason(t.close_reason) if t.close_reason is not None else None)
 
 
+def attribute_by_option_type_and_direction(trades: Sequence[Trade]) -> List[AttributionBucket]:
+    """
+    Corte pedido por el usuario (ronda 2026-09-29, hipotesis direccional de
+    §4.2): PnL bruto por call/put CRUZADO con compra/venta (t.direction,
+    "long"="compra"/"short"="venta" - ver reconstruct.Trade.direction,
+    poblado desde la columna "Direccion" del export de cierres de
+    vol_arbitrage o "Lado" de la ENTRY real del lifecycle journal). Bucket:
+    "call_long" / "call_short" / "put_long" / "put_short". Un trade sin
+    symbol parseable (parse_option_symbol devuelve None) o sin direction
+    conocida se excluye (DATA INSUFFICIENT), nunca se fuerza a un bucket.
+    """
+    def key_fn(t: Trade) -> Optional[str]:
+        parsed = parse_option_symbol(t.symbol)
+        if parsed is None or t.direction is None:
+            return None
+        option_type, _strike = parsed
+        return f"{option_type}_{t.direction}"
+
+    return _bucketize(trades, key_fn)
+
+
 _MONEYNESS_BUCKET_EDGES = (-0.05, -0.02, 0.02, 0.05)  # limites de moneyness_pct (positivo = ITM)
 
 
@@ -383,6 +404,86 @@ def split_friday_weekend_guard_trades(trades: Sequence[Trade]) -> "tuple[List[Tr
     flash = [t for t in trades if is_friday_entry_weekend_guard_trade(t)]
     rest = [t for t in trades if not is_friday_entry_weekend_guard_trade(t)]
     return flash, rest
+
+
+def trade_premium_pnl_pct(t: Trade) -> Optional[float]:
+    """
+    PnL% sobre la PRIMA (precio promedio ponderado de entrada vs. de
+    salida) de `t` - misma definicion exacta que usa
+    risk_manager.evaluate_position_exit() para comparar contra
+    `stop_loss_pct`/`take_profit_pct` ((precio_actual - precio_entrada) /
+    precio_entrada), aplicada aca sobre el precio de CIERRE real en vez del
+    precio de un ciclo intermedio. None si falta alguna pata o el precio
+    promedio de entrada es <= 0 (nunca se fabrica un valor).
+    """
+    entry_qty = sum(leg.quantity for leg in t.entry_legs)
+    exit_qty = sum(leg.quantity for leg in t.exit_legs)
+    if entry_qty <= 0 or exit_qty <= 0 or t.multiplier <= 0:
+        return None
+    avg_entry_price = t.entry_notional_ars / (entry_qty * t.multiplier)
+    avg_exit_price = t.exit_notional_ars / (exit_qty * t.multiplier)
+    if avg_entry_price <= 0:
+        return None
+    return (avg_exit_price - avg_entry_price) / avg_entry_price
+
+
+@dataclass
+class PremiumStopBreach:
+    threshold_pct: float
+    n_total: int
+    n_breached: int
+    gross_pnl_sum_breached_ars: float
+    gross_pnl_sum_losers_ars: float
+    pct_of_loser_pnl_explained: Optional[float]
+    worst_premium_loss_pct: Optional[float]
+    median_premium_loss_pct_breached: Optional[float]
+
+
+def premium_stop_breach_report(trades: Sequence[Trade], threshold_pct: float = 0.50) -> PremiumStopBreach:
+    """
+    Pedido del usuario (ronda 2026-09-29): cuantos trades cerraron con una
+    perdida sobre la prima MAYOR (en magnitud) al stop configurado
+    (`threshold_pct`, comparable contra config.LongFirstConfig.stop_loss_pct
+    / config.VolArbitrageConfig.stop_loss_pct, ambos 0.50 por defecto), y
+    cuanto de la perdida total explican. Un trade sin premium_pnl_pct
+    calculable (ver trade_premium_pnl_pct) se excluye de n_total (nunca se
+    fabrica un valor). "Breach" = premium_pnl_pct <= -threshold_pct - el
+    umbral en si NO discrimina si el cierre fue POR ese stop
+    (`close_reason == "stop_loss"`) o por otro motivo (vol_arbitrage no
+    tiene close_reason en el export) - mide el RESULTADO final vs. el
+    limite que el stop deberia haber impuesto, no la causa del cierre.
+    """
+    import statistics as _stats
+
+    pcts: List[float] = []
+    breached: List[Trade] = []
+    for t in trades:
+        pct = trade_premium_pnl_pct(t)
+        if pct is None:
+            continue
+        pcts.append(pct)
+        if pct <= -abs(threshold_pct):
+            breached.append(t)
+
+    n_total = len(pcts)
+    losers = [t for t in trades if t.pnl_gross_ars < 0]
+    gross_pnl_sum_losers = sum(t.pnl_gross_ars for t in losers)
+    gross_pnl_sum_breached = sum(t.pnl_gross_ars for t in breached)
+    breached_pcts = sorted(pct for pct in (trade_premium_pnl_pct(t) for t in breached) if pct is not None)
+
+    return PremiumStopBreach(
+        threshold_pct=threshold_pct,
+        n_total=n_total,
+        n_breached=len(breached),
+        gross_pnl_sum_breached_ars=gross_pnl_sum_breached,
+        gross_pnl_sum_losers_ars=gross_pnl_sum_losers,
+        pct_of_loser_pnl_explained=(
+            (gross_pnl_sum_breached / gross_pnl_sum_losers * 100.0)
+            if gross_pnl_sum_losers != 0 else None
+        ),
+        worst_premium_loss_pct=(min(pcts) if pcts else None),
+        median_premium_loss_pct_breached=(_stats.median(breached_pcts) if breached_pcts else None),
+    )
 
 
 def trade_holding_business_days(t: Trade) -> Optional[int]:

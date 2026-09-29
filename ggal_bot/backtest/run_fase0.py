@@ -28,7 +28,9 @@ from ggal_bot.backtest.attribution import (
     attribute_by_entry_hour_art,
     attribute_by_holding_time,
     attribute_by_moneyness,
+    attribute_by_option_type_and_direction,
     load_spot_closes_csv,
+    premium_stop_breach_report,
     split_by_holding_business_days_cutoff,
     split_friday_weekend_guard_trades,
     unmapped_close_reasons,
@@ -185,12 +187,61 @@ def run_attribution(lifecycle_path: Path, closed_trades_path: Path) -> dict:
         cuts["dte"] = attribute_by_dte(trades)
         cuts["holding_time"] = attribute_by_holding_time(trades)
         cuts["entry_hour_art"] = attribute_by_entry_hour_art(trades)
+        cuts["option_type_direction"] = attribute_by_option_type_and_direction(trades)
         out[strategy] = {
             "n_total": len(trades), "cuts": cuts,
             "unmapped_close_reasons": unmapped_close_reasons(trades),
             "winner_loser_profile": winner_loser_holding_profile(trades),
         }
     return out
+
+
+# Umbral de stop_loss REALMENTE configurado por estrategia (ver
+# config.LongFirstConfig.stop_loss_pct / config.VolArbitrageConfig.
+# stop_loss_pct, ambos 0.50 por defecto - config.ScalpingConfig.
+# stop_loss_pct es 0.25, mecanismo SEPARADO via evaluate_scalping_exit, no
+# evaluate_position_exit). El pedido del usuario ("todas las estrategias
+# que usan evaluate_position_exit") excluye a scalping en sentido estricto;
+# se incluye su fila igual, marcada aparte, por ser la misma pregunta de
+# fondo con un mecanismo analogo.
+_STOP_LOSS_PCT_BY_STRATEGY = {
+    "weekly_asymmetric": 0.50,
+    "weekly_asymmetric_sin_viernes_flash": 0.50,
+    "vol_arbitrage": 0.50,
+    "scalping": 0.25,  # via evaluate_scalping_exit, no evaluate_position_exit - ver docstring arriba
+}
+
+
+def run_premium_stop_breach_analysis(lifecycle_path: Path, closed_trades_path: Path) -> dict:
+    """
+    Item 2 (ronda 2026-09-29): por estrategia, cuantos trades cerraron con
+    una perdida sobre la prima mayor (en magnitud) al stop_loss_pct
+    REALMENTE configurado para esa estrategia, y cuanto de la perdida total
+    explican (ver attribution.premium_stop_breach_report). NO discrimina
+    causa del cierre (close_reason) - mide el resultado final vs. el limite
+    que el stop deberia haber impuesto.
+    """
+    all_trades = load_all_trades(lifecycle_path, closed_trades_path)
+    out: dict = {}
+    for strategy, (trades, _, _) in all_trades.items():
+        threshold = _STOP_LOSS_PCT_BY_STRATEGY.get(strategy)
+        if threshold is None:
+            continue
+        out[strategy] = premium_stop_breach_report(trades, threshold_pct=threshold)
+    return out
+
+
+def print_premium_stop_breach(reports: dict) -> None:
+    print(f"\n{'estrategia':<38}{'umbral':>8}{'n_total':>9}{'n_rompe':>9}{'pnl_rompe_ars':>16}{'pnl_perded_ars':>16}{'%perdida_expl':>15}{'peor_pct':>10}{'mediana_rompe':>15}")
+    for strategy, r in reports.items():
+        pct_expl = f"{r.pct_of_loser_pnl_explained:.1f}%" if r.pct_of_loser_pnl_explained is not None else "—"
+        worst = f"{r.worst_premium_loss_pct * 100:.1f}%" if r.worst_premium_loss_pct is not None else "—"
+        median_b = f"{r.median_premium_loss_pct_breached * 100:.1f}%" if r.median_premium_loss_pct_breached is not None else "—"
+        print(
+            f"{strategy:<38}{r.threshold_pct * 100:>7.0f}%{r.n_total:>9}{r.n_breached:>9}"
+            f"{r.gross_pnl_sum_breached_ars:>16,.0f}{r.gross_pnl_sum_losers_ars:>16,.0f}"
+            f"{pct_expl:>15}{worst:>10}{median_b:>15}"
+        )
 
 
 def _fmt(v, spec="{:.2f}"):
@@ -353,3 +404,7 @@ if __name__ == "__main__":
     out_holding = Path("fase0_vol_arbitrage_holding_cutoffs.csv")
     write_csv(holding_reports, out_holding)
     print(f"\nAnalisis de corte por tenencia escrito en {out_holding.resolve()}")
+
+    print("\n=== Chequeo 2 (ronda 2026-09-29): efectividad del stop de perdida sobre la prima ===")
+    breach_reports = run_premium_stop_breach_analysis(lifecycle_path, closed_trades_path)
+    print_premium_stop_breach(breach_reports)

@@ -27,15 +27,18 @@ from ggal_bot.backtest.attribution import (
     attribute_by_entry_hour_art,
     attribute_by_holding_time,
     attribute_by_moneyness,
+    attribute_by_option_type_and_direction,
     bucket_close_reason,
     is_friday_entry_weekend_guard_trade,
     load_spot_closes_csv,
     nearest_close_on_or_before,
     parse_contract_key_expiry,
     parse_option_symbol,
+    premium_stop_breach_report,
     split_by_holding_business_days_cutoff,
     split_friday_weekend_guard_trades,
     trade_holding_business_days,
+    trade_premium_pnl_pct,
     unmapped_close_reasons,
     winner_loser_holding_profile,
 )
@@ -44,7 +47,7 @@ from datetime import date
 
 
 def _trade(symbol="GFGC7000OC", opened="2026-09-10T14:00:00+00:00", closed="2026-09-11T14:00:00+00:00",
-           pnl=1000.0, close_reason=None, contract_key=None, multiplier=100.0) -> Trade:
+           pnl=1000.0, close_reason=None, contract_key=None, multiplier=100.0, direction=None) -> Trade:
     opened_dt = datetime.fromisoformat(opened) if opened else None
     closed_dt = datetime.fromisoformat(closed) if closed else None
     return Trade(
@@ -53,6 +56,7 @@ def _trade(symbol="GFGC7000OC", opened="2026-09-10T14:00:00+00:00", closed="2026
         entry_legs=[Leg(quantity=1, price=100.0, timestamp=opened_dt)],
         exit_legs=[Leg(quantity=1, price=110.0, timestamp=closed_dt)],
         pnl_gross_ars=pnl, close_reason=close_reason, contract_key=contract_key,
+        direction=direction,
     )
 
 
@@ -247,6 +251,86 @@ def test_is_friday_entry_weekend_guard_trade_false_without_opened_at():
     assert is_friday_entry_weekend_guard_trade(t) is False
 
 
+def test_attribute_by_option_type_and_direction_buckets_correctly():
+    trades = [
+        _trade(symbol="GFGC7000OC", pnl=-100.0, direction="long"),   # call_long
+        _trade(symbol="GFGC7100OC", pnl=200.0, direction="long"),    # call_long
+        _trade(symbol="GFGV6400I", pnl=50.0, direction="long"),      # put_long
+        _trade(symbol="GFGC7200OC", pnl=-30.0, direction="short"),   # call_short
+    ]
+    buckets = {b.label: b for b in attribute_by_option_type_and_direction(trades)}
+    assert buckets["call_long"].n == 2
+    assert buckets["call_long"].gross_pnl_sum_ars == 100.0
+    assert buckets["put_long"].n == 1
+    assert buckets["call_short"].n == 1
+    assert "put_short" not in buckets  # ningun trade en ese bucket, no se fabrica una fila vacia
+
+
+def test_attribute_by_option_type_and_direction_excludes_missing_direction_or_unparseable_symbol():
+    trades = [
+        _trade(symbol="GFGC7000OC", direction=None),      # sin direction -> excluido
+        _trade(symbol="ALGO_RARO", direction="long"),      # symbol no parseable -> excluido
+        _trade(symbol="GFGC7100OC", direction="long"),     # este SI cuenta
+    ]
+    buckets = attribute_by_option_type_and_direction(trades)
+    total_n = sum(b.n for b in buckets)
+    assert total_n == 1
+
+
+def _trade_with_legs(entry_price, exit_price, qty=1, multiplier=100.0, pnl=None) -> Trade:
+    pnl_value = pnl if pnl is not None else (exit_price - entry_price) * qty * multiplier
+    return Trade(
+        strategy="weekly_asymmetric", symbol="GFGC7000OC", trade_id="t1",
+        opened_at=datetime.fromisoformat("2026-09-10T14:00:00+00:00"),
+        closed_at=datetime.fromisoformat("2026-09-11T14:00:00+00:00"),
+        multiplier=multiplier,
+        entry_legs=[Leg(quantity=qty, price=entry_price, timestamp=None)],
+        exit_legs=[Leg(quantity=qty, price=exit_price, timestamp=None)],
+        pnl_gross_ars=pnl_value,
+    )
+
+
+def test_trade_premium_pnl_pct_computes_weighted_average_pct():
+    t = _trade_with_legs(entry_price=100.0, exit_price=40.0, qty=10)  # -60% de la prima
+    pct = trade_premium_pnl_pct(t)
+    assert pct is not None and abs(pct - (-0.60)) < 1e-9
+
+
+def test_trade_premium_pnl_pct_none_without_legs_or_zero_entry():
+    empty = Trade(
+        strategy="weekly_asymmetric", symbol="GFGC7000OC", trade_id="t2",
+        opened_at=None, closed_at=None, multiplier=100.0,
+        entry_legs=[], exit_legs=[], pnl_gross_ars=0.0,
+    )
+    assert trade_premium_pnl_pct(empty) is None
+
+
+def test_premium_stop_breach_report_flags_losses_beyond_threshold():
+    trades = [
+        _trade_with_legs(entry_price=100.0, exit_price=40.0, qty=10),   # -60%, rompe el 50%
+        _trade_with_legs(entry_price=100.0, exit_price=55.0, qty=10),   # -45%, NO rompe el 50%
+        _trade_with_legs(entry_price=100.0, exit_price=130.0, qty=10),  # ganadora, no cuenta como perdida
+    ]
+    report = premium_stop_breach_report(trades, threshold_pct=0.50)
+    assert report.n_total == 3
+    assert report.n_breached == 1
+    # -60% trade: (40-100)*10*100 = -60,000
+    assert abs(report.gross_pnl_sum_breached_ars - (-60_000.0)) < 1e-6
+    # perdedoras totales: -60,000 + (55-100)*10*100=-45,000 = -105,000
+    assert abs(report.gross_pnl_sum_losers_ars - (-105_000.0)) < 1e-6
+    assert report.pct_of_loser_pnl_explained is not None
+    assert abs(report.pct_of_loser_pnl_explained - (60_000.0 / 105_000.0 * 100.0)) < 1e-6
+    assert abs(report.worst_premium_loss_pct - (-0.60)) < 1e-9
+
+
+def test_premium_stop_breach_report_none_percent_when_no_losers():
+    trades = [_trade_with_legs(entry_price=100.0, exit_price=130.0, qty=10)]
+    report = premium_stop_breach_report(trades, threshold_pct=0.50)
+    assert report.n_breached == 0
+    assert report.gross_pnl_sum_losers_ars == 0.0
+    assert report.pct_of_loser_pnl_explained is None
+
+
 def test_trade_holding_business_days_counts_weekdays_only():
     """Jueves 2026-09-10 -> lunes 2026-09-14: 2 dias habiles (viernes y lunes; sabado/domingo no cuentan)."""
     t = _trade(opened="2026-09-10T14:00:00+00:00", closed="2026-09-14T14:00:00+00:00")
@@ -316,6 +400,12 @@ ALL_TESTS = [
     test_trade_holding_business_days_same_day_is_zero,
     test_trade_holding_business_days_none_without_both_timestamps,
     test_split_by_holding_business_days_cutoff_partitions_exhaustively,
+    test_attribute_by_option_type_and_direction_buckets_correctly,
+    test_attribute_by_option_type_and_direction_excludes_missing_direction_or_unparseable_symbol,
+    test_trade_premium_pnl_pct_computes_weighted_average_pct,
+    test_trade_premium_pnl_pct_none_without_legs_or_zero_entry,
+    test_premium_stop_breach_report_flags_losses_beyond_threshold,
+    test_premium_stop_breach_report_none_percent_when_no_losers,
 ]
 
 

@@ -92,6 +92,7 @@ class Trade:
     close_reason: Optional[str] = None
     contract_key: Optional[str] = None  # "SUBYACENTE|SIMBOLO|YYYY-MM-DD" - solo lifecycle journal
     data_insufficient_fields: List[str] = field(default_factory=list)
+    direction: Optional[str] = None  # "long" | "short", normalizado desde "Direccion" (vol_arbitrage) o "Lado" de la ENTRY (lifecycle journal) - ver attribution.attribute_by_option_type_and_direction
 
     @property
     def entry_notional_ars(self) -> float:
@@ -241,6 +242,13 @@ def reconstruct_lifecycle_trades(
         opened_at = _parse_ts(entry_rows[0]["timestamp_utc"]) if entry_rows else None
         closed_at = _parse_ts(close_rows[-1]["timestamp_utc"])
         close_reason = close_rows[-1].get("reason") or None
+        # "Lado" de la primera pata de ENTRADA real ("buy"/"sell") normalizado
+        # a la misma convencion "long"/"short" que usa el export de cierres
+        # de vol_arbitrage (columna "Direccion") - ver
+        # attribution.attribute_by_option_type_and_direction. None si falta
+        # el dato (nunca se fabrica un lado).
+        entry_side = str(entry_rows[0].get("side") or "").strip().lower() if entry_rows else ""
+        direction = {"buy": "long", "sell": "short"}.get(entry_side)
 
         if not entry_legs or not exit_legs:
             # SI tuvo CLOSE (termino dentro de la ventana) pero falta la
@@ -259,6 +267,7 @@ def reconstruct_lifecycle_trades(
             entry_legs=entry_legs, exit_legs=exit_legs,
             pnl_gross_ars=realized_pnl, close_reason=close_reason,
             contract_key=contract_key, data_insufficient_fields=data_insufficient,
+            direction=direction,
         ))
 
     return trades, still_open_count, incomplete_data_count
@@ -316,7 +325,7 @@ def load_closed_trades_export(path: Path) -> List[Trade]:
             opened_at=opened_at, closed_at=closed_at, multiplier=mult,
             entry_legs=[Leg(quantity=qty, price=entry_price, timestamp=opened_at)],
             exit_legs=[Leg(quantity=qty, price=exit_price, timestamp=closed_at)],
-            pnl_gross_ars=pnl_csv,
+            pnl_gross_ars=pnl_csv, direction=(direction or None),
         ))
 
     if inconsistent:
