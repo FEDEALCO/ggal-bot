@@ -9,15 +9,18 @@ bootstrap de trades donde tiene sentido estadistico hacerlo.
 
 LIMITACIONES METODOLOGICAS EXPLICITAS (leer antes de interpretar numeros):
 
-    1. Sharpe/Sortino "anualizados": no existe una serie de retornos
-       PERIODICOS de cuenta (no se conoce el capital real de la cuenta -
-       ver capital_base_ars=None abajo). Se calculan sobre la serie de
-       retornos POR TRADE (pnl_net_ars / notional_de_entrada_de_ESE_trade),
-       y se anualizan escalando por sqrt(trades_por_año_observado) - una
-       extrapolacion de la frecuencia de trades ya vista en la muestra, NO
-       una proyeccion de que esa frecuencia se sostendra. Con 2-3 semanas
-       de datos esto es, por construccion, una anualizacion de altisima
-       incertidumbre (ver bootstrap_ci de cada metrica).
+    1. Sharpe/Sortino se reportan UNICAMENTE POR TRADE (sobre la serie de
+       retornos pnl_net_ars / notional_de_entrada_de_ESE_trade), NUNCA
+       anualizados. Version previa de este modulo anualizaba el punto
+       (escalando por sqrt(trades_por_año_observado)) pero reportaba el
+       intervalo de confianza del bootstrap SIN anualizar - un error de
+       unidades real (el punto anualizado quedaba fuera de su propio IC).
+       Se corrigio eliminando la anualizacion por completo: con 15-22 dias
+       de datos y un solo regimen de mercado, escalar por la frecuencia de
+       trades YA OBSERVADA (no una proyeccion) no tiene sentido estadistico
+       - es una extrapolacion de altisima incertidumbre. `trades_per_year_observed`
+       se sigue reportando como dato informativo (frecuencia de trading
+       observada), pero ya NO se usa para anualizar Sharpe/Sortino.
     2. Max drawdown se calcula sobre la curva de equity en PESOS
        (pnl_net_ars acumulado, ordenado por cierre) porque no hay una base
        de capital real conocida contra la cual expresarlo en %. Se reporta
@@ -268,10 +271,8 @@ class StrategyReport:
     total_cost_ars: float
     cost_pct_of_gross_pnl: Optional[float]
     sharpe_per_trade: Optional[float]
-    sharpe_annualized: Optional[float]
     sharpe_ci: Tuple[Optional[float], Optional[float]]
     sortino_per_trade: Optional[float]
-    sortino_annualized: Optional[float]
     sortino_ci: Tuple[Optional[float], Optional[float]]
     observed_days: int
     trades_per_year_observed: float
@@ -318,9 +319,9 @@ def build_strategy_report(
     returns_pct = [r.pnl_net_pct for r in results]
     sharpe_pt, sharpe_lo, sharpe_hi = bootstrap_ci(returns_pct, statistic_fn=_sharpe) if n >= 2 else (None, None, None)
     sortino_pt, sortino_lo, sortino_hi = bootstrap_ci(returns_pct, statistic_fn=_sortino) if n >= 2 else (None, None, None)
-    ann_factor = math.sqrt(trades_per_year_observed) if trades_per_year_observed > 0 else None
-    sharpe_ann = (sharpe_pt * ann_factor) if (sharpe_pt is not None and ann_factor is not None) else None
-    sortino_ann = (sortino_pt * ann_factor) if (sortino_pt is not None and ann_factor is not None) else None
+    # NUNCA anualizar Sharpe/Sortino aca (ver limitacion 1 en el docstring del
+    # modulo) - se reportan tal cual, por trade, en las mismas unidades que
+    # su propio intervalo de confianza.
 
     curve = compute_equity_curve(results)
     dd = compute_max_drawdown(curve)
@@ -352,8 +353,8 @@ def build_strategy_report(
         expectancy_ars_per_trade=expectancy, expectancy_ci=(exp_lo, exp_hi),
         gross_pnl_ars=gross_pnl, net_pnl_ars=net_pnl, total_cost_ars=total_cost,
         cost_pct_of_gross_pnl=cost_pct_of_gross,
-        sharpe_per_trade=sharpe_pt, sharpe_annualized=sharpe_ann, sharpe_ci=(sharpe_lo, sharpe_hi),
-        sortino_per_trade=sortino_pt, sortino_annualized=sortino_ann, sortino_ci=(sortino_lo, sortino_hi),
+        sharpe_per_trade=sharpe_pt, sharpe_ci=(sharpe_lo, sharpe_hi),
+        sortino_per_trade=sortino_pt, sortino_ci=(sortino_lo, sortino_hi),
         observed_days=observed_days, trades_per_year_observed=trades_per_year_observed,
         drawdown=dd, worst_day=w_day, worst_week=w_week,
         sample_size_warning=sample_warning,

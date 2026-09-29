@@ -90,6 +90,7 @@ class Trade:
     exit_legs: List[Leg]
     pnl_gross_ars: float
     close_reason: Optional[str] = None
+    contract_key: Optional[str] = None  # "SUBYACENTE|SIMBOLO|YYYY-MM-DD" - solo lifecycle journal
     data_insufficient_fields: List[str] = field(default_factory=list)
 
     @property
@@ -207,6 +208,7 @@ def reconstruct_lifecycle_trades(
         symbol = str(pos_rows[0].get("symbol") or "")
         strategy = str(pos_rows[0].get("strategy_tag") or "") or "weekly_asymmetric"
         mult = multiplier_for_symbol(symbol)
+        contract_key = str(pos_rows[0].get("contract_key") or "") or None
 
         entry_legs: List[Leg] = []
         total_entry_qty = 0.0
@@ -256,7 +258,7 @@ def reconstruct_lifecycle_trades(
             opened_at=opened_at, closed_at=closed_at, multiplier=mult,
             entry_legs=entry_legs, exit_legs=exit_legs,
             pnl_gross_ars=realized_pnl, close_reason=close_reason,
-            data_insufficient_fields=data_insufficient,
+            contract_key=contract_key, data_insufficient_fields=data_insufficient,
         ))
 
     return trades, still_open_count, incomplete_data_count

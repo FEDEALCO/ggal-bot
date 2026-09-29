@@ -19,6 +19,7 @@ if __package__ in (None, ""):
 from ggal_bot.backtest.costs import (
     BROKER_COMMISSION_TIERS_PCT,
     CostAssumptions,
+    commission_tier_scenarios,
     default_scenarios,
     net_pnl_ars,
     round_trip_regulatory_cost_ars,
@@ -99,6 +100,20 @@ def test_commission_pct_override_replaces_tier_lookup():
     assert round_trip_regulatory_cost_ars(100_000.0, 100_000.0, zero_all) == 0.0
 
 
+def test_commission_tier_scenarios_covers_all_three_tiers_at_fixed_spread():
+    scenarios = commission_tier_scenarios(spread_round_trip_pct=0.0)
+    assert len(scenarios) == 3
+    tiers = sorted(s.commission_tier for s in scenarios)
+    assert tiers == ["black", "gold", "platinum"]
+    # El eje de spread queda FIJO (no se mezcla con la sensibilidad de spread).
+    assert all(s.spread_round_trip_pct == 0.0 for s in scenarios)
+
+
+def test_commission_tier_scenarios_respects_custom_spread():
+    scenarios = commission_tier_scenarios(spread_round_trip_pct=0.06)
+    assert all(s.spread_round_trip_pct == 0.06 for s in scenarios)
+
+
 ALL_TESTS = [
     test_regulatory_cost_matches_hand_computed_gold_tier,
     test_regulatory_cost_scales_with_commission_tier,
@@ -109,6 +124,8 @@ ALL_TESTS = [
     test_default_scenarios_cover_the_full_spread_band,
     test_all_commission_tiers_are_positive_and_decreasing_with_volume,
     test_commission_pct_override_replaces_tier_lookup,
+    test_commission_tier_scenarios_covers_all_three_tiers_at_fixed_spread,
+    test_commission_tier_scenarios_respects_custom_spread,
 ]
 
 

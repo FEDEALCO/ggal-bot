@@ -180,3 +180,23 @@ def default_scenarios() -> Tuple[CostAssumptions, ...]:
     return tuple(
         CostAssumptions(spread_round_trip_pct=s) for s in SPREAD_SCENARIOS_PCT
     )
+
+
+def commission_tier_scenarios(spread_round_trip_pct: float = 0.0) -> Tuple[CostAssumptions, ...]:
+    """
+    Un escenario por cada escala de comision de IOL (Gold/Platinum/Black),
+    a un supuesto de spread FIJO (por defecto 0.0 = "mid_sin_spread", para
+    aislar el efecto de la comision del efecto del spread). Pensado para
+    responder "cuanto cambia el resultado si mi cuenta califica para una
+    escala de comision distinta a Gold" sin mezclar ese eje con el de
+    sensibilidad de spread (ver default_scenarios).
+
+    IMPORTANTE: la escala real de la cuenta del usuario todavia NO fue
+    confirmada (depende de su volumen mensual operado - DATA INSUFFICIENT,
+    pendiente de que el usuario la provea). Estos 3 escenarios son una
+    banda de sensibilidad, no una eleccion de cual aplica en la practica.
+    """
+    return tuple(
+        CostAssumptions(commission_tier=tier, spread_round_trip_pct=spread_round_trip_pct)
+        for tier in ("gold", "platinum", "black")
+    )
