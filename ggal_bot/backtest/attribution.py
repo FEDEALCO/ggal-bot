@@ -278,6 +278,62 @@ def attribute_by_holding_time(trades: Sequence[Trade]) -> List[AttributionBucket
     return _bucketize(trades, key_fn)
 
 
+@dataclass
+class WinLossHoldingProfile:
+    """
+    Distribucion de tiempo de tenencia y PnL bruto de ganadoras vs.
+    perdedoras (pedido explicito del usuario, 2026-09-29: "¿el bot corta
+    las ganadoras antes y deja correr las perdedoras?"). Compara la
+    MEDIANA de holding_seconds de cada grupo (mediana, no promedio - un
+    solo trade sostenido muchos dias puede distorsionar el promedio con
+    pocas muestras) y el PnL bruto promedio/mediano de cada uno.
+    """
+    n_winners: int
+    n_losers: int
+    median_holding_seconds_winners: Optional[float]
+    median_holding_seconds_losers: Optional[float]
+    mean_gross_pnl_winners_ars: Optional[float]
+    mean_gross_pnl_losers_ars: Optional[float]
+    median_gross_pnl_winners_ars: Optional[float]
+    median_gross_pnl_losers_ars: Optional[float]
+
+
+def winner_loser_holding_profile(trades: Sequence[Trade]) -> WinLossHoldingProfile:
+    """
+    DATA INSUFFICIENT para el holding time de un trade sin opened_at o
+    closed_at (se excluye de la mediana de tenencia de su grupo, pero SI
+    se cuenta en n_winners/n_losers si tiene PnL bruto valido - son
+    preguntas independientes). Un trade con pnl_gross_ars == 0 exactamente
+    no se cuenta en ninguno de los dos grupos (ni ganador ni perdedor).
+    """
+    import statistics as _stats
+
+    winners = [t for t in trades if t.pnl_gross_ars > 0]
+    losers = [t for t in trades if t.pnl_gross_ars < 0]
+
+    def _median_holding(ts: Sequence[Trade]) -> Optional[float]:
+        vals = [t.holding_seconds for t in ts if t.holding_seconds is not None]
+        return _stats.median(vals) if vals else None
+
+    def _mean_pnl(ts: Sequence[Trade]) -> Optional[float]:
+        vals = [t.pnl_gross_ars for t in ts]
+        return _stats.fmean(vals) if vals else None
+
+    def _median_pnl(ts: Sequence[Trade]) -> Optional[float]:
+        vals = [t.pnl_gross_ars for t in ts]
+        return _stats.median(vals) if vals else None
+
+    return WinLossHoldingProfile(
+        n_winners=len(winners), n_losers=len(losers),
+        median_holding_seconds_winners=_median_holding(winners),
+        median_holding_seconds_losers=_median_holding(losers),
+        mean_gross_pnl_winners_ars=_mean_pnl(winners),
+        mean_gross_pnl_losers_ars=_mean_pnl(losers),
+        median_gross_pnl_winners_ars=_median_pnl(winners),
+        median_gross_pnl_losers_ars=_median_pnl(losers),
+    )
+
+
 def attribute_by_entry_hour_art(trades: Sequence[Trade]) -> List[AttributionBucket]:
     """
     Bucket por HORA de entrada en horario de Argentina (ART, UTC-3, sin

@@ -33,6 +33,7 @@ from ggal_bot.backtest.attribution import (
     parse_contract_key_expiry,
     parse_option_symbol,
     unmapped_close_reasons,
+    winner_loser_holding_profile,
 )
 from ggal_bot.backtest.reconstruct import Leg, Trade
 from datetime import date
@@ -174,6 +175,33 @@ def test_attribute_by_holding_time_buckets():
     assert buckets["1-3d"].n == 1
 
 
+def test_winner_loser_holding_profile_computes_median_holding_and_pnl_per_group():
+    trades = [
+        _trade(opened="2026-09-10T10:00:00+00:00", closed="2026-09-10T10:10:00+00:00", pnl=100.0),   # ganadora, 10min
+        _trade(opened="2026-09-11T10:00:00+00:00", closed="2026-09-11T10:20:00+00:00", pnl=200.0),   # ganadora, 20min
+        _trade(opened="2026-09-12T10:00:00+00:00", closed="2026-09-15T10:00:00+00:00", pnl=-50.0),   # perdedora, 3 dias
+        _trade(opened="2026-09-13T10:00:00+00:00", closed="2026-09-20T10:00:00+00:00", pnl=-150.0),  # perdedora, 7 dias
+    ]
+    profile = winner_loser_holding_profile(trades)
+    assert profile.n_winners == 2
+    assert profile.n_losers == 2
+    assert profile.median_holding_seconds_winners == 900.0  # mediana de 600s y 1200s
+    assert profile.median_holding_seconds_losers == 432000.0  # mediana de 3 dias (259200s) y 7 dias (604800s)
+    assert profile.mean_gross_pnl_winners_ars == 150.0
+    assert profile.mean_gross_pnl_losers_ars == -100.0
+
+
+def test_winner_loser_holding_profile_excludes_zero_pnl_and_missing_holding():
+    trades = [
+        _trade(opened="2026-09-10T10:00:00+00:00", closed="2026-09-10T10:10:00+00:00", pnl=0.0),  # ni ganadora ni perdedora
+        _trade(opened=None, closed=None, pnl=50.0),  # ganadora sin fechas -> cuenta en n_winners pero no en la mediana de tenencia
+    ]
+    profile = winner_loser_holding_profile(trades)
+    assert profile.n_winners == 1
+    assert profile.n_losers == 0
+    assert profile.median_holding_seconds_winners is None
+
+
 def test_attribute_by_entry_hour_art_converts_from_utc():
     # 14:00 UTC = 11:00 ART (UTC-3).
     trades = [_trade(opened="2026-09-10T14:00:00+00:00")]
@@ -195,6 +223,8 @@ ALL_TESTS = [
     test_attribute_by_moneyness_excludes_unparseable_symbol_or_missing_spot,
     test_attribute_by_dte_buckets_and_excludes_missing_contract_key,
     test_attribute_by_holding_time_buckets,
+    test_winner_loser_holding_profile_computes_median_holding_and_pnl_per_group,
+    test_winner_loser_holding_profile_excludes_zero_pnl_and_missing_holding,
     test_attribute_by_entry_hour_art_converts_from_utc,
 ]
 

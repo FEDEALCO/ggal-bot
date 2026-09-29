@@ -342,7 +342,8 @@ de 1 hora, casi todos por el patrón de entrada-de-viernes). Para `vol_arbitrage
 que las posiciones sostenidas más de 3 días (23 trades) concentran la mayor pérdida individual
 (-640.490 ARS, -27.847 ARS/trade medio) — consistente con la hipótesis de exposición direccional no
 cubierta de §4.2: cuanto más tiempo sostenida la posición, más tiempo expuesta a la baja sostenida
-de GGAL.
+de GGAL. Ver §10.A para el corte específico ganadoras vs. perdedoras (tenencia y PnL bruto por
+grupo), agregado a pedido del usuario como diagnóstico previo a proponer un esquema de salida.
 
 ### 4.5 Hora de entrada (ART, UTC-3)
 
@@ -479,8 +480,7 @@ Ver conversación para el detalle completo de cada ítem.
 
 ---
 
-## 9. Pendiente de esta ronda (pedido explícitamente por el usuario el 2026-09-29, no implementado
-   todavía — instrucción fue "arrancá por 1, 2 y 3" de esa lista, quedando estos para la próxima)
+## 9. Pendiente de la ronda anterior (2026-09-29)
 
 0. **Propuesta (sin implementar, a confirmar con el usuario): gate opt-in de "no entrar en
    horizonte semanal un viernes"** — fix directo para el hallazgo de §4.0. Idea de diseño: en
@@ -492,18 +492,138 @@ Ver conversación para el detalle completo de cada ítem.
    que el edge esperado sea grande respecto al costo regulatorio completo de un round-trip
    (emparenta con el filtro k×costo del punto 2 de abajo). Cualquiera de las dos requiere
    confirmación del usuario antes de tocar código de producción — el guard de salida existe por una
-   razón real y documentada (incidente de -$133.568), y no se toca.
-1. **Edge bruto mínimo para breakeven, por estrategia y escenario de costo, vs. edge bruto
-   promedio observado** — la brecha entre ambos como número central del reporte. Es calculable
-   directamente de los datos ya generados (`total_cost_ars / n_trades` vs. `gross_pnl_ars /
-   n_trades` de cada fila de `fase0_results.csv`) — queda para la próxima entrega junto con los
-   puntos 2 y 3 de abajo.
+   razón real y documentada (incidente de -$133.568), y no se toca. **Sigue pendiente.**
+
+1. **HECHO — Edge bruto mínimo para breakeven vs. edge bruto observado**, agregado a
+   `metrics.StrategyReport` (`avg_gross_pnl_ars_per_trade`, `avg_cost_ars_per_trade`,
+   `breakeven_edge_gap_ars`) con 3 tests nuevos, y a `fase0_results.csv`. Es un cálculo
+   determinístico (no bootstrap) sobre los trades ya costeados: `gap = costo_promedio_por_trade -
+   edge_bruto_promedio_por_trade` — positivo significa "falta esto de edge bruto promedio por trade
+   para llegar a breakeven neto" bajo ese escenario de costo.
+
+   | Estrategia | Escenario | Edge bruto/trade (ARS) | Costo/trade (ARS) | Brecha a breakeven (ARS) |
+   |---|---|---:|---:|---:|
+   | weekly_asymmetric | mid_sin_spread | -435 | 3.187 | **+3.622** |
+   | weekly_asymmetric | spread_10pct | -435 | 21.998 | **+22.433** |
+   | scalping | mid_sin_spread | +880 | 1.131 | **+251** |
+   | scalping | spread_10pct | +880 | 7.808 | **+6.928** |
+   | vol_arbitrage | mid_sin_spread | -1.210 | 2.047 | **+3.257** |
+   | vol_arbitrage | spread_10pct | -1.210 | 14.131 | **+15.341** |
+
+   `scalping` es la única con una brecha pequeña (+251 ARS/trade en el escenario más optimista) —
+   coherente con que ya se vuelve neta positiva bajo comisión Platinum/Black (§3.1). Las otras dos
+   tienen brechas de miles de ARS por trade incluso en el escenario más favorable — un filtro de
+   costos por sí solo no las va a cerrar; hace falta más edge bruto (§4) o menos trades de bajo
+   edge (ver punto C de §10).
+
 2. **Filtro de entrada opt-in propuesto (sin implementar):** edge esperado en ARS > k × costo
    round-trip estimado (spread real del book + comisión + derecho + IVA), con k configurable,
    default 2. Diseño a confirmar con el usuario antes de escribir código — en particular cómo
    estimar "edge esperado en ARS" de forma consistente con la dislocación de IV ya calculada por
    cada estrategia, y qué costo de spread usar mientras no haya datos reales del book (¿la banda de
-   sensibilidad de §2.2, o un valor fijo conservador?).
+   sensibilidad de §2.2, o un valor fijo conservador?). **Retomado en §10, punto C, como parte de la
+   línea de selectividad.**
 3. Se mantiene como prioridad desplegar `market_snapshots.csv` + el logger de embudo de señales
    (ítem 1 de §8): el spread real que empiece a registrar reemplaza la banda de sensibilidad actual
    por una medición real, y es un insumo directo para el filtro del punto 2 de esta sección.
+
+---
+
+## 10. Plan propuesto — gestión asimétrica de salidas + módulo de rupturas (momentum) + selectividad
+
+**PROPUESTA, NO IMPLEMENTADA TODAVÍA — a la espera de confirmación del usuario antes de escribir
+ningún código de estrategia nueva** (instrucción explícita del 2026-09-29: "antes de codear,
+mostrame un plan breve"). Todo lo de esta sección es opt-in, apagado por defecto, con tests, sin
+tocar los límites de riesgo existentes.
+
+### 10.A Gestión asimétrica de salidas — diagnóstico primero
+
+**Pregunta del usuario: ¿el bot corta las ganadoras antes y deja correr las perdedoras?** Respuesta
+con los datos ya reconstruidos (`attribution.winner_loser_holding_profile`, nuevo, 2 tests):
+
+| Estrategia | N ganadoras / perdedoras | Mediana tenencia ganadoras | Mediana tenencia perdedoras | PnL bruto medio ganadoras | PnL bruto medio perdedoras | Payoff bruto (ganadora/\|perdedora\|) |
+|---|---|---|---|---:|---:|---:|
+| weekly_asymmetric | 75 / 72 | 0,4 min | 0,4 min | +1.514 | -2.780 | 0,54 |
+| scalping | 102 / 77 | 0,3 min | 0,7 min | +2.633 | -1.043 | **2,52** |
+| vol_arbitrage | 244 / 230 | 0,4 min | 0,7 min | +2.880 | -6.090 | **0,47** |
+
+**Lectura, con cuidado de no sobre-interpretar:** la mediana de tenencia está dominada por el enorme
+volumen de trades de segundos (el patrón de §4.0 en `weekly_asymmetric`; una dinámica intradía
+similar parece predominar también en `scalping`/`vol_arbitrage` — HYPOTHESIS, no confirmado con la
+misma profundidad que §4.0). Por eso la mediana global no es muy informativa por sí sola. La señal
+más clara está en la COLA: `vol_arbitrage` tiene el peor payoff bruto (0,47 — las perdedoras pierden
+más del doble de lo que ganan las ganadoras) Y su bucket de tenencia >3 días ya identificado en §4.4
+concentra la peor pérdida promedio (-27.847 ARS/trade) — consistente con "deja correr las
+perdedoras" en la cola larga, aunque la mediana global no lo muestre. `scalping`, en cambio, ya tiene
+un payoff bruto FAVORABLE (2,52) — no muestra el patrón, y un esquema de salida asimétrico
+probablemente le aporte menos que a las otras dos. `weekly_asymmetric` está demasiado confundida por
+el patrón de §4.0 para sacar una conclusión limpia sobre esto en particular hasta que se corrija esa
+entrada.
+
+**Propuesta de esquema (opt-in, parámetros iniciales a confirmar):**
+
+| Parámetro | Valor inicial propuesto | Por qué |
+|---|---|---|
+| Stop inicial | max(1,5 × ATR(14) del subyacente, 25% de la prima pagada) | Ancla el stop a volatilidad real del subyacente en vez de solo % de prima (que no distingue una opción cara de una barata) — el piso de 25% evita un stop absurdamente angosto en opciones de prima chica. Ambos valores son de partida, no calibrados contra esta muestra (N insuficiente para calibrar un stop con datos históricos). |
+| Toma parcial | 50% de la posición a 2R (2× el riesgo inicial en ARS) | Estándar en gestión asimétrica de salidas (asegura parte de la ganancia sin cerrar toda la posición) — 2R es un punto de partida razonable, sensibilidad a confirmar. |
+| Trailing del resto | Trailing por ATR (ej. 2×ATR desde el máximo favorable) tras la toma parcial | Deja correr el remanente solo cuando ya aseguró parte del resultado — busca capturar la cola derecha sin repetir el patrón de la cola izquierda de `vol_arbitrage`. |
+
+**Limitación explícita de la re-evaluación sobre trades de Fase 0:** ninguno de los dos exports
+tiene el precio INTRA-TRADE (path completo entre entrada y salida) — solo entrada y salida. Esto
+significa que se puede calcular "¿el stop propuesto se habría activado ANTES del cierre real,
+dado el precio de cierre?" únicamente para el subyacente (con las barras diarias reales de GGAL,
+sección 10.B) — para el precio de la OPCIÓN en sí, no hay forma de saber si tocó el stop intra-día
+sin un historial de precios de opciones que no existe. Cualquier re-evaluación de este esquema sobre
+los trades de Fase 0 va a ser necesariamente APROXIMADA (usando el movimiento del SUBYACENTE como
+proxy del camino de la opción, vía Black-Scholes con vol estimada) y se va a etiquetar como tal, no
+como un resultado.
+
+### 10.B Módulo de rupturas (momentum) sobre el subyacente — validar ANTES de tocar opciones
+
+**Datos confirmados disponibles (verificado hoy, no fabricado):**
+- GGAL: 672 barras diarias reales, `get_price_history(symbol="GGAL", market="BCBA")`,
+  2024-01-02 a 2026-09-29 (~2,74 años).
+- MERVAL (índice general, para el filtro de régimen): confirmado disponible vía
+  `get_price_history(symbol="MERVAL", market="BCBA")` — probado con la ventana 2026-09-01 a
+  2026-09-29. **No verifiqué todavía un índice específicamente bancario** (el usuario mencionó
+  "Merval o índice bancario") — antes de asumir cuál usar, decime si tenés un ticker específico de
+  índice sectorial bancario en mente para que lo pruebe, o si MERVAL general alcanza.
+
+| Parámetro | Valor inicial propuesto | Por qué |
+|---|---|---|
+| N (base de consolidación) | 20 ruedas | Estándar en el método (equivalente a ~1 mes de rueda) — punto de partida, se sensibiliza ±20% (16 y 24 ruedas) como pide la metodología acordada. |
+| k (umbral de volumen) | 1,5× el promedio de M ruedas | Filtra rupturas sin convicción de volumen — valor típico en la literatura de O'Neil/Zanger, sensibilidad ±20% (1,2× y 1,8×). |
+| M (ventana de promedio de volumen) | 50 ruedas | Ventana estándar, sensibilidad ±20% (40 y 60 ruedas). |
+| Filtro de régimen | MERVAL sobre su media móvil de 50 ruedas | Solo operar rupturas cuando el mercado general acompaña — reduce falsos positivos en un mercado bajista generalizado (relevante dado que las 3 estrategias existentes sufrieron con la baja de GGAL de esta muestra). |
+
+**Expectativa de tamaño de muestra (orden de magnitud, no una corrida real todavía):** con ~672
+ruedas y un umbral de ruptura de 20 ruedas + filtro de volumen + filtro de régimen, es razonable
+esperar **entre 10 y 30 señales en 2,74 años** — pocas. Si al correr el backtest real da un número
+similar (o menor), el reporte lo va a decir explícitamente y va a acompañar cualquier métrica con
+bootstrap de trades e IC amplios, igual que en Fase 0 — sin sacar conclusiones fuertes de una
+muestra de esa magnitud.
+
+**Metodología del backtest (subyacente primero, sin opciones todavía):** costos BYMA reales de
+ACCIONES (no de opciones — comisión + derecho de mercado de renta variable, distinto al de
+opciones, a buscar/citar igual que se hizo con costs.py), walk-forward (optimizar en una ventana,
+validar en la siguiente), un tramo final out-of-sample que no se toca hasta el final, sensibilidad
+de cada parámetro ±20%, y comparación explícita contra buy & hold del mismo período. Solo si esto
+da expectativa neta positiva fuera de muestra se pasa a proponer cómo expresarlo con opciones
+(§10.B, último párrafo del pedido original) — y esa traducción a calls/call spreads se etiqueta
+siempre como aproximación (Black-Scholes con vol estimada), nunca como resultado.
+
+### 10.C Selectividad
+
+Dos parámetros opt-in, combinables:
+- `max_new_trades_per_week` por estrategia (default a confirmar — sugerido inicial: sin límite
+  explícito hasta ver el resultado de 10.A/10.B, para no introducir un parámetro sin evidencia que
+  lo justifique).
+- El filtro k×costo ya propuesto en §9, punto 2 (edge esperado en ARS > k × costo round-trip
+  estimado, k default 2).
+
+### Próximo paso
+
+Si confirmás este plan (o lo ajustás), sigo con: 10.A (esquema de salida, código + tests + 
+re-evaluación aproximada sobre trades de Fase 0), 10.B (módulo de rupturas + backtest sobre el
+subyacente, código + tests), 10.C (selectividad). Cada uno en commits separados, con su propia
+sección de resultados/limitaciones en REPORT.md.

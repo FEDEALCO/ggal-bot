@@ -30,6 +30,7 @@ from ggal_bot.backtest.attribution import (
     attribute_by_moneyness,
     load_spot_closes_csv,
     unmapped_close_reasons,
+    winner_loser_holding_profile,
 )
 from ggal_bot.backtest.costs import commission_tier_scenarios, default_scenarios
 from ggal_bot.backtest.metrics import StrategyReport, build_strategy_report
@@ -103,7 +104,11 @@ def run_attribution(lifecycle_path: Path, closed_trades_path: Path) -> dict:
         cuts["dte"] = attribute_by_dte(trades)
         cuts["holding_time"] = attribute_by_holding_time(trades)
         cuts["entry_hour_art"] = attribute_by_entry_hour_art(trades)
-        out[strategy] = {"n_total": len(trades), "cuts": cuts, "unmapped_close_reasons": unmapped_close_reasons(trades)}
+        out[strategy] = {
+            "n_total": len(trades), "cuts": cuts,
+            "unmapped_close_reasons": unmapped_close_reasons(trades),
+            "winner_loser_profile": winner_loser_holding_profile(trades),
+        }
     return out
 
 
@@ -111,10 +116,21 @@ def _fmt(v, spec="{:.2f}"):
     return spec.format(v) if v is not None else "—"
 
 
+def _fmt_seconds(v: float) -> str:
+    if v is None:
+        return "—"
+    if v < 3600:
+        return f"{v/60:.1f}min"
+    if v < 86400:
+        return f"{v/3600:.1f}h"
+    return f"{v/86400:.1f}d"
+
+
 def print_summary(reports: List[StrategyReport]) -> None:
     header = (
         f"{'estrategia':<18}{'costo':<20}{'n':>4}{'abierto':>8}{'incompl':>8}{'win%':>8}{'net_pnl_ars':>16}"
         f"{'gross_pnl_ars':>16}{'costo%':>8}{'sharpe_tr':>10}{'sortino_tr':>11}{'maxDD_ars':>14}{'recup_d':>14}"
+        f"{'edge_bruto/tr':>14}{'costo/tr':>12}{'gap_breakeven':>14}"
     )
     print(header)
     print("-" * len(header))
@@ -132,6 +148,9 @@ def print_summary(reports: List[StrategyReport]) -> None:
             f"{_fmt(r.cost_pct_of_gross_pnl):>8}{_fmt(r.sharpe_per_trade, '{:.4f}'):>10}{_fmt(r.sortino_per_trade, '{:.4f}'):>11}"
             f"{_fmt(r.drawdown.max_drawdown_ars, '{:,.0f}'):>14}"
             f"{recup_label:>14}"
+            f"{_fmt(r.avg_gross_pnl_ars_per_trade, '{:,.0f}'):>14}"
+            f"{_fmt(r.avg_cost_ars_per_trade, '{:,.0f}'):>12}"
+            f"{_fmt(r.breakeven_edge_gap_ars, '{:,.0f}'):>14}"
         )
 
 
@@ -154,6 +173,17 @@ def print_attribution(attribution: dict) -> None:
         if data["unmapped_close_reasons"]:
             print(f"  ADVERTENCIA: motivos de salida sin mapear en attribution.py: {data['unmapped_close_reasons']}")
 
+        p = data["winner_loser_profile"]
+        print(f"  [ganadoras vs. perdedoras] n_ganadoras={p.n_winners}  n_perdedoras={p.n_losers}")
+        print(
+            f"      mediana tenencia ganadoras: {_fmt_seconds(p.median_holding_seconds_winners)}   "
+            f"mediana tenencia perdedoras: {_fmt_seconds(p.median_holding_seconds_losers)}"
+        )
+        print(
+            f"      PnL bruto medio ganadoras: {_fmt(p.mean_gross_pnl_winners_ars, '{:,.0f}')}   "
+            f"PnL bruto medio perdedoras: {_fmt(p.mean_gross_pnl_losers_ars, '{:,.0f}')}"
+        )
+
 
 def write_csv(reports: List[StrategyReport], out_path: Path) -> None:
     fieldnames = [
@@ -162,6 +192,7 @@ def write_csv(reports: List[StrategyReport], out_path: Path) -> None:
         "avg_win_ars", "avg_loss_ars", "payoff_ratio",
         "expectancy_ars_per_trade", "expectancy_ci_lo", "expectancy_ci_hi",
         "gross_pnl_ars", "net_pnl_ars", "total_cost_ars", "cost_pct_of_gross_pnl",
+        "avg_gross_pnl_ars_per_trade", "avg_cost_ars_per_trade", "breakeven_edge_gap_ars",
         "sharpe_per_trade", "sharpe_ci_lo", "sharpe_ci_hi",
         "sortino_per_trade", "sortino_ci_lo", "sortino_ci_hi",
         "observed_days", "trades_per_year_observed",
@@ -182,6 +213,9 @@ def write_csv(reports: List[StrategyReport], out_path: Path) -> None:
                 "expectancy_ci_lo": r.expectancy_ci[0], "expectancy_ci_hi": r.expectancy_ci[1],
                 "gross_pnl_ars": r.gross_pnl_ars, "net_pnl_ars": r.net_pnl_ars,
                 "total_cost_ars": r.total_cost_ars, "cost_pct_of_gross_pnl": r.cost_pct_of_gross_pnl,
+                "avg_gross_pnl_ars_per_trade": r.avg_gross_pnl_ars_per_trade,
+                "avg_cost_ars_per_trade": r.avg_cost_ars_per_trade,
+                "breakeven_edge_gap_ars": r.breakeven_edge_gap_ars,
                 "sharpe_per_trade": r.sharpe_per_trade,
                 "sharpe_ci_lo": r.sharpe_ci[0], "sharpe_ci_hi": r.sharpe_ci[1],
                 "sortino_per_trade": r.sortino_per_trade,

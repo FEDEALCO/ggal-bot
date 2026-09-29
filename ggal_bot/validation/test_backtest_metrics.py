@@ -168,6 +168,39 @@ def test_build_strategy_report_costs_reduce_net_pnl_vs_gross():
     assert report.total_cost_ars > 0.0
 
 
+def test_build_strategy_report_breakeven_edge_gap_positive_when_cost_exceeds_gross():
+    trades = [
+        _trade("A", 100, 101, 10, "2026-09-01T10:00:00+00:00", "2026-09-02T10:00:00+00:00"),  # +1,000 bruto
+        _trade("B", 100, 99, 10, "2026-09-03T10:00:00+00:00", "2026-09-04T10:00:00+00:00"),   # -1,000 bruto
+    ]
+    # notional de entrada de cada trade: 100*10*100=100,000; con costo regulatorio
+    # explicito (sin override) de gold (0.847% por pata) el costo total > 0
+    # y el edge bruto promedio es 0 (1000-1000=0 sobre 2 trades) -> el gap
+    # tiene que ser exactamente igual al costo promedio por trade (positivo).
+    assumptions = CostAssumptions(commission_tier="gold", spread_round_trip_pct=0.0)
+    report = build_strategy_report("weekly_asymmetric", trades, assumptions, "con_costos")
+    assert report.avg_gross_pnl_ars_per_trade == 0.0
+    assert report.avg_cost_ars_per_trade > 0.0
+    assert abs(report.breakeven_edge_gap_ars - report.avg_cost_ars_per_trade) < 1e-6
+
+
+def test_build_strategy_report_breakeven_edge_gap_negative_when_gross_exceeds_cost():
+    trades = [
+        _trade("A", 100, 500, 10, "2026-09-01T10:00:00+00:00", "2026-09-02T10:00:00+00:00"),  # +400,000 bruto, edge enorme
+    ]
+    report = build_strategy_report("weekly_asymmetric", trades, _NO_COST, "sin_costos")
+    # Sin costos, el costo promedio es 0 y el edge bruto promedio es positivo -> gap negativo.
+    assert report.breakeven_edge_gap_ars < 0.0
+    assert abs(report.breakeven_edge_gap_ars - (0.0 - report.avg_gross_pnl_ars_per_trade)) < 1e-6
+
+
+def test_build_strategy_report_breakeven_edge_gap_none_when_no_trades():
+    report = build_strategy_report("weekly_asymmetric", [], _NO_COST, "vacio")
+    assert report.avg_gross_pnl_ars_per_trade is None
+    assert report.avg_cost_ars_per_trade is None
+    assert report.breakeven_edge_gap_ars is None
+
+
 def test_build_strategy_report_empty_trades_does_not_crash():
     report = build_strategy_report("weekly_asymmetric", [], _NO_COST, "vacio")
     assert report.n_trades == 0
@@ -189,6 +222,9 @@ ALL_TESTS = [
     test_worst_period_empty_curve_returns_none,
     test_build_strategy_report_basic_counts_and_pnl_no_cost,
     test_build_strategy_report_costs_reduce_net_pnl_vs_gross,
+    test_build_strategy_report_breakeven_edge_gap_positive_when_cost_exceeds_gross,
+    test_build_strategy_report_breakeven_edge_gap_negative_when_gross_exceeds_cost,
+    test_build_strategy_report_breakeven_edge_gap_none_when_no_trades,
     test_build_strategy_report_empty_trades_does_not_crash,
 ]
 

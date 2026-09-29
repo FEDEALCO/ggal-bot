@@ -36,6 +36,13 @@ LIMITACIONES METODOLOGICAS EXPLICITAS (leer antes de interpretar numeros):
        empleado"), NO sobre el capital total de la cuenta (desconocido -
        DATA INSUFFICIENT, nunca fabricado). Si el usuario provee su capital
        real, se puede recalcular sobre esa base.
+    5. `breakeven_edge_gap_ars` (pedido explicito del usuario, 2026-09-29):
+       cuanto edge bruto promedio por trade adicional haria falta, bajo ESE
+       escenario de costos, para que el PnL neto agregado de la muestra
+       fuera exactamente cero. Es un calculo DETERMINISTICO sobre los
+       propios trades ya costeados (no lleva bootstrap ni supuestos
+       nuevos) - positivo = falta edge; negativo o cero = el edge bruto ya
+       alcanza para cubrir el costo de ese escenario.
 """
 from __future__ import annotations
 
@@ -270,6 +277,9 @@ class StrategyReport:
     net_pnl_ars: float
     total_cost_ars: float
     cost_pct_of_gross_pnl: Optional[float]
+    avg_gross_pnl_ars_per_trade: Optional[float]
+    avg_cost_ars_per_trade: Optional[float]
+    breakeven_edge_gap_ars: Optional[float]  # avg_cost_ars_per_trade - avg_gross_pnl_ars_per_trade
     sharpe_per_trade: Optional[float]
     sharpe_ci: Tuple[Optional[float], Optional[float]]
     sortino_per_trade: Optional[float]
@@ -316,6 +326,24 @@ def build_strategy_report(
     total_cost = sum(r.cost_ars for r in results)
     cost_pct_of_gross = (total_cost / abs(gross_pnl) * 100.0) if gross_pnl != 0 else None
 
+    # Edge bruto minimo para breakeven neto (pedido explicito del usuario,
+    # 2026-09-29): dado el costo total YA PAGADO por la muestra bajo este
+    # escenario, cuanto edge bruto promedio por trade hacia falta para que
+    # el resultado NETO agregado fuera exactamente cero. Es simplemente
+    # despejar de "neto = bruto - costo": bruto_necesario_para_neto=0 =
+    # costo_total, entonces bruto_necesario_por_trade = costo_total / n.
+    # breakeven_edge_gap_ars = ese minimo MENOS el edge bruto promedio
+    # REALMENTE observado - positivo significa "falta esto de edge bruto
+    # promedio por trade para llegar a breakeven neto"; negativo significa
+    # que el edge bruto observado ya alcanza y sobra para cubrir el costo.
+    avg_gross_pnl_per_trade = (gross_pnl / n) if n else None
+    avg_cost_per_trade = (total_cost / n) if n else None
+    breakeven_gap = (
+        (avg_cost_per_trade - avg_gross_pnl_per_trade)
+        if (avg_cost_per_trade is not None and avg_gross_pnl_per_trade is not None)
+        else None
+    )
+
     returns_pct = [r.pnl_net_pct for r in results]
     sharpe_pt, sharpe_lo, sharpe_hi = bootstrap_ci(returns_pct, statistic_fn=_sharpe) if n >= 2 else (None, None, None)
     sortino_pt, sortino_lo, sortino_hi = bootstrap_ci(returns_pct, statistic_fn=_sortino) if n >= 2 else (None, None, None)
@@ -353,6 +381,9 @@ def build_strategy_report(
         expectancy_ars_per_trade=expectancy, expectancy_ci=(exp_lo, exp_hi),
         gross_pnl_ars=gross_pnl, net_pnl_ars=net_pnl, total_cost_ars=total_cost,
         cost_pct_of_gross_pnl=cost_pct_of_gross,
+        avg_gross_pnl_ars_per_trade=avg_gross_pnl_per_trade,
+        avg_cost_ars_per_trade=avg_cost_per_trade,
+        breakeven_edge_gap_ars=breakeven_gap,
         sharpe_per_trade=sharpe_pt, sharpe_ci=(sharpe_lo, sharpe_hi),
         sortino_per_trade=sortino_pt, sortino_ci=(sortino_lo, sortino_hi),
         observed_days=observed_days, trades_per_year_observed=trades_per_year_observed,
