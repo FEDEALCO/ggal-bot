@@ -263,6 +263,80 @@ def test_compute_max_drawdown_on_synthetic_equity_curve():
     assert abs(dd["max_drawdown_pct"] - (-40.0)) < 1e-6  # -2000 / 5000 pico
 
 
+def _event_row(order_client_id, strategy_tag, event_type="CLOSE", symbol="GFGC5200O"):
+    return {
+        "timestamp_utc": pd.Timestamp("2026-09-10T10:00:00Z", tz="UTC"), "event_type": event_type,
+        "position_id": f"pos-{order_client_id}", "contract_key": symbol, "symbol": symbol,
+        "strategy_tag": strategy_tag, "side": "sell", "quantity_delta": -1, "quantity_after": 0,
+        "price": 100.0, "order_client_id": order_client_id, "reason": "manual", "data_unavailable_fields": "",
+    }
+
+
+def test_load_position_events_returns_empty_frame_when_file_missing():
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        missing_path = Path(tmp_dir) / "no_existe.csv"
+        df = pe.load_position_events(csv_path=missing_path)
+        assert df.empty
+        assert list(df.columns) == pe.POSITION_EVENTS_COLUMNS
+
+
+def test_build_order_client_id_strategy_map_uses_first_valid_row_per_order():
+    events_df = pd.DataFrame([
+        _event_row("oc-1", "weekly_asymmetric", event_type="ENTRY"),
+        _event_row("oc-1", "weekly_asymmetric", event_type="CLOSE"),
+        _event_row("oc-2", "scalping"),
+        _event_row("oc-3", ""),  # sin strategy_tag -> se ignora
+    ])
+    mapping = pe.build_order_client_id_strategy_map(events_df)
+    assert mapping == {"oc-1": "weekly_asymmetric", "oc-2": "scalping"}
+    assert "oc-3" not in mapping
+
+
+def test_build_order_client_id_strategy_map_empty_when_no_events():
+    assert pe.build_order_client_id_strategy_map(pd.DataFrame()) == {}
+
+
+def test_classify_strategy_from_journal_uses_real_strategy_tag_not_vol_arbitrage_default():
+    """
+    Regresion DIRECTA del bug real documentado en REPORT.md SS12.0: la
+    version vieja (classify_strategy(symbol), todavia disponible sin
+    cambios mas abajo en este modulo) etiquetaba CUALQUIER opcion como
+    "vol_arbitrage" sin mirar que estrategia la abrio - verificado en
+    produccion: de 577 trades exportados como "vol_arbitrage", 411 eran en
+    realidad de weekly_asymmetric/scalping. classify_strategy_from_journal
+    cruza por client_order_id contra el event journal real en vez de
+    adivinar.
+    """
+    fills = pd.DataFrame([
+        _fill_row("2026-09-10T10:00:00Z", "oc-1", "GFGC5200O", "buy", 1, 100.0),
+        _fill_row("2026-09-10T10:05:00Z", "oc-2", "GFGV5200O", "buy", 1, 90.0),
+        _fill_row("2026-09-10T10:10:00Z", "oc-3", "GFGC6000O", "buy", 1, 80.0),
+    ])
+    events_df = pd.DataFrame([
+        _event_row("oc-1", "weekly_asymmetric", symbol="GFGC5200O"),
+        _event_row("oc-2", "scalping", symbol="GFGV5200O"),
+        # oc-3 no tiene evento en el journal -> unknown_legacy, NUNCA vol_arbitrage por default
+    ])
+    result = pe.classify_strategy_from_journal(fills, events_df)
+    assert list(result) == ["weekly_asymmetric", "scalping", pe.UNKNOWN_LEGACY_STRATEGY]
+
+
+def test_classify_strategy_from_journal_still_recognizes_underlying_as_delta_hedge():
+    cfg = SETTINGS.instruments
+    fills = pd.DataFrame([
+        _fill_row("2026-09-10T10:00:00Z", "oc-1", cfg.contado_ticker, "buy", 24, 6975.0),
+    ])
+    result = pe.classify_strategy_from_journal(fills, pd.DataFrame())
+    assert list(result) == ["delta_hedge"]
+
+
+def test_classify_strategy_from_journal_empty_fills_returns_empty_series():
+    result = pe.classify_strategy_from_journal(pd.DataFrame(), pd.DataFrame())
+    assert result.empty
+
+
 def test_load_fills_returns_empty_frame_when_file_missing(tmp_path=None):
     import tempfile
     from pathlib import Path
@@ -370,6 +444,12 @@ ALL_TESTS = [
     test_load_fills_returns_empty_frame_when_file_missing,
     test_load_fills_parses_mixed_subsecond_precision_timestamps_without_dropping_rows,
     test_fit_smile_curve_returns_quadratic_shape,
+    test_load_position_events_returns_empty_frame_when_file_missing,
+    test_build_order_client_id_strategy_map_uses_first_valid_row_per_order,
+    test_build_order_client_id_strategy_map_empty_when_no_events,
+    test_classify_strategy_from_journal_uses_real_strategy_tag_not_vol_arbitrage_default,
+    test_classify_strategy_from_journal_still_recognizes_underlying_as_delta_hedge,
+    test_classify_strategy_from_journal_empty_fills_returns_empty_series,
 ]
 
 

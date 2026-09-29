@@ -60,9 +60,15 @@ st.sidebar.divider()
 st.sidebar.subheader("Filtros")
 
 strategy_filter = st.sidebar.multiselect(
-    "Estrategia", options=["vol_arbitrage", "delta_hedge"],
-    default=["vol_arbitrage", "delta_hedge"],
-    help="vol_arbitrage = señales de smile (opciones); delta_hedge = rebalanceo del subyacente/futuro.",
+    "Estrategia", options=["weekly_asymmetric", "scalping", "vol_arbitrage", "delta_hedge", "unknown_legacy"],
+    default=["weekly_asymmetric", "scalping", "vol_arbitrage", "delta_hedge", "unknown_legacy"],
+    help=(
+        "delta_hedge = rebalanceo del subyacente/futuro. Las demas se resuelven cruzando cada "
+        "fill contra el Position Lifecycle Event Journal por client_order_id (ver "
+        "pnl_engine.classify_strategy_from_journal) - 'unknown_legacy' = opcion sin match en ese "
+        "journal (tipicamente anterior a 2026-09-07 17:05 UTC, cuando se desplego el journal): "
+        "NO se adivina una estrategia para esas filas, ver REPORT.md SS12.0."
+    ),
 )
 option_type_filter = st.sidebar.multiselect(
     "Tipo", options=["call", "put", "subyacente", "otro"],
@@ -100,8 +106,16 @@ if fills.empty:
     )
     st.stop()
 
+position_events_df_raw = pe.load_position_events()
+
 fills = fills.copy()
-fills["strategy"] = fills["symbol"].apply(pe.classify_strategy)
+# CORREGIDO 2026-09-29 (ver REPORT.md SS12.0 y pnl_engine.py, docstring
+# punto 2): classify_strategy(symbol) etiquetaba TODA opcion como
+# "vol_arbitrage" sin importar que estrategia la abrio realmente.
+# classify_strategy_from_journal() cruza cada fill contra el event journal
+# por client_order_id (id exacto, no una aproximacion) y devuelve
+# "unknown_legacy" en vez de adivinar cuando no hay match.
+fills["strategy"] = pe.classify_strategy_from_journal(fills, position_events_df_raw)
 fills["option_type"] = fills["symbol"].apply(pe.classify_option_type)
 
 closed_trades, open_lots = pe.match_trades_fifo(fills)
@@ -202,27 +216,19 @@ st.divider()
 st.subheader("Operaciones")
 
 
-def _load_position_events() -> pd.DataFrame:
+def _position_events_for_display(events_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Lee logs/position_events.csv (Fase 5.3, ver
-    ggal_bot/portfolio/event_journal.py) - archivo NUEVO e independiente de
-    shadow_trades.csv, arranca vacio/inexistente hasta el primer evento de
-    lifecycle registrado DESPUES de este deploy (no reconstruye historial
-    previo, ver docstring del modulo).
+    Reordena logs/position_events.csv (ya cargado una sola vez arriba via
+    pe.load_position_events(), reusado tambien para
+    classify_strategy_from_journal() - no se relee el archivo dos veces)
+    para la pestaña "Lifecycle": mas reciente primero.
     """
-    if not POSITION_EVENTS_LOG.exists() or POSITION_EVENTS_LOG.stat().st_size == 0:
-        return pd.DataFrame()
-    try:
-        df = pd.read_csv(POSITION_EVENTS_LOG)
-    except (pd.errors.EmptyDataError, pd.errors.ParserError):
-        return pd.DataFrame()
-    if df.empty:
-        return df
-    df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
-    return df.sort_values("timestamp_utc", ascending=False).reset_index(drop=True)
+    if events_df.empty:
+        return events_df
+    return events_df.sort_values("timestamp_utc", ascending=False).reset_index(drop=True)
 
 
-position_events_df = _load_position_events()
+position_events_df = _position_events_for_display(position_events_df_raw)
 
 tab_closed, tab_open, tab_lifecycle = st.tabs([
     f"Cerradas ({len(closed_df_f)})", f"Abiertas ({len(open_positions_f)})",

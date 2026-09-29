@@ -26,14 +26,33 @@ IMPORTANTE - alcance y limitaciones (leer antes de confiar en los numeros):
        ggal_bot/data/live_shadow_feed.py); en modo real, el PnL "de verdad"
        siempre debe validarse contra get_account_positions() y los
        resumenes de cuenta del broker, no solo contra este CSV.
-    2. La clasificacion de estrategia (vol_arbitrage vs delta_hedge) es
-       DEDUCIDA por el simbolo, no un campo persistido: en la arquitectura
-       actual del bot, la UNICA fuente de ordenes sobre el subyacente/futuro
-       es DeltaHedgingEngine (run_bot._maybe_hedge) y la UNICA fuente de
-       ordenes sobre opciones es VolatilityArbitrageStrategy
-       (run_bot._act_on_signal) - por eso la deduccion es confiable HOY,
-       pero dejaria de serlo si en el futuro se agrega una estrategia
-       adicional que tambien opere opciones directamente.
+    2. BUG REAL CORREGIDO (2026-09-29, ver REPORT.md SS12.0): `classify_strategy(symbol)`
+       clasificaba TODO simbolo de opcion (sin importar cual estrategia lo
+       abrio realmente) como `"vol_arbitrage"` - la premisa que justificaba
+       esto ("la UNICA fuente de ordenes sobre opciones es
+       VolatilityArbitrageStrategy") dejo de ser cierta hace tiempo:
+       `weekly_asymmetric` y `scalping` tambien operan opciones
+       directamente. Verificado por comparacion fila a fila: de 577 trades
+       del export historico etiquetado "vol_arbitrage", 411 resultaron ser
+       duplicados exactos de trades de `scalping`/`weekly_asymmetric` mal
+       etiquetados. `classify_strategy()` se deja tal cual (varios tests
+       existentes dependen de su comportamiento historico y ningun otro
+       llamador de produccion consume el campo `strategy` que produce -
+       ver `ggal_bot/ops/manual_close.py` y `ggal_bot/portfolio/
+       reconciliation.py`, que solo usan `open_lots`, nunca `closed`) -
+       este bug NUNCA afecto el riesgo en vivo, solo el reporting/dashboard.
+       El camino correcto para el dashboard/exports es
+       `classify_strategy_from_journal()` (mas abajo), que cruza cada fill
+       contra `logs/position_events.csv` (Position Lifecycle Event
+       Journal, ver `ggal_bot/portfolio/event_journal.py`) por
+       `client_order_id` == `order_client_id` - el MISMO id de orden que
+       ambos archivos comparten (ver `state.request.client_order_id` en
+       `run_bot.py::_act_on_entry_signal`/`_act_on_exit_signal`), no una
+       aproximacion. Un fill sin match en el journal (tipicamente: anterior
+       al deploy de `event_journal.py`, 2026-09-07 17:05 UTC, commit
+       `b3397fd`) se etiqueta explicitamente `"unknown_legacy"` - NUNCA se
+       vuelve a adivinar `"vol_arbitrage"` por default, para no repetir el
+       mismo error.
     3. Sharpe aproximado: se calcula sobre la serie de retornos por trade
        cerrado (pnl_pct), SIN anualizar (la frecuencia de trades de este
        bot es demasiado irregular para una anualizacion estandar). Sirve
@@ -68,12 +87,20 @@ import numpy as np
 import pandas as pd
 
 from ggal_bot.config import SETTINGS
-from ggal_bot.paths import SHADOW_TRADES_LOG, STATE_FILE
+from ggal_bot.paths import POSITION_EVENTS_LOG, SHADOW_TRADES_LOG, STATE_FILE
 
 FILLS_COLUMNS = [
     "timestamp_utc", "client_order_id", "symbol", "side", "order_type",
     "quantity", "requested_price", "fill_price", "reference_price", "event",
 ]
+
+POSITION_EVENTS_COLUMNS = [
+    "timestamp_utc", "event_type", "position_id", "contract_key", "symbol",
+    "strategy_tag", "side", "quantity_delta", "quantity_after", "price",
+    "order_client_id", "reason", "data_unavailable_fields",
+]
+
+UNKNOWN_LEGACY_STRATEGY = "unknown_legacy"
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +152,110 @@ def load_fills(csv_path: Optional[Path] = None) -> pd.DataFrame:
     df = df.dropna(subset=["timestamp_utc", "quantity", "fill_price", "symbol", "side"])
     df = df.sort_values("timestamp_utc").reset_index(drop=True)
     return df
+
+
+def load_position_events(csv_path: Optional[Path] = None) -> pd.DataFrame:
+    """
+    Lee logs/position_events.csv (Position Lifecycle Event Journal, ver
+    ggal_bot/portfolio/event_journal.py) - archivo NUEVO e independiente de
+    shadow_trades.csv, solo tiene eventos desde su deploy (2026-09-07 17:05
+    UTC, commit b3397fd) en adelante, no reconstruye historial previo (ver
+    docstring de ese modulo). Tolerante a que el archivo todavia no exista
+    o este vacio - MISMO criterio que load_fills(), reutilizado aca para no
+    duplicar la carga entre dashboard/app.py (pestaña "Lifecycle") y
+    classify_strategy_from_journal() (mas abajo), que la necesitan ambas.
+    """
+    path = Path(csv_path) if csv_path is not None else POSITION_EVENTS_LOG
+    if not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame(columns=POSITION_EVENTS_COLUMNS)
+
+    try:
+        df = pd.read_csv(path)
+    except (pd.errors.EmptyDataError, pd.errors.ParserError):
+        return pd.DataFrame(columns=POSITION_EVENTS_COLUMNS)
+
+    if df.empty:
+        return pd.DataFrame(columns=POSITION_EVENTS_COLUMNS)
+
+    df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce", format="ISO8601")
+    return df
+
+
+def build_order_client_id_strategy_map(events_df: pd.DataFrame) -> Dict[str, str]:
+    """
+    Devuelve {order_client_id: strategy_tag} a partir del event journal -
+    la clave de cruce EXACTA (no aproximada) entre un fill de
+    shadow_trades.csv (columna client_order_id) y el evento de lifecycle
+    que lo origino (columna order_client_id): ambos son el MISMO
+    client_order_id de la orden real (ver run_bot.py::_act_on_entry_signal/
+    _act_on_exit_signal, que pasan
+    `order_client_id=state.request.client_order_id` al loguear el evento -
+    el mismo `state.request.client_order_id` que
+    ShadowAuditLogger.log_fill() ya persiste como `client_order_id` en
+    shadow_trades.csv).
+
+    Filas sin order_client_id (ej. REJECT: nunca llega a haber fill, asi
+    que no tiene orden real para cruzar) o sin strategy_tag se ignoran. Si
+    el mismo order_client_id aparece en mas de una fila (ej. ENTRY seguido
+    de un CLOSE posterior de la misma orden) se usa la PRIMERA con datos
+    validos - alcanza con una, y todas las filas de una misma orden
+    comparten el mismo strategy_tag por construccion.
+    """
+    mapping: Dict[str, str] = {}
+    if events_df.empty or "order_client_id" not in events_df.columns:
+        return mapping
+    for row in events_df.itertuples(index=False):
+        client_id = str(getattr(row, "order_client_id", "") or "").strip()
+        strategy_tag = str(getattr(row, "strategy_tag", "") or "").strip()
+        if not client_id or not strategy_tag:
+            continue
+        mapping.setdefault(client_id, strategy_tag)
+    return mapping
+
+
+def classify_strategy_from_journal(
+    fills: pd.DataFrame, events_df: Optional[pd.DataFrame] = None,
+) -> pd.Series:
+    """
+    Clasificacion de estrategia CORREGIDA (2026-09-29, ver REPORT.md
+    SS12.0) para el dashboard/exports: reemplaza a `fills["symbol"].apply
+    (classify_strategy)` (el bug real ya documentado - ver docstring del
+    modulo, punto 2). Devuelve una Serie alineada al indice de `fills`.
+
+    Regla, en orden:
+      1. Subyacente/futuro -> "delta_hedge" (esto SI era confiable con solo
+         el simbolo - DeltaHedgingEngine es la unica fuente de ordenes
+         sobre el subyacente - y sigue siendo confiable ahora).
+      2. Opcion CON match de client_order_id en el event journal -> el
+         strategy_tag REAL de ese match (weekly_asymmetric/scalping/
+         vol_arbitrage/lo que sea).
+      3. Opcion SIN match (tipicamente anterior al deploy del journal) ->
+         "unknown_legacy", NUNCA "vol_arbitrage" por default - no hay
+         evidencia para adivinar cual estrategia la abrio, y adivinar mal
+         es exactamente el bug que esto corrige.
+
+    Si `events_df` es None, se carga con load_position_events() (comodo
+    para el llamador tipico de dashboard/app.py); pasarlo explicitamente
+    evita releer el archivo dos veces cuando el llamador ya lo tiene (ej.
+    para la pestaña "Lifecycle").
+    """
+    if events_df is None:
+        events_df = load_position_events()
+    strategy_map = build_order_client_id_strategy_map(events_df)
+
+    def _classify_row(row) -> str:
+        symbol = getattr(row, "symbol", "")
+        if _is_underlying_symbol(symbol):
+            return "delta_hedge"
+        client_id = str(getattr(row, "client_order_id", "") or "").strip()
+        return strategy_map.get(client_id, UNKNOWN_LEGACY_STRATEGY)
+
+    if fills.empty:
+        return pd.Series([], dtype=object, index=fills.index)
+    return pd.Series(
+        [_classify_row(row) for row in fills.itertuples(index=False)],
+        index=fills.index,
+    )
 
 
 def load_bot_state(path: Optional[Path] = None) -> Dict[str, Any]:
