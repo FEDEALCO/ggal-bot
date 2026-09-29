@@ -756,6 +756,104 @@ def test_scan_entry_signals_min_days_to_expiry_default_none_preserves_behavior()
     assert strategy.last_scan_diagnostics.blocked_by_min_days_to_expiry == 0
 
 
+def test_scan_entry_signals_blocks_friday_entries_beyond_weekend_guard_when_enabled():
+    """
+    FIX 2026-09-29 (ver REPORT.md §4.0/§9.0, config.LongFirstConfig.
+    weekend_theta_guard_block_new_entries): con el flag activado y `now`
+    inyectado como un viernes, una entrada nueva sobre un vencimiento
+    posterior a ese viernes queda bloqueada - esa posicion, si se abriera,
+    tendria holding_business_days=0 y el weekend_theta_guard de salida la
+    cerraria casi de inmediato (mismo patron real que produjo 194/199
+    entradas de la muestra de Fase 0 cerradas en una mediana de 23s).
+    """
+    cfg = _default_config(weekend_theta_guard_block_new_entries=True)
+    assert cfg.weekend_theta_guard_enabled is True  # precondicion: el guard de salida sigue activo
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    spot = 5200.0
+    quotes = [
+        _quote("GFGC5000O", 5000, 0.45, spot, days_biz=3, expiry=date(2026, 10, 9)),
+        _quote("GFGC5300O", 5300, 0.58, spot, days_biz=3, expiry=date(2026, 10, 9)),
+        _quote("GFGC6100O", 6100, 0.58, spot, days_biz=3, expiry=date(2026, 10, 9)),
+    ]
+    surface = VolatilitySurface(quotes)
+    friday = datetime(2026, 10, 2, 14, 0, tzinfo=timezone.utc)  # 2026-10-02 es viernes; vencimiento 2026-10-09 es posterior
+    assert friday.weekday() == 4
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH", now=friday,
+    )
+    assert signals == []
+    # Las 3 comparten vencimiento posterior al viernes: el guard bloquea la
+    # entrada ANTES del chequeo de dislocacion (misma prioridad que el resto
+    # de los filtros "estructurales" de arriba), sin importar si alguna
+    # hubiera calificado como "barata".
+    assert strategy.last_scan_diagnostics.blocked_by_weekend_entry_guard == 3
+
+
+def test_scan_entry_signals_friday_guard_default_off_preserves_behavior():
+    """Sin activar el flag (default False), un viernes se comporta exactamente igual que cualquier otro dia - sin cambios."""
+    cfg = _default_config()  # weekend_theta_guard_block_new_entries no seteado -> False
+    assert cfg.weekend_theta_guard_block_new_entries is False
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    spot = 5200.0
+    quotes = [
+        _quote("GFGC5000O", 5000, 0.45, spot, days_biz=3, expiry=date(2026, 10, 9)),
+        _quote("GFGC5300O", 5300, 0.58, spot, days_biz=3, expiry=date(2026, 10, 9)),
+        _quote("GFGC6100O", 6100, 0.58, spot, days_biz=3, expiry=date(2026, 10, 9)),
+    ]
+    surface = VolatilitySurface(quotes)
+    friday = datetime(2026, 10, 2, 14, 0, tzinfo=timezone.utc)
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH", now=friday,
+    )
+    assert any(s.symbol == "GFGC5000O" for s in signals)
+    assert strategy.last_scan_diagnostics.blocked_by_weekend_entry_guard == 0
+
+
+def test_scan_entry_signals_friday_guard_ignores_non_friday_even_when_enabled():
+    """Mismo escenario que arriba, pero `now` es un jueves - el flag activado no debe bloquear nada fuera de viernes."""
+    cfg = _default_config(weekend_theta_guard_block_new_entries=True)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    spot = 5200.0
+    quotes = [
+        _quote("GFGC5000O", 5000, 0.45, spot, days_biz=3, expiry=date(2026, 10, 9)),
+        _quote("GFGC5300O", 5300, 0.58, spot, days_biz=3, expiry=date(2026, 10, 9)),
+        _quote("GFGC6100O", 6100, 0.58, spot, days_biz=3, expiry=date(2026, 10, 9)),
+    ]
+    surface = VolatilitySurface(quotes)
+    thursday = datetime(2026, 10, 1, 14, 0, tzinfo=timezone.utc)
+    assert thursday.weekday() == 3
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH", now=thursday,
+    )
+    assert any(s.symbol == "GFGC5000O" for s in signals)
+    assert strategy.last_scan_diagnostics.blocked_by_weekend_entry_guard == 0
+
+
+def test_scan_entry_signals_friday_guard_allows_entry_expiring_that_same_friday():
+    """
+    Si el vencimiento ES ese mismo viernes (q.expiry == now.date(), no
+    posterior), el guard de salida nunca aplicaria (misma condicion
+    `expiry > now.date()` que risk_manager.evaluate_position_exit) - el
+    filtro de entrada debe espejar exactamente esa condicion y no bloquear.
+    """
+    cfg = _default_config(weekend_theta_guard_block_new_entries=True)
+    strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)
+    spot = 5200.0
+    friday_date = date(2026, 10, 2)
+    quotes = [
+        _quote("GFGC5000O", 5000, 0.45, spot, days_biz=0, expiry=friday_date),
+        _quote("GFGC5300O", 5300, 0.58, spot, days_biz=0, expiry=friday_date),
+        _quote("GFGC6100O", 6100, 0.58, spot, days_biz=0, expiry=friday_date),
+    ]
+    surface = VolatilitySurface(quotes)
+    friday = datetime(2026, 10, 2, 14, 0, tzinfo=timezone.utc)
+    signals = strategy.scan_entry_signals(
+        surface, recent_volumes={q.symbol: 1000.0 for q in quotes}, trend="BULLISH", now=friday,
+    )
+    assert any(s.symbol == "GFGC5000O" for s in signals)
+    assert strategy.last_scan_diagnostics.blocked_by_weekend_entry_guard == 0
+
+
 def test_scan_entry_signals_ranks_by_convexity_score_descending():
     cfg = _default_config()
     strategy = WeeklyAsymmetricStrategy(_lenient_risk_manager(), config=cfg)

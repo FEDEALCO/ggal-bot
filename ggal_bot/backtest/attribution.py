@@ -350,3 +350,101 @@ def attribute_by_entry_hour_art(trades: Sequence[Trade]) -> List[AttributionBuck
         return f"{art.hour:02d}h ART"
 
     return _bucketize(trades, key_fn)
+
+
+def is_friday_entry_weekend_guard_trade(t: Trade) -> bool:
+    """
+    Identifica un trade "viernes flash" (FIX 2026-09-29, hallazgo verificado
+    por lectura de codigo, ver REPORT.md §4.0/§9.0 y
+    config.LongFirstConfig.weekend_theta_guard_block_new_entries): entrada
+    un viernes (hora ART, mismo criterio de zona horaria que
+    attribute_by_entry_hour_art) cerrada por el motivo real "weekend_theta_
+    guard" - exactamente el patron que scan_entry_signals() ahora puede
+    evitar con el flag opt-in de arriba. Requiere t.opened_at real y
+    t.close_reason == "weekend_theta_guard"; sin uno de los dos, devuelve
+    False (nunca se asume el patron sin ambos datos presentes).
+    """
+    if t.close_reason != "weekend_theta_guard" or t.opened_at is None:
+        return False
+    ts = t.opened_at
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    art = ts.astimezone(timezone(_ART_OFFSET))
+    return art.weekday() == 4
+
+
+def split_friday_weekend_guard_trades(trades: Sequence[Trade]) -> "tuple[List[Trade], List[Trade]]":
+    """
+    Separa `trades` en (viernes_flash, resto) segun
+    is_friday_entry_weekend_guard_trade. NUNCA descarta datos silenciosamente:
+    todo trade de entrada cae en exactamente uno de los dos grupos, y
+    len(viernes_flash) + len(resto) == len(trades) siempre.
+    """
+    flash = [t for t in trades if is_friday_entry_weekend_guard_trade(t)]
+    rest = [t for t in trades if not is_friday_entry_weekend_guard_trade(t)]
+    return flash, rest
+
+
+def trade_holding_business_days(t: Trade) -> Optional[int]:
+    """
+    Dias habiles (lunes a viernes, sin feriados locales) entre la fecha de
+    ENTRADA y la de SALIDA reales de `t`, calculados en hora ART (mismo
+    criterio de zona horaria que el resto de este modulo). Logica de
+    conteo DUPLICADA deliberadamente de risk/risk_manager.py::
+    _business_days_between (mismo criterio que ese modulo documenta: evitar
+    que backtest/ dependa de risk/, cada uno se mantiene con dependencias
+    minimas a proposito) - un trade cerrado el mismo dia habil que se abrio
+    da 0. None si falta opened_at o closed_at (nunca se fabrica una fecha).
+    """
+    if t.opened_at is None or t.closed_at is None:
+        return None
+
+    def _art_date(ts: datetime) -> date:
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone(timezone(_ART_OFFSET)).date()
+
+    start = _art_date(t.opened_at)
+    end = _art_date(t.closed_at)
+    if end <= start:
+        return 0
+    days = 0
+    current = start
+    while current < end:
+        current += timedelta(days=1)
+        if current.weekday() < 5:
+            days += 1
+    return days
+
+
+def split_by_holding_business_days_cutoff(
+    trades: Sequence[Trade], cutoff_business_days: int
+) -> "tuple[List[Trade], List[Trade], List[Trade]]":
+    """
+    Separa `trades` en (dentro_del_corte, mas_alla_del_corte, sin_fecha)
+    segun trade_holding_business_days(t) <= cutoff_business_days.
+
+    IMPORTANTE - que SI y que NO responde esto: "mas_alla_del_corte" son
+    trades reales que terminaron sosteniendose mas de `cutoff_business_days`
+    dias habiles, CON SU PNL REAL DE CIERRE COMPLETO (no un PnL simulado al
+    momento del corte). Ninguno de los exports disponibles tiene el precio
+    de la opcion EN el dia del corte (solo entrada y salida reales) - por lo
+    tanto esto NUNCA simula "que hubiera pasado si se forzaba el cierre en
+    el dia N": eso exigiria un precio que no existe y seria fabricado. Lo
+    que SI permite es medir, con datos 100% reales, cuanto del PnL total
+    esta concentrado en posiciones que terminaron sostenidas mas alla de
+    cada corte candidato - evidencia de correlacion/concentracion, no un
+    backtest del stop propuesto.
+    """
+    within: List[Trade] = []
+    beyond: List[Trade] = []
+    unknown: List[Trade] = []
+    for t in trades:
+        days = trade_holding_business_days(t)
+        if days is None:
+            unknown.append(t)
+        elif days <= cutoff_business_days:
+            within.append(t)
+        else:
+            beyond.append(t)
+    return within, beyond, unknown

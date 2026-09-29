@@ -61,3 +61,15 @@ vol_arbitrage,entry_hour_art,14h ART,48,8803.55,183.40729166666665,39.5833333333
 vol_arbitrage,entry_hour_art,22h ART,72,110071.31999999998,1528.768333333333,47.22222222222222
 vol_arbitrage,entry_hour_art,01h ART,22,76898.44,3495.3836363636365,77.27272727272727
 vol_arbitrage,entry_hour_art,07h ART,1,-84928.75,-84928.75,0.0
+weekly_asymmetric_sin_viernes_flash,close_reason,otro,1,23360.6,23360.6,100.0
+weekly_asymmetric_sin_viernes_flash,close_reason,stop,1,-84928.74999999999,-84928.74999999999,0.0
+weekly_asymmetric_sin_viernes_flash,close_reason,timeout,1,-32198.60000000001,-32198.60000000001,0.0
+weekly_asymmetric_sin_viernes_flash,moneyness,ITM >5%,1,23360.6,23360.6,100.0
+weekly_asymmetric_sin_viernes_flash,moneyness,OTM >5%,2,-117127.34999999999,-58563.674999999996,0.0
+weekly_asymmetric_sin_viernes_flash,dte,15+d,3,-93766.75,-31255.583333333332,33.33333333333333
+weekly_asymmetric_sin_viernes_flash,holding_time,1-6h,1,23360.6,23360.6,100.0
+weekly_asymmetric_sin_viernes_flash,holding_time,>3d,1,-84928.74999999999,-84928.74999999999,0.0
+weekly_asymmetric_sin_viernes_flash,holding_time,6-24h,1,-32198.60000000001,-32198.60000000001,0.0
+weekly_asymmetric_sin_viernes_flash,entry_hour_art,11h ART,1,23360.6,23360.6,100.0
+weekly_asymmetric_sin_viernes_flash,entry_hour_art,07h ART,1,-84928.74999999999,-84928.74999999999,0.0
+weekly_asymmetric_sin_viernes_flash,entry_hour_art,10h ART,1,-32198.60000000001,-32198.60000000001,0.0

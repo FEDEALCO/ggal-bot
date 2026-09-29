@@ -29,10 +29,12 @@ from ggal_bot.backtest.attribution import (
     attribute_by_holding_time,
     attribute_by_moneyness,
     load_spot_closes_csv,
+    split_by_holding_business_days_cutoff,
+    split_friday_weekend_guard_trades,
     unmapped_close_reasons,
     winner_loser_holding_profile,
 )
-from ggal_bot.backtest.costs import commission_tier_scenarios, default_scenarios
+from ggal_bot.backtest.costs import CostAssumptions, commission_tier_scenarios, default_scenarios
 from ggal_bot.backtest.metrics import StrategyReport, build_strategy_report
 from ggal_bot.backtest.reconstruct import (
     load_closed_trades_export,
@@ -45,14 +47,93 @@ _SPOT_CSV_PATH = Path(__file__).parent / "data" / "ggal_underlying_daily_2026-08
 
 
 def load_all_trades(lifecycle_path: Path, closed_trades_path: Path) -> dict:
-    """Devuelve {"weekly_asymmetric": (trades, still_open, incomplete), "scalping": (...), "vol_arbitrage": (trades, 0, 0)}."""
+    """
+    Devuelve {"weekly_asymmetric": (trades, still_open, incomplete), "scalping": (...),
+    "vol_arbitrage": (trades, 0, 0), "weekly_asymmetric_sin_viernes_flash": (...)}.
+
+    La 4ta clave (FIX 2026-09-29, ver REPORT.md §4.0/§9.0) es una
+    PSEUDO-estrategia derivada, NO una estrategia nueva: los mismos trades
+    reales de weekly_asymmetric, excluyendo los "viernes flash" (entrada un
+    viernes ART, cerrados por weekend_theta_guard - ver
+    attribution.split_friday_weekend_guard_trades) que scan_entry_signals()
+    ahora puede evitar con weekend_theta_guard_block_new_entries=True (ver
+    config.LongFirstConfig). Se agrega AL LADO de la fila real de
+    weekly_asymmetric (que sigue incluyendo el patron, tal como ocurrio en
+    los datos) - nunca la reemplaza. n_still_open_excluded/n_excluded_
+    incomplete_data se heredan sin cambios: ninguno de esos dos conjuntos
+    es un trade cerrado, asi que el split no los toca.
+    """
     lifecycle_rows = load_lifecycle_journal_rows(lifecycle_path)
     out = {}
     for strategy in ("weekly_asymmetric", "scalping"):
         out[strategy] = reconstruct_lifecycle_trades(lifecycle_rows, strategies=(strategy,))
     vol_arb_trades = load_closed_trades_export(closed_trades_path)
     out["vol_arbitrage"] = (vol_arb_trades, 0, 0)
+
+    wa_trades, wa_still_open, wa_incomplete = out["weekly_asymmetric"]
+    _flash, _rest = split_friday_weekend_guard_trades(wa_trades)
+    out["weekly_asymmetric_sin_viernes_flash"] = (_rest, wa_still_open, wa_incomplete)
     return out
+
+
+_VOL_ARB_HOLDING_CUTOFFS_BUSINESS_DAYS = (1, 2, 3)
+
+
+def run_vol_arbitrage_holding_cutoff_analysis(closed_trades_path: Path) -> List[StrategyReport]:
+    """
+    Item 1 de la ronda 2026-09-29 (A, solo vol_arbitrage): para cada corte
+    candidato de dias habiles de tenencia (1, 2, 3), separa los trades REALES
+    de vol_arbitrage en "sostenidos <= N dias habiles" vs. "sostenidos > N
+    dias habiles" (ver attribution.split_by_holding_business_days_cutoff) y
+    construye un StrategyReport completo (bootstrap incluido) para cada
+    cohorte, en el escenario de costo BASE (Gold, mid_sin_spread).
+
+    LIMITACION EXPLICITA (leer antes de interpretar la tabla resultante):
+    esto NO simula "que hubiera pasado si el bot hubiera forzado el cierre
+    en el dia N" - eso exigiria el precio de la opcion EN el dia del corte,
+    dato que no existe en el export (solo hay precio de entrada y de
+    salida real). La cohorte "> N dias" usa el PnL REAL de cierre completo
+    de esos trades (con su holding real, que fue mas largo que N) - es
+    evidencia de correlacion/concentracion de perdida en tenencias largas,
+    no un backtest exacto del stop propuesto. Ademas, vol_arbitrage no
+    tiene Griegas (delta) registradas por trade en el export historico
+    (mismo DATA INSUFFICIENT ya documentado en REPORT.md §4.1/§4.3) - por
+    lo tanto una conversion real de ATR del subyacente a stop de prima via
+    delta NO se puede validar retroactivamente con estos datos; el stop de
+    perdida en unidades de PRIMA que pidio el usuario ya existe en
+    produccion (config.VolArbitrageConfig.stop_loss_pct, default -50% de la
+    prima, aplicado via risk_manager.evaluate_position_exit igual que en
+    weekly_asymmetric) - no hace falta codigo nuevo para ese parametro,
+    solo falta decidir el corte de dias vía este analisis.
+    """
+    vol_arb_trades = load_closed_trades_export(closed_trades_path)
+    base_scenario = CostAssumptions()  # gold, spread_round_trip_pct=0.0 ("mid_sin_spread")
+    reports: List[StrategyReport] = []
+    for cutoff in _VOL_ARB_HOLDING_CUTOFFS_BUSINESS_DAYS:
+        within, beyond, unknown = split_by_holding_business_days_cutoff(vol_arb_trades, cutoff)
+        reports.append(build_strategy_report(
+            f"vol_arbitrage_holding_leq_{cutoff}d", within, base_scenario, "mid_sin_spread",
+            n_excluded_incomplete_data=len(unknown),
+        ))
+        reports.append(build_strategy_report(
+            f"vol_arbitrage_holding_gt_{cutoff}d", beyond, base_scenario, "mid_sin_spread",
+            n_excluded_incomplete_data=len(unknown),
+        ))
+    return reports
+
+
+def print_friday_flash_split(all_trades: dict) -> None:
+    """Cuenta y muestra el split viernes-flash / resto para weekly_asymmetric (ver load_all_trades)."""
+    wa_trades, _, _ = all_trades["weekly_asymmetric"]
+    rest_trades, _, _ = all_trades["weekly_asymmetric_sin_viernes_flash"]
+    n_flash = len(wa_trades) - len(rest_trades)
+    print(
+        f"[FIX 2026-09-29] weekly_asymmetric: {n_flash}/{len(wa_trades)} trades cerrados son 'viernes flash' "
+        f"(entrada viernes ART cerrada por weekend_theta_guard, ver REPORT.md §4.0/§9.0). "
+        f"'weekly_asymmetric_sin_viernes_flash' abajo muestra los numeros de la estrategia SIN ese patron - "
+        f"son los que 'cuentan' segun el criterio pedido; los de 'weekly_asymmetric' a secas siguen incluyendolo "
+        f"tal como ocurrio realmente en la muestra."
+    )
 
 
 def run(lifecycle_path: Path, closed_trades_path: Path) -> List[StrategyReport]:
@@ -251,6 +332,9 @@ if __name__ == "__main__":
         raise SystemExit(1)
     lifecycle_path, closed_trades_path = Path(sys.argv[1]), Path(sys.argv[2])
 
+    print_friday_flash_split(load_all_trades(lifecycle_path, closed_trades_path))
+    print()
+
     reports = run(lifecycle_path, closed_trades_path)
     print_summary(reports)
     out = Path("fase0_results.csv")
@@ -262,3 +346,10 @@ if __name__ == "__main__":
     out_attr = Path("fase0_attribution.csv")
     write_attribution_csv(attribution, out_attr)
     print(f"\nAtribucion completa escrita en {out_attr.resolve()}")
+
+    print("\n=== Item 1 (ronda 2026-09-29): corte por dias habiles de tenencia - vol_arbitrage ===")
+    holding_reports = run_vol_arbitrage_holding_cutoff_analysis(closed_trades_path)
+    print_summary(holding_reports)
+    out_holding = Path("fase0_vol_arbitrage_holding_cutoffs.csv")
+    write_csv(holding_reports, out_holding)
+    print(f"\nAnalisis de corte por tenencia escrito en {out_holding.resolve()}")

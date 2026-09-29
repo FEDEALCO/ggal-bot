@@ -1338,6 +1338,7 @@ class GgalOptionsBot:
                     surface, self._recent_volumes, hv_estimate=hv_estimate,
                     trend=trend, momentum_shift=momentum_shift,
                     dislocation_zscore=dislocation_zscore, earnings_blackout=earnings_blackout,
+                    now=now,
                 )
                 if self.strategy.last_scan_diagnostics is not None:
                     entry_diagnostics_by_expiry[expiry] = self.strategy.last_scan_diagnostics

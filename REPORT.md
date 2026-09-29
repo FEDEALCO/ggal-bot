@@ -48,6 +48,16 @@ muy anchos). Significa que, con la evidencia disponible hoy, **ninguna de las tr
 tiene un caso demostrado de rentabilidad neta de costos**, y que activar cualquier mejora en vivo
 sin resolver esto primero sería prematuro.
 
+**⚠️ ACTUALIZACIÓN 2026-09-29 — la fila de `weekly_asymmetric` de arriba NO cuenta todavía (per
+instrucción explícita del usuario) hasta corregir el bug de §4.0.** El bug ya fue corregido (ver
+§4.0 y §9, punto 0) y la corrección tiene test de regresión, pero el fix es **opt-in** (apagado por
+defecto, todavía no desplegado en Northflank) — no cambia retroactivamente los 199 trades ya
+ocurridos, que siguen siendo datos reales. Al excluir del análisis los 196 trades que el fix habría
+evitado (ver metodología en §4.0), quedan solo **3 trades reales** de `weekly_asymmetric` en toda la
+ventana — **N insuficiente para concluir nada sobre la estrategia real** (ni a favor ni en contra).
+La fila de arriba sigue siendo el registro fiel de lo que pasó; la sección §4.0 explica por qué casi
+todo ese resultado es ruido de un bug de coordinación, no una medición de la estrategia en sí.
+
 ---
 
 ## 1. Alcance de la Fase 0
@@ -224,42 +234,94 @@ bruto antes de proponer ninguna mejora nueva. Este corte usa `ggal_bot/backtest/
 consultado el 2026-09-29 vía la API del broker). CSV completo con las 5 cortes × 3 estrategias:
 `fase0_attribution.csv`, adjunto en esta conversación.
 
-### 4.0 Hallazgo más importante: entradas de viernes auto-liquidadas por `weekend_theta_guard`
+### 4.0 Hallazgo más importante: entradas de viernes auto-liquidadas por `weekend_theta_guard` — **FIX IMPLEMENTADO 2026-09-29**
 
-**194 de los 199 trades de `weekly_asymmetric` (97,5%) se abren un VIERNES y se cierran en menos de
-60 segundos** (mediana: 23 segundos), forzados por el propio `weekend_theta_guard` — un guard
-**real e intencional** (`ggal_bot/risk/risk_manager.py::evaluate_position_exit`, línea 246-255;
-documentado en `config.py` desde un incidente real de -$133.568 de decay de fin de semana no
-capturado). El guard dispara si `now.weekday() == 4` (viernes) y el vencimiento es posterior a
+**196 de los 199 trades de `weekly_asymmetric` (98,5%) se abren un VIERNES (hora ART) y se cierran
+en menos de 60 segundos** (mediana: 23 segundos), forzados por el propio `weekend_theta_guard` — un
+guard **real e intencional** (`ggal_bot/risk/risk_manager.py::evaluate_position_exit`, línea
+246-255; documentado en `config.py` desde un incidente real de -$133.568 de decay de fin de semana
+no capturado). El guard dispara si `now.weekday() == 4` (viernes) y el vencimiento es posterior a
 ese día, **sin ningún piso de tiempo mínimo de tenencia** (`weekend_theta_guard_max_holding_business_days=None`
 por defecto) — es decir, se aplica igual a una posición abierta hace 3 días que a una abierta hace
 8 segundos.
 
-**El problema verificado por lectura de código:** la lógica de ENTRADA de `weekly_asymmetric.py`
-(`scan_entry_signals`) **no chequea el día de la semana en ningún lado** — no existe ningún gate
-que evite abrir una posición nueva basada en una tesis de "horizonte semanal" (15-25 días hábiles,
-según el propio motivo de entrada registrado) un viernes, sabiendo que el propio guard la va a
+_(Nota: la primera entrega de este reporte decía 194/199, calculado ad-hoc sobre el día de la semana
+en UTC crudo. El número correcto, recalculado con la conversión a hora ART igual que el resto de
+este documento — ver `attribution.is_friday_entry_weekend_guard_trade`, que ahora tiene 5 tests —
+es **196/199**. La diferencia son 2 trades cuyo timestamp en UTC cae ya en sábado pero que en ART
+(UTC-3) siguen siendo viernes de noche. No cambia ninguna conclusión, corrige la precisión del
+número.)_
+
+**El problema, verificado por lectura de código:** la lógica de ENTRADA de `weekly_asymmetric.py`
+(`scan_entry_signals`) **no chequeaba el día de la semana en ningún lado** — no existía ningún gate
+que evitara abrir una posición nueva basada en una tesis de "horizonte semanal" (15-25 días hábiles,
+según el propio motivo de entrada registrado) un viernes, sabiendo que el propio guard la iba a
 revertir casi con certeza en el siguiente ciclo de evaluación. El resultado observado en esta
 ventana:
 
 | | N | PnL bruto sum (ARS) | Costo regulatorio total (ARS, mid_sin_spread) | PnL NETO (ARS) |
 |---|---:|---:|---:|---:|
-| Entradas de viernes cerradas en <60s por weekend_theta_guard | 194 | +9.904 | 618.981 | **-609.077** |
-| Resto de `weekly_asymmetric` (stop_loss, otro, timeout >60s) | 5 | -96.541 | ~14.615 | ~-111.693 |
-| **Total `weekly_asymmetric`** | 199 | -86.637 | ~633.596 | -720.770 |
+| Entradas de viernes cerradas por weekend_theta_guard | 196 | +7.129 | 625.602 | **-618.472** |
+| Resto de `weekly_asymmetric` (stop_loss, otro) | 3 | -93.767 | 8.531 | -102.298 |
+| **Total `weekly_asymmetric`** | 199 | -86.637 | 634.133 | -720.770 |
 
-**Estas 194 entradas relámpago explican ~85% del PnL neto negativo total de `weekly_asymmetric` en
-esta ventana** (-609.077 de -720.770 ARS) — no por tener un edge bruto negativo (de hecho suman
-+9.904 ARS, prácticamente ruido/breakeven), sino porque cada una paga el costo regulatorio COMPLETO
+(Fila "resto" = exactamente los mismos 3 trades y números de
+`weekly_asymmetric_sin_viernes_flash` de la tabla más abajo — calculados una sola vez, mostrados en
+ambos lugares para que el desglose 196+3=199 sea directamente verificable.)
+
+**Estas 196 entradas relámpago explican ~85,8% del PnL neto negativo total de `weekly_asymmetric`
+en esta ventana** (-618.472 de -720.770 ARS) — no por tener un edge bruto negativo (de hecho suman
++7.129 ARS, prácticamente ruido/breakeven), sino porque cada una paga el costo regulatorio COMPLETO
 de un round-trip (~1,7% del nocional, ~188.000 ARS promedio por trade) por una posición que nunca
-tuvo tiempo de desarrollar su tesis. Esto es un **problema estructural y recurrente** (se va a
-repetir todos los viernes mientras el bot corra, no es un evento aislado de esta muestra), y es el
-hallazgo más accionable de todo este diagnóstico: **candidato a prioridad #0 de Fase 1** (por
-delante de los 5 puntos ya acordados) — un gate opt-in en la entrada que evite abrir posiciones
-nuevas de horizonte semanal un viernes (o que exija que el horizonte restante hasta el vencimiento
-sobreviva el propio guard), sin tocar el guard en sí (que existe por una razón real y documentada).
-Ver §8 para la propuesta concreta (sin implementar todavía, a la espera de confirmación del
-usuario).
+tuvo tiempo de desarrollar su tesis. Este era un **problema estructural y recurrente** (se iba a
+repetir todos los viernes mientras el bot corriera, no un evento aislado de esta muestra).
+
+**Fix implementado (commit de esta ronda), opt-in, apagado por defecto:**
+
+- Nuevo parámetro `now: Optional[datetime]` en `weekly_asymmetric.py::scan_entry_signals()` —
+  inyectado por el llamador (`run_bot.py`, que ya calculaba `now = datetime.now(timezone.utc)` en
+  el mismo scope), nunca calculado internamente (mismo criterio de diseño que
+  `risk_manager.evaluate_position_exit()` ya documentaba para este módulo).
+- Nuevo flag `config.LongFirstConfig.weekend_theta_guard_block_new_entries` (env
+  `GGAL_BOT_WEEKEND_THETA_GUARD_BLOCK_NEW_ENTRIES`, **default `False`**): con el flag activado y
+  `weekend_theta_guard_enabled` también activo (el guard de SALIDA, que no se toca), una cotización
+  cuyo vencimiento es posterior a un viernes vigente (`now.weekday() == 4 and q.expiry >
+  now.date()`) queda excluida de `scan_entry_signals()` **antes** de cualquier otro filtro —
+  exactamente la misma condición bajo la que el guard de salida cerraría esa posición casi de
+  inmediato si se abriera. El guard de salida en sí **no se modifica**: sigue cerrando cualquier
+  posición ya abierta un viernes, exactamente igual que siempre.
+- Contador de diagnóstico nuevo `EntryScanDiagnostics.blocked_by_weekend_entry_guard` (visible en
+  los logs de diagnóstico existentes, mismo patrón que los demás filtros).
+- **6 tests de regresión nuevos** en `test_long_first_mode.py`: bloqueo con flag activado en
+  viernes, sin cambio de comportamiento con el flag apagado (default), sin efecto fuera de viernes
+  aunque el flag esté activado, y el caso límite de vencimiento el mismo viernes (no posterior, no
+  se bloquea — misma condición exacta que el guard de salida). Los 466 tests de la suite completa
+  pasan.
+- **Recomendación explícita, dada la evidencia de arriba: activar
+  `GGAL_BOT_WEEKEND_THETA_GUARD_BLOCK_NEW_ENTRIES=true`** — pero la decisión de activarlo en
+  producción/shadow queda en manos del usuario (no se activó un default distinto de `False` sin
+  confirmación).
+
+**Los "196 de 199" NO desaparecen retroactivamente** — son trades reales que ya ocurrieron; el fix
+solo evita que el patrón se repita hacia adelante. Al excluir esos 196 trades del análisis (no
+descartarlos: separarlos, ver `attribution.split_friday_weekend_guard_trades`, 2 tests nuevos),
+queda lo que la estrategia hizo el resto del tiempo:
+
+| Escenario | N | PnL bruto (ARS) | PnL neto (ARS) | Sharpe/trade (IC 95%) |
+|---|---:|---:|---:|---:|
+| `weekly_asymmetric` (con el patrón, dato real sin filtrar) | 199 | -86.637 | -720.770 | -0,55 (-2,06 a -0,40) |
+| `weekly_asymmetric_sin_viernes_flash` (excluyendo el patrón) | **3** | -93.767 | -102.298 | -0,58 (-2,40 a +0,14) |
+
+**N=3 es insuficiente para concluir absolutamente nada sobre la estrategia real** — ni que funciona,
+ni que no funciona. Es el hallazgo más honesto posible con los datos actuales: **casi toda la
+"actividad" observada de `weekly_asymmetric` en esta ventana era el bug, no la estrategia**. Los 3
+trades reales que quedan (2 perdedores grandes, -84.929 y -32.199 ARS; 1 ganador de +23.361 ARS)
+no alcanzan ni de lejos el tamaño de muestra mínimo para el bootstrap (`build_strategy_report`
+igual lo calcula porque técnicamente hay ≥100 resamples válidos, pero el intervalo resultante,
+-2,40 a +0,14, es tan ancho que no es informativo). **Recomendación: no juzgar la viabilidad de
+`weekly_asymmetric` con esta muestra — activar el fix y acumular trades reales nuevos (sin el ruido
+del bug) antes de decidir si la estrategia tiene edge real.** Detalle completo por corte (motivo de
+salida, moneyness, DTE, tenencia, hora) de ambas filas en `fase0_attribution.csv`.
 
 ### 4.1 Motivo de salida (bucket: stop / take_profit / timeout / otro)
 
@@ -459,10 +521,12 @@ código, con una causa raíz clara y una propuesta de fix concreta (§9, punto 0
 Ninguna flag debe activarse en vivo con la evidencia actual. Orden actualizado tras el diagnóstico
 de PnL bruto (§4) y la confirmación del usuario del 2026-09-29:
 
-0. **(Nuevo, prioridad más alta que los 5 puntos ya acordados)** Corregir la interacción
-   entrada-viernes / `weekend_theta_guard` de `weekly_asymmetric` (§4.0) — responsable de ~85% del
-   PnL neto negativo de esa estrategia en esta muestra. Propuesta concreta en §9, punto 0 (todavía
-   sin implementar, a la espera de confirmación del usuario).
+0. **HECHO (2026-09-29)** — corregida la interacción entrada-viernes / `weekend_theta_guard` de
+   `weekly_asymmetric` (§4.0) — responsable de ~86% del PnL neto negativo de esa estrategia en esta
+   muestra. Fix opt-in (`GGAL_BOT_WEEKEND_THETA_GUARD_BLOCK_NEW_ENTRIES`, default apagado), 6 tests
+   de regresión, ver §4.0/§9 punto 0. **Nuevo pendiente que este fix expone:** con el patrón
+   excluido, `weekly_asymmetric` solo tiene 3 trades reales en toda la ventana — no hay muestra
+   suficiente para evaluar la estrategia hasta acumular trades nuevos con el fix activado.
 1. Desplegar el logger de embudo de señales completo (persistiendo TODO el universo de candidatas
    por ciclo — strike, vencimiento, IV, dislocación, spread, profundidad, Griegas, y qué filtros
    pasó o no con qué valor, no solo señales) en Northflank junto con `market_snapshots.csv`, lo
@@ -482,17 +546,17 @@ Ver conversación para el detalle completo de cada ítem.
 
 ## 9. Pendiente de la ronda anterior (2026-09-29)
 
-0. **Propuesta (sin implementar, a confirmar con el usuario): gate opt-in de "no entrar en
-   horizonte semanal un viernes"** — fix directo para el hallazgo de §4.0. Idea de diseño: en
-   `weekly_asymmetric.py::scan_entry_signals`, si `weekend_theta_guard_enabled` está activo, no
-   generar una señal de entrada nueva cuando `now.weekday() == 4` (viernes) y el vencimiento
-   candidato es posterior a ese viernes — exactamente la misma condición que ya usa el guard de
-   salida (`risk_manager.py::evaluate_position_exit`, línea 246-255), para que ambas lógicas queden
-   coordinadas en vez de contradictorias. Alternativa más permisiva: permitir la entrada pero exigir
-   que el edge esperado sea grande respecto al costo regulatorio completo de un round-trip
-   (emparenta con el filtro k×costo del punto 2 de abajo). Cualquiera de las dos requiere
-   confirmación del usuario antes de tocar código de producción — el guard de salida existe por una
-   razón real y documentada (incidente de -$133.568), y no se toca. **Sigue pendiente.**
+0. **HECHO (2026-09-29) — gate opt-in de "no entrar en horizonte semanal un viernes"**, fix directo
+   para el hallazgo de §4.0. Implementado exactamente como se había diseñado: en
+   `weekly_asymmetric.py::scan_entry_signals`, con `weekend_theta_guard_block_new_entries` (nuevo,
+   default `False`) y `weekend_theta_guard_enabled` ambos activos, no se genera una señal de entrada
+   nueva cuando `now.weekday() == 4` (viernes) y el vencimiento candidato es posterior a ese viernes
+   — exactamente la misma condición que ya usa el guard de salida
+   (`risk_manager.py::evaluate_position_exit`, línea 246-255), coordinando ambas lógicas en vez de
+   dejarlas contradictorias. El guard de salida **no se tocó** (sigue existiendo por la razón real y
+   documentada del incidente de -$133.568). 6 tests de regresión nuevos, ver §4.0 para el detalle
+   completo y los números recalculados (n=3 real tras excluir el patrón — insuficiente para juzgar la
+   estrategia, ver recomendación en §4.0).
 
 1. **HECHO — Edge bruto mínimo para breakeven vs. edge bruto observado**, agregado a
    `metrics.StrategyReport` (`avg_gross_pnl_ars_per_trade`, `avg_cost_ars_per_trade`,
@@ -588,6 +652,20 @@ como un resultado.
   2026-09-29. **No verifiqué todavía un índice específicamente bancario** (el usuario mencionó
   "Merval o índice bancario") — antes de asumir cuál usar, decime si tenés un ticker específico de
   índice sectorial bancario en mente para que lo pruebe, o si MERVAL general alcanza.
+- **CCL implícito por bonos: CONFIRMADO disponible (2026-09-29, ver instrucción del usuario de no
+  usar MERVAL nominal por el sesgo alcista de inflación).** `get_asset_info("GD30", "BCBA")` expone
+  un símbolo "cable" relacionado (`GD30C`) además del símbolo en pesos (`GD30`) — la convención de
+  mercado estándar para el dólar CCL implícito es `CCL = precio_ARS(GD30) / precio_USD(GD30C)`. Se
+  verificó con datos reales de la ventana 2026-09-01 a 2026-09-29: GD30 cerró en 87.650 (2026-09-29,
+  precio por 100 nominal en ARS) y GD30C cerró en 54,20 (mismo día, USD por 100 nominal) → CCL
+  implícito ≈ **1.617 ARS/USD** — consistente en orden de magnitud con el precio de GGAL en pesos de
+  esta ventana (~6.000 ARS) y un ADR de GGAL en NYSE de pocos dólares. Mismo cálculo se puede hacer
+  con `AL30`/`AL30C` como serie alternativa/de control. **No es una aproximación ni un dato
+  sintético** — es la forma estándar en que el mercado argentino calcula el CCL implícito todos los
+  días (arbitraje de bonos), simplemente construida acá con 2 llamadas a `get_price_history` en vez
+  de venir pre-calculada. Con esto, tanto el filtro de régimen (MERVAL/CCL en vez de MERVAL nominal)
+  como la señal de ruptura de GGAL en USD (GGAL_ARS / CCL) quedan con datos reales confirmados —
+  ninguno de los dos queda como DATA INSUFFICIENT.
 
 | Parámetro | Valor inicial propuesto | Por qué |
 |---|---|---|
@@ -627,3 +705,89 @@ Si confirmás este plan (o lo ajustás), sigo con: 10.A (esquema de salida, cód
 re-evaluación aproximada sobre trades de Fase 0), 10.B (módulo de rupturas + backtest sobre el
 subyacente, código + tests), 10.C (selectividad). Cada uno en commits separados, con su propia
 sección de resultados/limitaciones en REPORT.md.
+
+---
+
+## 11. Item 1 (ronda 2026-09-29) — corte por tiempo de tenencia, solo `vol_arbitrage`
+
+**Pedido del usuario:** stop por tiempo (probar máximo de tenencia de 1, 2 y 3 días hábiles) + stop
+de pérdida en unidades de la prima, para `vol_arbitrage` únicamente. Si no da neta positiva en el
+escenario base, recomendar apagar la estrategia.
+
+### El stop de pérdida en unidades de prima YA EXISTE en producción
+
+`config.VolArbitrageConfig.stop_loss_pct` (default `-50%` de la prima pagada, ver
+`GGAL_BOT_VOL_ARBITRAGE_STOP_LOSS_PCT`) ya está implementado y aplicado vía
+`risk_manager.evaluate_position_exit()` — exactamente el mismo mecanismo que `weekly_asymmetric`, y
+ya medido en unidades de PRIMA (no del subyacente), tal como pidió el usuario. **No hace falta
+código nuevo para este parámetro.** La conversión ATR-del-subyacente→prima-vía-delta que pidió el
+usuario como alternativa **no se puede validar retroactivamente**: el export histórico de
+`vol_arbitrage` no trae Griegas (delta) por trade — mismo DATA INSUFFICIENT ya documentado en
+§4.1/§4.3 — así que no hay con qué reconstruir esa conversión sobre los 577 trades ya cerrados. Con
+la config ya existente, esto queda resuelto sin necesidad de aproximar nada.
+
+### Stop por tiempo: `max_holding_business_days` también ya existe — falta decidir el corte
+
+`config.VolArbitrageConfig.max_holding_business_days` (default `None` = sin límite) ya está
+implementado, reutilizando el mismo mecanismo de horizonte que `weekly_asymmetric`. Lo que faltaba
+era evidencia para elegir un valor. Se construyó `attribution.trade_holding_business_days` +
+`split_by_holding_business_days_cutoff` (6 tests nuevos) para medir esto sobre los 577 trades reales
+de `vol_arbitrage`.
+
+**Límite metodológico explícito, a leer ANTES de la tabla:** ninguno de los dos exports tiene el
+precio de la opción en un día intermedio — solo entrada y salida reales. Por lo tanto esto **no
+simula** "qué hubiera pasado si el bot forzaba el cierre en el día N" (eso exigiría un precio que no
+existe, y sería fabricarlo). Lo que sí mide, con datos 100% reales: separando los trades en "los que
+YA terminaron sosteniéndose ≤N días hábiles" (su resultado real no depende de ningún stop
+hipotético, porque nunca llegaron a necesitarlo) vs. "los que terminaron sosteniéndose >N días" (su
+PnL real de cierre completo, no un cierre anticipado simulado).
+
+| Corte | Cohorte | N | PnL bruto (ARS) | Edge bruto/trade (ARS) | PnL neto (ARS, mid_sin_spread) | Sharpe/trade (IC 95%) |
+|---|---|---:|---:|---:|---:|---:|
+| 1 día hábil | ≤1d (real, sin stop necesario) | 545 | -8.826 | -16 | **-1.129.867** | -0,29 (-0,42 a -0,19) |
+| 1 día hábil | >1d (real, cierre completo) | 32 | **-689.268** | -21.540 | -749.355 | -0,40 (-0,68 a -0,10) |
+| 2 días hábiles | ≤2d | 548 | -6.394 | -12 | **-1.132.272** | -0,28 (-0,41 a -0,18) |
+| 2 días hábiles | >2d | 29 | **-691.700** | -23.852 | -746.950 | -0,45 (-0,75 a -0,14) |
+| 3 días hábiles | ≤3d | 555 | -43.104 | -78 | **-1.183.476** | -0,28 (-0,40 a -0,18) |
+| 3 días hábiles | >3d | 22 | **-654.989** | -29.772 | -695.746 | -0,49 (-0,86 a -0,14) |
+
+(Verificación de consistencia: en cada corte, N y PnL bruto de ambas cohortes suman exactamente el
+total de `vol_arbitrage` — 577 trades, -698.093 ARS bruto.)
+
+**Lectura, con el límite metodológico de arriba siempre presente:**
+
+1. **La pérdida bruta está brutalmente concentrada en una cola larga muy chica.** En el corte de 1
+   día, apenas 32 trades (5,5% del total) concentran el **98,7%** de toda la pérdida bruta de la
+   estrategia (-689.268 de -698.093 ARS) — con un edge bruto promedio de -21.540 ARS/trade, muy por
+   encima de cualquier costo regulatorio. Esto es evidencia real y fuerte de que "dejar correr las
+   perdedoras" (mismo patrón que §10.A ya insinuaba con el payoff bruto 0,47 de esta estrategia) es
+   un problema estructural real, no ruido de muestra.
+2. **Pero — y esto es lo que responde directamente al pedido del usuario ("si no da positiva neta,
+   recomendá apagarla") — incluso la cohorte "protegida" (≤N días, la que NO depende de ningún
+   supuesto sobre qué hubiera pasado con un stop) es NETA NEGATIVA en el escenario base, en los 3
+   cortes probados**, con un intervalo de confianza de Sharpe que **no cruza cero** en ningún caso
+   (-0,42 a -0,19 en el corte más favorable). Esto no es una aproximación ni una simulación: son
+   545-555 trades reales que jamás necesitaron ningún stop de tiempo (se cerraron solos antes del
+   corte) y aun así, bajo el costo regulatorio real más conservador posible (Gold, sin spread),
+   pierden en conjunto entre -1.129.867 y -1.183.476 ARS.
+3. Esto acota el mejor caso posible del stop de tiempo: aunque el stop lograra el resultado más
+   optimista imaginable sobre la cola larga (recortar toda la pérdida de esos 22-32 trades a cero,
+   algo que no se puede verificar con estos datos), la porción de la estrategia que SÍ se puede medir
+   sin ningún supuesto ya es neta negativa por sí sola.
+
+**Recomendación explícita, con la evidencia disponible: apagar `vol_arbitrage`** (que de hecho ya
+está en NO-GO de producción desde 2026-09-08, solo corre en shadow — ver docstring de
+`VolArbitrageConfig`). Un stop de tiempo (`max_holding_business_days` en 1, 2 o 3) es una mejora de
+riesgo real y recomendable igual (reduce la cola de pérdidas grandes, ver punto 1), pero **no
+alcanza para convertir la estrategia en neta positiva** con la evidencia de esta muestra — la fuente
+del problema no es únicamente la cola de trades largos, sino que la mayoría silenciosa de trades
+cortos ya pierde neto por costos sobre un edge bruto casi nulo (-16 a -78 ARS/trade, ver tabla).
+Antes de reconsiderar esto, haría falta el mismo tipo de evidencia nueva que para `weekly_asymmetric`
+(§4.0): datos post-fix, con Griegas reales por trade (para poder separar edge real de exposición
+direccional no cubierta, hipótesis ya planteada en §4.2) — es decir, depende del mismo despliegue de
+`market_snapshots.csv` + logger de embudo que ya es prioridad de Fase 1.
+
+**Reproducibilidad:** `ggal_bot.backtest.run_vol_arbitrage_holding_cutoff_analysis()`, 0 tests
+nuevos de lógica de negocio propia (reutiliza `metrics.build_strategy_report` ya testeado) + 6 tests
+nuevos de las funciones de corte en `attribution.py`. CSV completo:
+`fase0_vol_arbitrage_holding_cutoffs.csv`, adjunto en esta conversación.

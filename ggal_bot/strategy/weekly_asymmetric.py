@@ -238,6 +238,7 @@ class EntryScanDiagnostics:
     blocked_by_zscore: int = 0          # MEJORA 2026-09-28: ver config.LongFirstConfig.enable_zscore_filter
     blocked_by_execution_cost: int = 0  # MEJORA 2026-09-28: ver config.LongFirstConfig.enable_execution_cost_filter
     blocked_by_earnings_blackout: int = 0  # MEJORA 2026-09-28: ver config.LongFirstConfig.enable_earnings_blackout
+    blocked_by_weekend_entry_guard: int = 0  # FIX 2026-09-29: ver config.LongFirstConfig.weekend_theta_guard_block_new_entries
     qualified: int = 0                  # generaron EntrySignal
     trend: str = ""
     closest_miss_symbol: Optional[str] = None
@@ -265,6 +266,7 @@ class WeeklyAsymmetricStrategy:
         dislocation_zscore: Optional[Dict[str, float]] = None,
         earnings_blackout: bool = False,
         adr_ccl_trend: Optional[str] = None,
+        now: Optional[datetime] = None,
     ) -> List[EntrySignal]:
         """
         `trend`: lectura vigente de data.technical_analysis.get_daily_trend_signal()
@@ -306,6 +308,20 @@ class WeeklyAsymmetricStrategy:
         llamador la inyecta. Cuando esta habilitado y discrepa de `trend`
         para un `option_type` dado, exige el umbral EXTREMO en vez del
         normal (mismo patron que Momentum Shift), nunca bloquea de plano.
+
+        `now` (FIX 2026-09-29, ver config.LongFirstConfig.
+        weekend_theta_guard_block_new_entries y REPORT.md §4.0/§9.0):
+        fecha/hora vigente, inyectada por el llamador exactamente igual que
+        `trend` (mismo criterio de diseño del docstring del modulo: este
+        metodo sigue sin llamar datetime.now() internamente). Se usa
+        UNICAMENTE para, con el flag de arriba activado, no generar una
+        entrada nueva un viernes sobre un vencimiento posterior a ese
+        viernes cuando weekend_theta_guard_enabled esta activo - esa
+        posicion quedaria con holding_business_days=0 y el guard de salida
+        la cerraria casi de inmediato en el siguiente ciclo de riesgo (ver
+        risk/risk_manager.py::evaluate_position_exit). Con `now=None`
+        (default) o el flag apagado, este chequeo no se aplica: identico
+        al comportamiento de siempre.
         """
         cfg = self.cfg
         ta_cfg = SETTINGS.technical_analysis
@@ -409,6 +425,29 @@ class WeeklyAsymmetricStrategy:
             min_days_to_expiry = getattr(cfg, "min_business_days_to_expiry_for_entry", None)
             if min_days_to_expiry is not None and q.days_business < min_days_to_expiry:
                 diag.blocked_by_min_days_to_expiry += 1
+                continue
+
+            # Weekend theta guard coordinado con la entrada (FIX 2026-09-29,
+            # ver docstring de `now` arriba y config.LongFirstConfig.
+            # weekend_theta_guard_block_new_entries): opt-in, default False.
+            # Espeja la condicion exacta bajo la que
+            # risk_manager.evaluate_position_exit() va a cerrar esta misma
+            # posicion por "weekend_theta_guard" si se abriera ahora (con
+            # holding_business_days=0 recien abierta) - NO afloja el guard
+            # de salida, solo evita abrir algo que el guard va a cerrar el
+            # mismo dia.
+            if (
+                now is not None
+                and cfg.weekend_theta_guard_enabled
+                and getattr(cfg, "weekend_theta_guard_block_new_entries", False)
+                and now.weekday() == 4
+                and q.expiry > now.date()
+                and (
+                    cfg.weekend_theta_guard_max_holding_business_days is None
+                    or 0 < cfg.weekend_theta_guard_max_holding_business_days
+                )
+            ):
+                diag.blocked_by_weekend_entry_guard += 1
                 continue
 
             volume = recent_volumes.get(q.symbol, 0.0)

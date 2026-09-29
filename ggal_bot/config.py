@@ -861,6 +861,36 @@ class LongFirstConfig:
         _env_int("GGAL_BOT_WEEKEND_THETA_GUARD_MAX_HOLDING_BUSINESS_DAYS", 0) or None
     )
 
+    # FIX 2026-09-29 (ver REPORT.md secciones 4.0 y 9.0, hallazgo verificado
+    # por lectura de codigo): weekend_theta_guard_enabled (arriba) cierra
+    # CUALQUIER posicion cuyo vencimiento no haya llegado todavia, todos los
+    # viernes - pero scan_entry_signals() nunca supo que dia es, asi que
+    # nada le impedia generar una entrada nueva un viernes sobre un
+    # vencimiento posterior. Esa posicion recien abierta tiene
+    # holding_business_days=0, lo que dispara el guard casi de inmediato en
+    # el primer ciclo de riesgo siguiente (weekend_theta_guard_max_holding_
+    # business_days=0 no lo evita: 0 < N es cierto para cualquier N>=1, y
+    # con el default None el guard nunca tiene excepcion). En la muestra
+    # real de Fase 0, esto produjo 194/199 (97.5%) de las entradas de
+    # weekly_asymmetric: viernes abiertas y cerradas por este guard en una
+    # mediana de 23 SEGUNDOS, cobrando el costo regulatorio de round-trip
+    # completo (-609.077 ARS neto) sobre un PnL bruto de apertura/cierre
+    # casi nulo (+9.904 ARS) - aproximadamente 85% de la perdida neta total
+    # de la estrategia en la muestra.
+    #
+    # Esto NO afloja el guard (que sigue cerrando cualquier posicion ya
+    # abierta un viernes, exactamente igual que siempre): esto evita ABRIR
+    # una posicion nueva que el guard va a cerrar el mismo dia por
+    # construccion. Opt-in, default False (cambio de comportamiento real
+    # solo si se activa explicitamente vía
+    # GGAL_BOT_WEEKEND_THETA_GUARD_BLOCK_NEW_ENTRIES) - se recomienda
+    # activarlo dada la evidencia de arriba, pero queda a criterio explicito
+    # del usuario (ver weekly_asymmetric.py::scan_entry_signals, parametro
+    # `now`).
+    weekend_theta_guard_block_new_entries: bool = _env_bool(
+        "GGAL_BOT_WEEKEND_THETA_GUARD_BLOCK_NEW_ENTRIES", False
+    )
+
     # --- Salida forzada, medida sobre la PRIMA pagada (no sobre el subyacente) ---
     stop_loss_pct: float = _env_float("GGAL_BOT_STOP_LOSS_PCT", 0.50)     # -50% de la prima -> cerrar
     take_profit_pct: float = _env_float("GGAL_BOT_TAKE_PROFIT_PCT", 1.00)  # +100% de la prima -> cerrar

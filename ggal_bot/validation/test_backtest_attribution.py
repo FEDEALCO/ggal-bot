@@ -28,10 +28,14 @@ from ggal_bot.backtest.attribution import (
     attribute_by_holding_time,
     attribute_by_moneyness,
     bucket_close_reason,
+    is_friday_entry_weekend_guard_trade,
     load_spot_closes_csv,
     nearest_close_on_or_before,
     parse_contract_key_expiry,
     parse_option_symbol,
+    split_by_holding_business_days_cutoff,
+    split_friday_weekend_guard_trades,
+    trade_holding_business_days,
     unmapped_close_reasons,
     winner_loser_holding_profile,
 )
@@ -210,6 +214,82 @@ def test_attribute_by_entry_hour_art_converts_from_utc():
     assert buckets[0].label == "11h ART"
 
 
+def test_is_friday_entry_weekend_guard_trade_true_when_both_conditions_hold():
+    """2026-09-11 14:00 UTC = 11:00 ART, viernes; close_reason es exactamente 'weekend_theta_guard'."""
+    t = _trade(opened="2026-09-11T14:00:00+00:00", close_reason="weekend_theta_guard")
+    assert is_friday_entry_weekend_guard_trade(t) is True
+
+
+def test_is_friday_entry_weekend_guard_trade_false_if_close_reason_differs():
+    """Mismo viernes, pero cerrado por otro motivo (ej. stop_loss) - no es el patron 'viernes flash'."""
+    t = _trade(opened="2026-09-11T14:00:00+00:00", close_reason="stop_loss")
+    assert is_friday_entry_weekend_guard_trade(t) is False
+
+
+def test_is_friday_entry_weekend_guard_trade_false_if_not_friday():
+    """Jueves 2026-09-10, mismo close_reason - el dia de la semana es la otra condicion necesaria."""
+    t = _trade(opened="2026-09-10T14:00:00+00:00", close_reason="weekend_theta_guard")
+    assert is_friday_entry_weekend_guard_trade(t) is False
+
+
+def test_is_friday_entry_weekend_guard_trade_uses_art_not_utc_at_day_boundary():
+    """
+    2026-09-12T01:00:00+00:00 (sabado en UTC) es 2026-09-11T22:00:00 ART
+    (viernes de noche) - la conversion a ART (no UTC crudo) es la que
+    importa para juzgar el dia de la semana de la entrada.
+    """
+    t = _trade(opened="2026-09-12T01:00:00+00:00", close_reason="weekend_theta_guard")
+    assert is_friday_entry_weekend_guard_trade(t) is True
+
+
+def test_is_friday_entry_weekend_guard_trade_false_without_opened_at():
+    t = _trade(opened=None, close_reason="weekend_theta_guard")
+    assert is_friday_entry_weekend_guard_trade(t) is False
+
+
+def test_trade_holding_business_days_counts_weekdays_only():
+    """Jueves 2026-09-10 -> lunes 2026-09-14: 2 dias habiles (viernes y lunes; sabado/domingo no cuentan)."""
+    t = _trade(opened="2026-09-10T14:00:00+00:00", closed="2026-09-14T14:00:00+00:00")
+    assert trade_holding_business_days(t) == 2
+
+
+def test_trade_holding_business_days_same_day_is_zero():
+    t = _trade(opened="2026-09-10T11:00:00+00:00", closed="2026-09-10T18:00:00+00:00")
+    assert trade_holding_business_days(t) == 0
+
+
+def test_trade_holding_business_days_none_without_both_timestamps():
+    assert trade_holding_business_days(_trade(opened=None)) is None
+    assert trade_holding_business_days(_trade(closed=None)) is None
+
+
+def test_split_by_holding_business_days_cutoff_partitions_exhaustively():
+    trades = [
+        _trade(symbol="A", opened="2026-09-10T14:00:00+00:00", closed="2026-09-10T18:00:00+00:00"),  # 0 dias
+        _trade(symbol="B", opened="2026-09-10T14:00:00+00:00", closed="2026-09-11T14:00:00+00:00"),  # 1 dia
+        _trade(symbol="C", opened="2026-09-10T14:00:00+00:00", closed="2026-09-14T14:00:00+00:00"),  # 2 dias
+        _trade(symbol="D", opened=None, closed="2026-09-14T14:00:00+00:00"),                          # sin fecha
+    ]
+    within, beyond, unknown = split_by_holding_business_days_cutoff(trades, cutoff_business_days=1)
+    assert {t.symbol for t in within} == {"A", "B"}
+    assert {t.symbol for t in beyond} == {"C"}
+    assert {t.symbol for t in unknown} == {"D"}
+    assert len(within) + len(beyond) + len(unknown) == len(trades)
+
+
+def test_split_friday_weekend_guard_trades_partitions_exhaustively():
+    trades = [
+        _trade(symbol="A", opened="2026-09-11T14:00:00+00:00", close_reason="weekend_theta_guard"),  # flash
+        _trade(symbol="B", opened="2026-09-11T14:00:00+00:00", close_reason="stop_loss"),             # resto (viernes pero no ese motivo)
+        _trade(symbol="C", opened="2026-09-10T14:00:00+00:00", close_reason="weekend_theta_guard"),   # resto (motivo pero no viernes)
+        _trade(symbol="D", opened="2026-09-18T14:00:00+00:00", close_reason="weekend_theta_guard"),   # flash (otro viernes)
+    ]
+    flash, rest = split_friday_weekend_guard_trades(trades)
+    assert {t.symbol for t in flash} == {"A", "D"}
+    assert {t.symbol for t in rest} == {"B", "C"}
+    assert len(flash) + len(rest) == len(trades)
+
+
 ALL_TESTS = [
     test_bucket_close_reason_maps_known_reasons,
     test_bucket_close_reason_unknown_falls_back_to_otro,
@@ -226,6 +306,16 @@ ALL_TESTS = [
     test_winner_loser_holding_profile_computes_median_holding_and_pnl_per_group,
     test_winner_loser_holding_profile_excludes_zero_pnl_and_missing_holding,
     test_attribute_by_entry_hour_art_converts_from_utc,
+    test_is_friday_entry_weekend_guard_trade_true_when_both_conditions_hold,
+    test_is_friday_entry_weekend_guard_trade_false_if_close_reason_differs,
+    test_is_friday_entry_weekend_guard_trade_false_if_not_friday,
+    test_is_friday_entry_weekend_guard_trade_uses_art_not_utc_at_day_boundary,
+    test_is_friday_entry_weekend_guard_trade_false_without_opened_at,
+    test_split_friday_weekend_guard_trades_partitions_exhaustively,
+    test_trade_holding_business_days_counts_weekdays_only,
+    test_trade_holding_business_days_same_day_is_zero,
+    test_trade_holding_business_days_none_without_both_timestamps,
+    test_split_by_holding_business_days_cutoff_partitions_exhaustively,
 ]
 
 
