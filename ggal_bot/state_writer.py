@@ -36,6 +36,8 @@ class StateWriter:
         risk_breaches: str,
         extra: Optional[Dict[str, Any]] = None,
         option_chain_snapshot: Optional[List[Dict[str, Any]]] = None,
+        env_flags: Optional[Dict[str, str]] = None,
+        deployed_git_sha: Optional[str] = None,
     ) -> None:
         payload = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -53,6 +55,18 @@ class StateWriter:
             # usa ninguna parte del motor de trading (run_bot.py solo
             # ESCRIBE aca; nadie adentro del bot lo relee).
             "option_chain_snapshot": option_chain_snapshot or [],
+            # MEJORA 2026-09-30 (correccion de arquitectura de config del
+            # dashboard, a pedido explicito del usuario - ver REPORT.md):
+            # el bot publica ACA sus propias env vars GGAL_BOT_* efectivas
+            # (ya enmascaradas si el nombre sugiere una credencial, ver
+            # ggal_bot.env_introspection.list_ggal_bot_env_vars) y el SHA
+            # de git de ESTE deploy (ver ggal_bot.version_info). El
+            # dashboard debe leer la config del bot DESDE ACA, nunca de su
+            # propio os.environ - no hay garantia de que dashboard y bot
+            # compartan proceso/contenedor (ver Dockerfile/entrypoint.sh
+            # para la topologia DISEÑADA, no necesariamente la real).
+            "env_flags": env_flags or {},
+            "deployed_git_sha": deployed_git_sha or "unknown",
         }
         tmp_path = self.path.with_suffix(".tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:

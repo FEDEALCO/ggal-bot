@@ -399,14 +399,34 @@ def match_trades_fifo(
     1.0 para el subyacente/futuro (acciones), `option_multiplier` para
     cualquier opcion - nunca un unico valor global para todos los simbolos
     (ver nota de bug real en multiplier_for_symbol()).
+
+    BUG REAL CORREGIDO ACA (2026-09-30, encontrado al construir el panel de
+    reconciliacion del dashboard - ver REPORT.md): esta funcion ignoraba
+    por completo una columna "strategy" ya presente en `fills` y volvia a
+    calcular la estrategia de CADA fila llamando a classify_strategy(symbol)
+    -EL BUG ORIGINAL, siempre "vol_arbitrage" para cualquier opcion-, aunque
+    dashboard/app.py YA hubiera poblado fills["strategy"] con el valor
+    CORRECTO via classify_strategy_from_journal() antes de llamar a esta
+    funcion. En los hechos, la columna corregida quedaba calculada pero
+    nunca se usaba: ClosedTrade.strategy/OpenLot.strategy (y por lo tanto
+    la columna "Estrategia" de las tablas Cerradas/Abiertas, y el filtro de
+    estrategia de la sidebar) seguian mostrando la clasificacion vieja y
+    contaminada. Reproducido con un test antes de este fix (ver
+    test_match_trades_fifo_uses_the_strategy_column_when_present, no
+    "vol_arbitrage" adivinado). Ahora: si `fills` trae una columna
+    "strategy", se usa tal cual (fuente unica de verdad = lo que el
+    llamador ya clasifico); si no la trae (compatibilidad con llamadores
+    viejos/tests que arman fills a mano), se cae al classify_strategy(symbol)
+    de siempre - mismo comportamiento que antes SOLO para ese caso.
     """
     open_lots: Dict[str, deque] = {}
     closed: List[ClosedTrade] = []
+    has_strategy_column = "strategy" in fills.columns
 
     for row in fills.itertuples(index=False):
         symbol = row.symbol
         signed_qty = float(row.quantity) if row.side == "buy" else -float(row.quantity)
-        strategy = classify_strategy(symbol)
+        strategy = row.strategy if has_strategy_column else classify_strategy(symbol)
         multiplier = multiplier_for_symbol(symbol, option_multiplier)
         queue = open_lots.setdefault(symbol, deque())
 

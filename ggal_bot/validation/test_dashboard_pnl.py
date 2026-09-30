@@ -95,6 +95,54 @@ def test_match_trades_fifo_uses_multiplier_1_for_delta_hedge_legs():
     assert trade.pnl_ars < 10_000.0  # el bug anterior daba ~$860,800 aca
 
 
+def test_match_trades_fifo_uses_the_strategy_column_when_present():
+    """
+    BUG REAL ENCONTRADO Y CORREGIDO 2026-09-30 (al construir el panel de
+    reconciliacion del dashboard - ver REPORT.md): match_trades_fifo()
+    ignoraba una columna "strategy" ya presente en `fills` y volvia a
+    calcular classify_strategy(symbol) por su cuenta (SIEMPRE
+    "vol_arbitrage" para una opcion) - aunque dashboard/app.py ya hubiera
+    poblado fills["strategy"] con el valor CORRECTO via
+    classify_strategy_from_journal() antes de llamar a esta funcion. En
+    los hechos, el fix de classify_strategy_from_journal (commit 4a64b22)
+    nunca llegaba a la tabla "Cerradas"/"Abiertas" del dashboard: sin este
+    test hubiera pasado desapercibido otra vez.
+    """
+    fills = pd.DataFrame([
+        {**_fill_row("2026-09-10T10:00:00Z", "oc1", "GFGC5200O", "buy", 10, 100.0), "strategy": "weekly_asymmetric"},
+        {**_fill_row("2026-09-11T10:00:00Z", "oc1", "GFGC5200O", "sell", 10, 120.0), "strategy": "weekly_asymmetric"},
+    ])
+    closed, open_lots = pe.match_trades_fifo(fills, option_multiplier=100.0)
+    assert len(closed) == 1
+    assert closed[0].strategy == "weekly_asymmetric"  # NUNCA "vol_arbitrage" cuando la columna ya viene clasificada
+
+
+def test_match_trades_fifo_falls_back_to_classify_strategy_when_column_absent():
+    """
+    Compatibilidad hacia atras: un llamador que arma `fills` sin columna
+    "strategy" (como el resto de los tests de este archivo, y cualquier
+    uso historico de esta funcion) debe seguir viendo el comportamiento de
+    siempre - classify_strategy(symbol) por simbolo.
+    """
+    fills = pd.DataFrame([
+        _fill_row("2026-09-10T10:00:00Z", "oc1", "GFGC5200O", "buy", 10, 100.0),
+        _fill_row("2026-09-11T10:00:00Z", "oc1", "GFGC5200O", "sell", 10, 120.0),
+    ])
+    assert "strategy" not in fills.columns
+    closed, open_lots = pe.match_trades_fifo(fills, option_multiplier=100.0)
+    assert closed[0].strategy == "vol_arbitrage"  # fallback historico, sin columna no hay otra fuente
+
+
+def test_aggregate_open_positions_also_uses_the_strategy_column_when_present():
+    """Mismo bug/fix que arriba, para el lado de posiciones ABIERTAS (OpenLot.strategy viene de la misma variable local)."""
+    fills = pd.DataFrame([
+        {**_fill_row("2026-09-10T10:00:00Z", "oc1", "GFGC5200O", "buy", 10, 100.0), "strategy": "scalping"},
+    ])
+    _, open_lots = pe.match_trades_fifo(fills, option_multiplier=100.0)
+    assert len(open_lots) == 1
+    assert open_lots[0].strategy == "scalping"
+
+
 def test_mark_to_market_uses_multiplier_1_for_delta_hedge_open_position():
     contado = SETTINGS.instruments.contado_ticker
     fills = pd.DataFrame([_fill_row("2026-08-26T10:00:00Z", "h3", contado, "buy", 10.0, 7000.0)])
@@ -429,6 +477,9 @@ ALL_TESTS = [
     test_multiplier_for_symbol_is_1_for_underlying_and_option_multiplier_for_options,
     test_classify_and_multiplier_recognize_bare_underlying_symbol_alias,
     test_match_trades_fifo_uses_multiplier_1_for_delta_hedge_legs,
+    test_match_trades_fifo_uses_the_strategy_column_when_present,
+    test_match_trades_fifo_falls_back_to_classify_strategy_when_column_absent,
+    test_aggregate_open_positions_also_uses_the_strategy_column_when_present,
     test_mark_to_market_uses_multiplier_1_for_delta_hedge_open_position,
     test_summary_pnl_total_not_inflated_when_delta_hedge_and_options_mixed,
     test_match_trades_fifo_closes_simple_round_trip,

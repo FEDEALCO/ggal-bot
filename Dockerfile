@@ -25,8 +25,23 @@
 #   contenedor se recrea (redeploy, restart), bot_state.json y los shadow
 #   trades se pierden salvo que se monte un volumen persistente en
 #   /app/state, /app/logs y /app/data_cache (Northflank > Volumes).
+# - GIT_SHA (build arg, MEJORA 2026-09-30, ver ggal_bot/version_info.py):
+#   .dockerignore excluye .git/ tanto de la imagen COMO del build context,
+#   asi que `git rev-parse HEAD` no se puede correr DENTRO de este
+#   Dockerfile (el directorio .git ni siquiera llega al daemon de Docker).
+#   Quien dispare el build tiene que calcular el SHA AFUERA y pasarlo con
+#   --build-arg GIT_SHA=$(git rev-parse HEAD). En Northflank esto se
+#   configura en "Build arguments" del servicio (ver docs.northflank.com,
+#   "inject build arguments") - no encontramos documentacion publica de
+#   una variable auto-inyectada con el SHA del commit buildeado, asi que
+#   el usuario tiene que setear ese build-arg el mismo (o automatizarlo
+#   con un paso de CI propio). Sin build-arg, GGAL_BOT_GIT_SHA queda en
+#   "unknown" - nunca se fabrica un SHA.
 
 FROM python:3.11-slim
+
+ARG GIT_SHA=unknown
+ENV GGAL_BOT_GIT_SHA=${GIT_SHA}
 
 # Evita que Python bufferee stdout/stderr (para que los logs de Northflank
 # se vean en tiempo real, no recien al final del proceso).

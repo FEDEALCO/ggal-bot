@@ -1,61 +1,42 @@
 """
 dashboard/data/bot_config.py
 ==============================
-Introspeccion pura y testeada de: (1) las env vars GGAL_BOT_* efectivas
-del proceso (para el panel "Salud del bot"/"flags activas" - el dashboard
-corre como proceso HERMANO del bot en el mismo contenedor, ver
-entrypoint.sh, asi que comparte el mismo os.environ, sin gap), y (2) el
-snapshot en vivo state/bot_state.json (ver ggal_bot/state_writer.py).
+Introspeccion pura y testeada de: (1) el snapshot en vivo
+state/bot_state.json (ver ggal_bot/state_writer.py), y (2) la config
+efectiva del BOT (env vars GGAL_BOT_* enmascaradas y SHA de git
+desplegado) que el bot mismo publica DENTRO de ese snapshot.
 
-SEGURIDAD: aunque a fecha 2026-09-30 ninguna env var con prefijo
-GGAL_BOT_* es una credencial (verificado via grep sobre todo el repo -
-las credenciales de IOL usan otro prefijo, fuera del alcance de este
-listado), este modulo enmascara por las dudas cualquier variable cuyo
-NOMBRE contenga una palabra sensible, para que un futuro env var mal
-nombrado nunca se muestre en texto plano en el dashboard.
+CORREGIDO 2026-09-30 (a pedido explicito del usuario - ver REPORT.md):
+la version anterior de este modulo asumia que el dashboard corre como
+proceso HERMANO del bot en el mismo contenedor (ver entrypoint.sh) y leia
+os.environ de ESTE proceso directamente. Esa topologia es un DISEÑO
+documentado en Dockerfile/entrypoint.sh, pero nunca fue verificada contra
+la config REAL de Northflank (no hay ningun archivo de config de
+Northflank versionado en este repo) - el usuario pidio explicitamente no
+asumirlo. Ahora el dashboard NUNCA lee su propio os.environ para esto:
+lee unicamente lo que el bot publico en bot_state.json (via
+StateWriter.write(env_flags=..., deployed_git_sha=...), alimentado por
+ggal_bot.env_introspection/ggal_bot.version_info) - funciona identico
+corran ambos procesos en el mismo contenedor o en servicios separados,
+siempre que compartan el volumen de state/ (si ni siquiera eso se
+comparte, load_bot_state() ya devuelve None y el panel muestra SIN DATOS,
+nunca datos fabricados).
 """
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from ggal_bot import paths
-
-_SENSITIVE_NAME_SUBSTRINGS = ("KEY", "TOKEN", "PASSWORD", "SECRET", "CREDENTIAL")
-
-
-def list_ggal_bot_env_vars() -> Dict[str, str]:
-    """
-    Devuelve {nombre: valor_efectivo} de TODAS las env vars con prefijo
-    GGAL_BOT_ presentes en os.environ de ESTE proceso, ordenadas
-    alfabeticamente. El dashboard comparte el mismo entorno del bot
-    (procesos hermanos en el mismo contenedor - ver entrypoint.sh), asi que
-    esto refleja exactamente la config con la que el bot esta corriendo,
-    no un archivo de config separado que podria estar desactualizado.
-
-    Un nombre que matchea _SENSITIVE_NAME_SUBSTRINGS se enmascara
-    ("***") en vez de mostrarse - nunca hubo necesidad de esto hasta
-    ahora (ninguna GGAL_BOT_* es una credencial), pero es la postura
-    correcta por defecto para un panel de solo lectura.
-    """
-    out: Dict[str, str] = {}
-    for name in sorted(os.environ):
-        if not name.startswith("GGAL_BOT_"):
-            continue
-        if any(s in name.upper() for s in _SENSITIVE_NAME_SUBSTRINGS):
-            out[name] = "***"
-        else:
-            out[name] = os.environ[name]
-    return out
 
 
 def load_bot_state(json_path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
     """
     Lee state/bot_state.json (ver ggal_bot/state_writer.py::StateWriter.write) -
     snapshot de UN SOLO punto en el tiempo (no historico): griegas de
-    cartera, señales activas, risk_breaches, option_chain_snapshot.
+    cartera, señales activas, risk_breaches, option_chain_snapshot,
+    env_flags, deployed_git_sha.
 
     Devuelve None si el archivo no existe, esta vacio o no es JSON valido -
     NUNCA fabrica un snapshot ni devuelve un dict con valores por defecto.
@@ -72,3 +53,37 @@ def load_bot_state(json_path: Optional[Path] = None) -> Optional[Dict[str, Any]]
     if not isinstance(data, dict):
         return None
     return data
+
+
+def get_env_flags_from_state(state: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """
+    Extrae las env vars GGAL_BOT_* efectivas QUE EL BOT PUBLICO en
+    bot_state.json (ya enmascaradas si el nombre sugiere una credencial -
+    ver ggal_bot.env_introspection.list_ggal_bot_env_vars, que es quien
+    las calculo del lado del bot). Devuelve {} (nunca fabrica flags) si el
+    state es None o no trae esa clave - el llamador debe distinguir "{}"
+    de "SIN DATOS" mostrando SIN DATOS cuando `state` mismo es None.
+    """
+    if not state:
+        return {}
+    flags = state.get("env_flags")
+    if not isinstance(flags, dict):
+        return {}
+    return {str(k): str(v) for k, v in flags.items()}
+
+
+def get_deployed_git_sha_from_state(state: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    SHA de git publicado por el bot en este snapshot (ver
+    ggal_bot.version_info.get_deployed_git_sha, horneado en la imagen via
+    el build-arg GIT_SHA del Dockerfile). None si el state es None, no
+    trae la clave, o el bot publico su propio "unknown" (build sin
+    build-arg) - en los tres casos el llamador debe mostrar SIN DATOS/
+    "desconocido", nunca fabricar un SHA.
+    """
+    if not state:
+        return None
+    sha = state.get("deployed_git_sha")
+    if not sha or not isinstance(sha, str) or sha == "unknown":
+        return None
+    return sha

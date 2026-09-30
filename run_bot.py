@@ -43,6 +43,9 @@ from ggal_bot.portfolio.portfolio import Portfolio, Position
 from ggal_bot.portfolio.event_journal import PositionEventJournal
 from ggal_bot.data.market_snapshot_log import MarketSnapshotLogger
 from ggal_bot.data.signal_funnel_log import SignalFunnelLogger
+from ggal_bot.data.ccl_bond_quote_log import CclBondQuoteLogger
+from ggal_bot.env_introspection import list_ggal_bot_env_vars
+from ggal_bot.version_info import get_deployed_git_sha
 from ggal_bot.data.dislocation_history import DislocationHistoryTracker
 from ggal_bot.portfolio.reconciliation import (
     ReconciliationUnavailable,
@@ -402,6 +405,13 @@ class GgalOptionsBot:
         # arriba y _warn_positions_without_valid_quote): es la base para
         # poder backtestear offline cualquier mejora futura.
         self.market_snapshot_log = MarketSnapshotLogger()
+
+        # -- Cotizaciones de bonos para CCL implicito (MEJORA 2026-09-30,
+        # ver ggal_bot/data/ccl_bond_quote_log.py y REPORT.md) - instanciado
+        # SIEMPRE (igual que market_snapshot_log arriba), pero el poll HTTP
+        # real solo corre si SETTINGS.shadow.enable_ccl_bond_quote_log esta
+        # prendido (ver _run_cycle mas abajo) - apagado por defecto.
+        self.ccl_bond_quote_log = CclBondQuoteLogger()
 
         # -- Embudo de señales (MEJORA 2026-09-29, ver
         # ggal_bot/data/signal_funnel_log.py y REPORT.md §12.3/§12.5 punto 5) -
@@ -807,6 +817,14 @@ class GgalOptionsBot:
         # tumbar el ciclo de trading real (ver MarketSnapshotLogger._write_rows).
         self.market_snapshot_log.log_quotes(self.option_chain.all_quotes())
 
+        # Cotizaciones de bonos para CCL implicito (MEJORA 2026-09-30, ver
+        # ggal_bot/data/ccl_bond_quote_log.py) - MISMO ciclo que el snapshot
+        # de mercado de arriba, a pedido explicito del usuario. Opt-in
+        # (apagado por defecto): con el flag apagado esta llamada es un
+        # no-op completo, sin ningun poll HTTP adicional.
+        if SETTINGS.shadow.enable_ccl_bond_quote_log:
+            self.ccl_bond_quote_log.fetch_and_log()
+
         # Kill switch centralizado (Fase 5.3, ver ggal_bot/risk/kill_switch.py):
         # se evalua ANTES de correr el escaneo de entradas de este ciclo,
         # contra el estado del portfolio tal cual quedo al final del ciclo
@@ -866,6 +884,8 @@ class GgalOptionsBot:
             risk_breaches=self.risk_manager.breach_report(totals),
             extra={"open_orders": self.mid_price_exec.open_order_count(), "spot_mid": spot},
             option_chain_snapshot=self._option_chain_snapshot(),
+            env_flags=list_ggal_bot_env_vars(),
+            deployed_git_sha=get_deployed_git_sha(),
         )
 
     def _check_vol_arbitrage_exits(self, spot: float) -> None:
@@ -2370,6 +2390,8 @@ class GgalOptionsBot:
                 risk_breaches=self.risk_manager.breach_report(totals),
                 extra={"shutdown": True, "spot_mid": spot_mid},
                 option_chain_snapshot=self._option_chain_snapshot(),
+                env_flags=list_ggal_bot_env_vars(),
+                deployed_git_sha=get_deployed_git_sha(),
             )
         except Exception:
             logger.exception("Error escribiendo el estado final durante el shutdown.")

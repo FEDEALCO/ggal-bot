@@ -618,6 +618,16 @@ class ShadowConfig:
     # es el mismo proveedor y se reusan esos dos parametros.
     data912_historical_stocks_endpoint_template: str = "/historical/stocks/{ticker}"
     request_timeout_seconds: float = _env_float("GGAL_BOT_SHADOW_REQUEST_TIMEOUT", 5.0)
+    # Bonos soberanos para CCL implicito (MEJORA 2026-09-30, ver
+    # ggal_bot/data/ccl_bond_quote_log.py y REPORT.md) - mismo REST/mismo
+    # base_url/timeout de arriba, endpoint distinto ("/live/arg_bonds",
+    # confirmado real via WebFetch: GD30/GD30C/AL30/AL30C existen ahi con
+    # el mismo schema symbol/px_bid/px_ask/c que arg_stocks/arg_options).
+    # Opt-in, apagado por defecto - mismo criterio que
+    # market_snapshot_log/signal_funnel_log: una fuente nueva nunca se
+    # activa sola.
+    data912_bonds_endpoint: str = "/live/arg_bonds"
+    enable_ccl_bond_quote_log: bool = _env_bool("GGAL_BOT_ENABLE_CCL_BOND_QUOTE_LOG", False)
 
     # --- Generador Mock/Replay (sin ninguna dependencia de red) ---
     mock_initial_spot: float = _env_float("GGAL_BOT_MOCK_INITIAL_SPOT", 6600.0)

@@ -66,5 +66,16 @@ MARKET_SNAPSHOT_LOG = LOGS_DIR / "market_snapshots.csv"
 # produccion ya existente).
 SIGNAL_FUNNEL_LOG = LOGS_DIR / "signal_funnel.csv"
 
+# MEJORA 2026-09-30 (a pedido explicito del usuario - ver REPORT.md,
+# panel de "CCL implicito / GGAL en USD"): cotizaciones RAW (bid/ask/
+# ultimo) de bonos soberanos (GD30/GD30C/AL30/AL30C por defecto, ver
+# ggal_bot/data/ccl_bond_quote_log.py) via el mismo REST publico
+# data912.com que ya usa Data912RestSource para GGAL. Archivo NUEVO,
+# mismo criterio que los de arriba (nunca se agregan columnas a un CSV de
+# produccion ya existente, y esto es un tipo de dato distinto - bonos, no
+# opciones/acciones de GGAL). Opt-in via GGAL_BOT_ENABLE_CCL_BOND_QUOTE_LOG,
+# apagado por defecto.
+CCL_BOND_QUOTES_LOG = LOGS_DIR / "ccl_bond_quotes.csv"
+
 for _dir in (LOGS_DIR, STATE_DIR, DATA_DIR):
     _dir.mkdir(parents=True, exist_ok=True)
