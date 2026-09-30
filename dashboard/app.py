@@ -325,17 +325,29 @@ sum_matches_kpi = abs(fifo_total_check - kpi_total) <= _RECON_TOLERANCE_ARS
 # via _check_vol_arbitrage_exits, que ya logueaba el CLOSE desde antes).
 #
 # delta_hedge TAMBIEN loguea ya su lifecycle completo (ENTRY/ADD/REDUCE/
-# CLOSE, ver _maybe_hedge) pero DELIBERADAMENTE NO se agrega aca todavia:
-# verificado (ver reconstruct.reconstruct_lifecycle_trades) que una
-# posicion sin evento CLOSE dentro de la ventana se cuenta 100% como
-# "todavia abierta" y su PnL de eventuales REDUCE NUNCA se suma a
-# journal_pnl - y la Position de delta_hedge es UNA sola, continuamente
-# reajustada (ver _maybe_hedge), que en operacion normal casi nunca llega a
-# CLOSE (cantidad exactamente 0). Agregarla aca produciria un ❌ de
-# reconciliacion PERMANENTE y enganoso (PnL FIFO real vs. journal_pnl=0 por
-# diseño de reconstruct_lifecycle_trades), no un bug real - se documenta
-# como limitacion conocida en el caption de abajo en vez de fabricar una
-# comparacion que no es honesta con los datos disponibles.
+# CLOSE, ver _maybe_hedge) pero DELIBERADAMENTE NO se agrega aca todavia.
+#
+# MEJORA 2026-09-30 (ver docstring de reconstruct_lifecycle_trades):
+# include_partial_realized_for_open_positions=True ya corrige el caso de
+# weekly_asymmetric/scalping/vol_arbitrage donde un PARTIAL_EXIT/REDUCE
+# realiza PnL real sobre una posicion que despues queda abierta SIN
+# CLOSE (verificado en produccion: posicion 9bf25bc4c8ca, GFGC7400OC,
+# ARS 29.699,10 de PnL ya realizado que antes se perdia). PERO delta_hedge
+# sigue quedando afuera por una razon DISTINTA y todavia sin resolver: su
+# Position es UNA sola, continuamente reajustada con ADD/REDUCE
+# entrelazados en el tiempo durante toda su vida (ver _maybe_hedge) -
+# reconstruct_lifecycle_trades calcula un unico precio promedio de entrada
+# ponderado sobre TODAS sus patas ENTRY/ADD (sin importar el orden
+# cronologico relativo a los REDUCE) y lo usa para calcular el PnL de CADA
+# REDUCE historico. Eso es exacto para weekly_asymmetric (una sola tanda
+# de entrada, un solo PARTIAL_EXIT despues) pero NO para delta_hedge
+# (podria haber ADDs posteriores a un REDUCE ya realizado, contaminando
+# retroactivamente el promedio con el que se valuo ese REDUCE) - incluirla
+# aca exigiria un calculo de PnL realizado verdaderamente cronologico
+# (FIFO/promedio movil pata por pata), que esta funcion no implementa
+# todavia. Se sigue documentando como limitacion conocida en el caption de
+# abajo en vez de fabricar una comparacion que no es honesta con los datos
+# disponibles.
 # `unknown_legacy` sigue sin cobertura aca: por definicion, es un fill SIN
 # match en el journal (anterior a su deploy, 2026-09-07 17:05 UTC) - no hay
 # nada que reconstruir.
@@ -348,7 +360,15 @@ for strat in _JOURNAL_STRATEGIES:
     fifo_n = int((closed_df["strategy"] == strat).sum()) if not closed_df.empty else 0
 
     rows_for_strat = [r for r in journal_rows_all if r.get("strategy_tag") == strat]
-    closed_result = dj.get_closed_trades(journal_rows_all, strategies=(strat,))
+    # MEJORA 2026-09-30 (verificado contra datos reales de produccion, ver
+    # REPORT.md - posicion 9bf25bc4c8ca en GFGC7400OC): sin este flag, el
+    # PnL YA REALIZADO de un PARTIAL_EXIT/REDUCE sobre una posicion que
+    # todavia no cerro quedaba afuera de journal_pnl, produciendo un ❌ de
+    # reconciliacion enganoso (el FIFO si lo contaba, correctamente). Ver
+    # docstring de reconstruct_lifecycle_trades para el detalle completo.
+    closed_result = dj.get_closed_trades(
+        journal_rows_all, strategies=(strat,), include_partial_realized_for_open_positions=True,
+    )
     open_result = dj.get_open_positions(journal_rows_all, strategies=(strat,))
     trades, _, _ = closed_result
     journal_pnl = sum(t.pnl_gross_ars for t in trades)
@@ -394,9 +414,13 @@ elif any_journal_mismatch:
         "diferencia en la tabla de arriba. `match_trades_fifo()` ya agrupa lotes abiertos por Position "
         "ID cuando hay match en el journal (o por simbolo+estrategia si no lo hay — corregido "
         "2026-09-30, ver docstring de esa funcion), asi que un cruce entre estrategias del mismo "
-        "simbolo ya NO deberia ser la causa. Motivos probables a investigar: fills sin match en el "
-        "journal (anteriores a 2026-09-07 17:05 UTC, cuando se desplego el journal) o posiciones "
-        "legacy con datos incompletos."
+        "simbolo ya NO deberia ser la causa. El Journal (`reconstruct_lifecycle_trades`, con "
+        "`include_partial_realized_for_open_positions=True` desde el 2026-09-30) ya cuenta el PnL "
+        "ya realizado de un PARTIAL_EXIT/REDUCE aunque la posicion siga abierta sin CLOSE. Motivos "
+        "probables a investigar: fills sin match en el journal (anteriores a 2026-09-07 17:05 UTC, "
+        "cuando se desplego el journal), posiciones legacy con datos incompletos, o (ver caption de "
+        "abajo) una posicion con ADD/REDUCE entrelazados en el tiempo donde el promedio de entrada "
+        "unico ya no es exacto."
     )
 else:
     st.success(
@@ -412,13 +436,20 @@ st.caption(
     "Reconciliación de solo lectura: no corrige nada, solo compara dos caminos de calculo "
     "independientes (FIFO sobre `shadow_trades.csv` vs. reconstruccion desde `position_events.csv`). "
     "Desde el 2026-09-30 las 4 estrategias (`weekly_asymmetric`, `scalping`, `vol_arbitrage`, "
-    "`delta_hedge`) loguean su lifecycle completo al Event Journal, pero la tabla de arriba solo "
-    "cruza `weekly_asymmetric`/`scalping`/`vol_arbitrage`: `delta_hedge` es UNA sola posicion "
-    "continuamente reajustada que casi nunca llega a un evento CLOSE exacto, y la reconstruccion "
-    "del journal (`reconstruct_lifecycle_trades`) solo cuenta PnL de una posicion que SI cerro — "
-    "cruzarla aca daria un ❌ permanente y enganoso, no un bug real. `unknown_legacy` tampoco tiene "
-    "equivalente por definicion (fill sin match en el journal, anterior a su deploy el 2026-09-07 "
-    "17:05 UTC): para esas dos, la unica fuente disponible es el FIFO, sin verificacion cruzada."
+    "`delta_hedge`) loguean su lifecycle completo al Event Journal, y la tabla de arriba ya cuenta "
+    "(via `include_partial_realized_for_open_positions=True`, verificado contra produccion: posicion "
+    "9bf25bc4c8ca en GFGC7400OC, ARS 29.699,10 que antes se perdian) el PnL YA REALIZADO de un "
+    "PARTIAL_EXIT/REDUCE aunque la posicion siga abierta sin CLOSE. Aun asi, la tabla solo cruza "
+    "`weekly_asymmetric`/`scalping`/`vol_arbitrage`: `delta_hedge` sigue afuera porque es UNA sola "
+    "posicion continuamente reajustada con ADD/REDUCE entrelazados en el tiempo durante toda su vida "
+    "— `reconstruct_lifecycle_trades` valua cada REDUCE historico contra UN solo promedio de entrada "
+    "ponderado sobre todas sus patas ENTRY/ADD (sin orden cronologico), lo cual es exacto para una "
+    "posicion con una sola tanda de entrada (weekly_asymmetric/scalping/vol_arbitrage) pero no para "
+    "delta_hedge, donde un ADD posterior contaminaria retroactivamente el promedio de un REDUCE ya "
+    "realizado antes. Incluirla exigiria un calculo cronologico pata por pata que todavia no existe. "
+    "`unknown_legacy` tampoco tiene equivalente por definicion (fill sin match en el journal, anterior "
+    "a su deploy el 2026-09-07 17:05 UTC): para esas dos, la unica fuente disponible es el FIFO, sin "
+    "verificacion cruzada."
 )
 
 st.divider()
