@@ -213,6 +213,71 @@ def build_order_client_id_strategy_map(events_df: pd.DataFrame) -> Dict[str, str
     return mapping
 
 
+def build_order_client_id_position_map(events_df: pd.DataFrame) -> Dict[str, str]:
+    """
+    Devuelve {order_client_id: position_id} a partir del event journal - el
+    MISMO cruce exacto que build_order_client_id_strategy_map (mismo
+    client_order_id/order_client_id compartido entre shadow_trades.csv y
+    position_events.csv), pero para el Position ID en vez del strategy_tag.
+
+    USADO POR match_trades_fifo() (via resolve_position_ids_from_journal())
+    para agrupar los lotes FIFO por POSICION REAL en vez de solo por
+    simbolo - ver el docstring de esa funcion para el bug real que esto
+    corrige (2026-09-30, verificado con export-lifecycle.csv: la posicion
+    weekly_asymmetric `9bf25bc4c8ca` sobre GFGC7400OC quedo con 7 contratos
+    sin cerrar dentro del export; el simbolo-only FIFO le asigno esos 7
+    contratos, mas viejos en la cola, a la PRIMERA venta de `scalping` que
+    llego despues sobre el mismo simbolo, en vez de a la propia compra de
+    scalping - cruzando PnL real entre ambas estrategias).
+
+    Filas sin order_client_id o sin position_id se ignoran (igual que la
+    funcion hermana). Si el mismo order_client_id aparece en mas de una
+    fila se usa la PRIMERA con datos validos.
+    """
+    mapping: Dict[str, str] = {}
+    if events_df.empty or "order_client_id" not in events_df.columns:
+        return mapping
+    for row in events_df.itertuples(index=False):
+        client_id = str(getattr(row, "order_client_id", "") or "").strip()
+        position_id = str(getattr(row, "position_id", "") or "").strip()
+        if not client_id or not position_id:
+            continue
+        mapping.setdefault(client_id, position_id)
+    return mapping
+
+
+def resolve_position_ids_from_journal(
+    fills: pd.DataFrame, events_df: Optional[pd.DataFrame] = None,
+) -> pd.Series:
+    """
+    Devuelve una Serie alineada al indice de `fills` con el Position ID real
+    (desde el event journal, cruzado por client_order_id) para cada fill, o
+    "" si no hay match (fill anterior al deploy del journal, o de una
+    estrategia que todavia no loguea sus ENTRY - ver Prioridad 2 en curso
+    para vol_arbitrage/delta_hedge).
+
+    match_trades_fifo() usa esto (cuando el llamador lo agrega como columna
+    "position_id" de `fills`, mismo patron que fills["strategy"] via
+    classify_strategy_from_journal()) para agrupar los lotes FIFO por
+    posicion real en vez de por simbolo+estrategia - ver docstring de
+    match_trades_fifo para el detalle completo de la jerarquia de fallback.
+    """
+    if events_df is None:
+        events_df = load_position_events()
+    position_map = build_order_client_id_position_map(events_df)
+
+    def _resolve_row(row) -> str:
+        client_id = str(getattr(row, "client_order_id", "") or "").strip()
+        return position_map.get(client_id, "")
+
+    if fills.empty:
+        return pd.Series([], dtype=object, index=fills.index)
+    return pd.Series(
+        [_resolve_row(row) for row in fills.itertuples(index=False)],
+        index=fills.index,
+    )
+
+
 def classify_strategy_from_journal(
     fills: pd.DataFrame, events_df: Optional[pd.DataFrame] = None,
 ) -> pd.Series:
@@ -418,17 +483,69 @@ def match_trades_fifo(
     llamador ya clasifico); si no la trae (compatibilidad con llamadores
     viejos/tests que arman fills a mano), se cae al classify_strategy(symbol)
     de siempre - mismo comportamiento que antes SOLO para ese caso.
+
+    SEGUNDO BUG REAL VERIFICADO Y CORREGIDO ACA (2026-09-30, a pedido
+    explicito del usuario, medido contra export-lifecycle.csv - 1333 filas,
+    2026-09-07 a 2026-09-28, ver analisis en la sesion): la cola FIFO
+    (`open_lots`) se indexaba SOLO por `symbol`. Verificado con una
+    reconstruccion fill-a-fill de ese export que esto SI cruzo PnL real
+    entre estrategias: la posicion `weekly_asymmetric` `9bf25bc4c8ca` sobre
+    GFGC7400OC (ENTRY +13 @153.001 el 2026-09-15, PARTIAL_EXIT -6 @202.500
+    el 2026-09-16, quedan 7 contratos abiertos que NUNCA se cierran dentro
+    del export) dejo un lote abierto mas viejo en la cola de ese simbolo.
+    Cuando `scalping` opero el MISMO simbolo despues (2026-09-21 en
+    adelante, ENTRY+CLOSE propios, un round-trip completo y correcto en si
+    mismo), el FIFO symbol-only le asigno la venta de cierre de `scalping`
+    contra el lote VIEJO de `weekly_asymmetric` (el mas antiguo en la cola),
+    en vez de contra su propia compra - diferencia medida: ARS 1.361,50 de
+    PnL mal atribuido entre ambas estrategias solo en ese simbolo (13,615
+    unidades * multiplicador 100). Importante: esto NO requiere que las
+    VENTANAS DE TIEMPO de ambas posiciones se solapen en el sentido
+    tradicional (0 pares de posiciones CERRADAS se solapan en ese export) -
+    alcanza con que una posicion quede SIN CERRAR (abierta) cuando otra
+    estrategia opera el mismo simbolo despues, porque FIFO no sabe que ese
+    lote "pertenece" a otra estrategia.
+
+    FIX: la cola FIFO ahora se indexa por (symbol, match_key), con
+    match_key resuelto en esta jerarquia de fallback (la misma que pidio el
+    usuario: "emparejar por Position ID, o por simbolo + estrategia si el
+    fill no trae Position ID"):
+      1. Si `fills` trae una columna "position_id" (ver
+         resolve_position_ids_from_journal(), cruce EXACTO por
+         client_order_id contra logs/position_events.csv) Y esa fila tiene
+         un valor no vacio -> match_key = f"pid:{position_id}". Esto es lo
+         mas preciso posible: agrupa por la POSICION REAL, no por una
+         aproximacion - corrige tambien el caso (documentado en
+         AUDITORIA_FASE5.2_LIFECYCLE_ROOT_CAUSE.md) de dos posiciones de la
+         MISMA estrategia sobre el mismo simbolo simultaneas por
+         fragmentacion.
+      2. Si no hay Position ID resuelto para esa fila (tipicamente: fill
+         anterior al deploy del journal, o de una estrategia que todavia no
+         loguea sus ENTRY al journal - vol_arbitrage/delta_hedge, Prioridad
+         2 en curso) -> match_key = f"strat:{strategy}" (la misma columna
+         "strategy" ya corregida arriba, via classify_strategy_from_journal
+         o classify_strategy(symbol) de fallback).
+    Backward-compatible: un llamador/test que no agrega ninguna columna
+    nueva sigue viendo el comportamiento de ANTES de este fix (fallback 2
+    con classify_strategy(symbol), que agrupa igual que "symbol-only" para
+    fills de opciones - ver test_match_trades_fifo_falls_back_to_classify_strategy_when_column_absent).
+    Ver test_match_trades_fifo_groups_fifo_lots_by_position_id_not_by_symbol_alone
+    para la reproduccion exacta de este bug y su regresion.
     """
-    open_lots: Dict[str, deque] = {}
+    open_lots: Dict[Tuple[str, str], deque] = {}
     closed: List[ClosedTrade] = []
     has_strategy_column = "strategy" in fills.columns
+    has_position_id_column = "position_id" in fills.columns
 
     for row in fills.itertuples(index=False):
         symbol = row.symbol
         signed_qty = float(row.quantity) if row.side == "buy" else -float(row.quantity)
         strategy = row.strategy if has_strategy_column else classify_strategy(symbol)
         multiplier = multiplier_for_symbol(symbol, option_multiplier)
-        queue = open_lots.setdefault(symbol, deque())
+
+        position_id = str(getattr(row, "position_id", "") or "").strip() if has_position_id_column else ""
+        match_key = f"pid:{position_id}" if position_id else f"strat:{strategy}"
+        queue = open_lots.setdefault((symbol, match_key), deque())
 
         remaining = signed_qty
         while remaining != 0 and queue and (queue[0].quantity > 0) != (remaining > 0):

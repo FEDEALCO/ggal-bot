@@ -385,6 +385,122 @@ def test_classify_strategy_from_journal_empty_fills_returns_empty_series():
     assert result.empty
 
 
+def test_build_order_client_id_position_map_uses_first_valid_row_per_order():
+    events_df = pd.DataFrame([
+        _event_row("oc-1", "weekly_asymmetric", event_type="ENTRY"),
+        _event_row("oc-1", "weekly_asymmetric", event_type="CLOSE"),
+        _event_row("oc-2", "scalping"),
+        _event_row("oc-3", ""),
+    ])
+    mapping = pe.build_order_client_id_position_map(events_df)
+    # _event_row() genera position_id=f"pos-{order_client_id}" - ver helper arriba.
+    assert mapping == {"oc-1": "pos-oc-1", "oc-2": "pos-oc-2", "oc-3": "pos-oc-3"}
+
+
+def test_build_order_client_id_position_map_empty_when_no_events():
+    assert pe.build_order_client_id_position_map(pd.DataFrame()) == {}
+
+
+def test_resolve_position_ids_from_journal_returns_position_id_or_empty_string():
+    fills = pd.DataFrame([
+        _fill_row("2026-09-10T10:00:00Z", "oc-1", "GFGC5200O", "buy", 1, 100.0),
+        _fill_row("2026-09-10T10:05:00Z", "oc-legacy", "GFGV5200O", "buy", 1, 90.0),
+    ])
+    events_df = pd.DataFrame([_event_row("oc-1", "weekly_asymmetric", symbol="GFGC5200O")])
+    result = pe.resolve_position_ids_from_journal(fills, events_df)
+    assert list(result) == ["pos-oc-1", ""]  # oc-legacy no tiene evento en el journal -> "" (nunca se fabrica)
+
+
+def test_match_trades_fifo_reproduces_and_fixes_the_verified_cross_strategy_pnl_crossing():
+    """
+    Regresion DIRECTA de un bug real, VERIFICADO contra datos de produccion
+    (export-lifecycle.csv, 1333 filas, 2026-09-07 a 2026-09-28 - medido en la
+    sesion 2026-09-30 a pedido explicito del usuario, ver REPORT.md): la
+    posicion `weekly_asymmetric` `9bf25bc4c8ca` sobre el simbolo GFGC7400OC
+    (ENTRY +13 @153.001, PARTIAL_EXIT -6 @202.500, quedan 7 contratos
+    abiertos que NUNCA se cierran) dejo un lote abierto en la cola FIFO de
+    ese simbolo. Cuando `scalping` opero el MISMO simbolo despues (su propio
+    round-trip completo: ENTRY +7 @110.99, CLOSE -7 @110.495), el
+    match_trades_fifo VIEJO (cola indexada solo por `symbol`) le asigno la
+    venta de cierre de scalping contra el lote VIEJO de weekly_asymmetric
+    (el mas antiguo en la cola) en vez de contra su propia compra -
+    diferencia medida en ese simbolo: ARS 1.361,50 de PnL mal atribuido
+    entre ambas estrategias (13,615 unidades * multiplicador 100).
+
+    Esta prueba reproduce el patron EXACTO (mismos precios/cantidades reales
+    del export) usando solo la columna "strategy" (sin "position_id" - el
+    fallback symbol+estrategia alcanza para este caso, porque las dos
+    posiciones son de estrategias DISTINTAS) y confirma que, con el fix,
+    scalping cierra contra su PROPIA entrada (pnl=(110.495-110.99)*7=-3.465,
+    NO (110.495-153.001)*7=-297.54) y que el lote de weekly_asymmetric
+    permanece abierto e intacto.
+    """
+    fills = pd.DataFrame([
+        {**_fill_row("2026-09-15T13:50:23Z", "wa-1", "GFGC7400OC", "buy", 13, 153.001), "strategy": "weekly_asymmetric"},
+        {**_fill_row("2026-09-16T13:30:29Z", "wa-2", "GFGC7400OC", "sell", 6, 202.500), "strategy": "weekly_asymmetric"},
+        {**_fill_row("2026-09-21T19:34:57Z", "sc-1", "GFGC7400OC", "buy", 7, 110.990), "strategy": "scalping"},
+        {**_fill_row("2026-09-21T19:39:14Z", "sc-2", "GFGC7400OC", "sell", 7, 110.495), "strategy": "scalping"},
+    ])
+    assert "position_id" not in fills.columns  # ejercita el fallback symbol+estrategia, no Position ID
+
+    closed, open_lots = pe.match_trades_fifo(fills, option_multiplier=1.0)
+
+    scalping_trades = [t for t in closed if t.strategy == "scalping"]
+    weekly_trades = [t for t in closed if t.strategy == "weekly_asymmetric"]
+
+    assert len(scalping_trades) == 1
+    assert abs(scalping_trades[0].pnl_ars - (110.495 - 110.990) * 7) < 1e-9
+    assert scalping_trades[0].entry_price == 110.990  # contra su PROPIA entrada, NO 153.001
+
+    # El PARTIAL_EXIT de weekly_asymmetric cierra 6 de sus PROPIOS 13 contratos
+    # (contra su propia entrada, 153.001->202.5) - eso es correcto y esperado.
+    # Lo que NO debe pasar (el bug viejo) es que el cierre de SCALPING toque
+    # este lote: los 7 contratos restantes de weekly_asymmetric deben seguir
+    # abiertos e intactos, nunca consumidos por la venta de scalping.
+    assert len(weekly_trades) == 1
+    assert weekly_trades[0].entry_price == 153.001
+    assert weekly_trades[0].exit_price == 202.500
+    assert weekly_trades[0].quantity == 6.0
+    assert len(open_lots) == 1
+    assert open_lots[0].strategy == "weekly_asymmetric"
+    assert open_lots[0].quantity == 7.0
+    assert open_lots[0].entry_price == 153.001
+
+
+def test_match_trades_fifo_uses_position_id_to_isolate_positions_of_the_same_strategy():
+    """
+    Complementa el test anterior: cubre el caso que el fallback
+    symbol+estrategia NO puede resolver por si solo - dos POSICIONES
+    DISTINTAS de la MISMA estrategia sobre el mismo simbolo (el patron de
+    fragmentacion ya documentado en AUDITORIA_FASE5.2_LIFECYCLE_ROOT_CAUSE.md:
+    "5 bases con mas de 1 Position activa simultanea"). Sin Position ID,
+    symbol+estrategia las mezclaria en una sola cola igual que antes.
+
+    posA (weekly_asymmetric) abre y NUNCA cierra (10 @ 100.0). Despues,
+    posB (weekly_asymmetric, PosicionID DISTINTO) hace su propio round-trip
+    completo (compra 5 @ 50.0, vende 5 @ 60.0). Con Position ID resuelto por
+    fill, el cierre de posB debe aparearse contra su PROPIA entrada
+    (pnl=(60-50)*5=50), dejando el lote de posA (10 @ 100.0) intacto.
+    """
+    fills = pd.DataFrame([
+        {**_fill_row("2026-09-10T10:00:00Z", "a-1", "GFGC5200O", "buy", 10, 100.0),
+         "strategy": "weekly_asymmetric", "position_id": "posA"},
+        {**_fill_row("2026-09-10T11:00:00Z", "b-1", "GFGC5200O", "buy", 5, 50.0),
+         "strategy": "weekly_asymmetric", "position_id": "posB"},
+        {**_fill_row("2026-09-10T12:00:00Z", "b-2", "GFGC5200O", "sell", 5, 60.0),
+         "strategy": "weekly_asymmetric", "position_id": "posB"},
+    ])
+    closed, open_lots = pe.match_trades_fifo(fills, option_multiplier=1.0)
+
+    assert len(closed) == 1
+    assert abs(closed[0].pnl_ars - (60.0 - 50.0) * 5) < 1e-9
+    assert closed[0].entry_price == 50.0  # contra la entrada de posB, NO la de posA
+
+    assert len(open_lots) == 1
+    assert open_lots[0].quantity == 10.0
+    assert open_lots[0].entry_price == 100.0  # el lote de posA sigue intacto
+
+
 def test_load_fills_returns_empty_frame_when_file_missing(tmp_path=None):
     import tempfile
     from pathlib import Path
@@ -501,6 +617,11 @@ ALL_TESTS = [
     test_classify_strategy_from_journal_uses_real_strategy_tag_not_vol_arbitrage_default,
     test_classify_strategy_from_journal_still_recognizes_underlying_as_delta_hedge,
     test_classify_strategy_from_journal_empty_fills_returns_empty_series,
+    test_build_order_client_id_position_map_uses_first_valid_row_per_order,
+    test_build_order_client_id_position_map_empty_when_no_events,
+    test_resolve_position_ids_from_journal_returns_position_id_or_empty_string,
+    test_match_trades_fifo_reproduces_and_fixes_the_verified_cross_strategy_pnl_crossing,
+    test_match_trades_fifo_uses_position_id_to_isolate_positions_of_the_same_strategy,
 ]
 
 

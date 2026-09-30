@@ -119,6 +119,16 @@ fills = fills.copy()
 # por client_order_id (id exacto, no una aproximacion) y devuelve
 # "unknown_legacy" en vez de adivinar cuando no hay match.
 fills["strategy"] = pe.classify_strategy_from_journal(fills, position_events_df_raw)
+# CORREGIDO 2026-09-30 (medido y verificado contra export-lifecycle.csv - ver
+# docstring de match_trades_fifo para el bug real y la cifra exacta cruzada:
+# ARS 1.361,50 en un solo simbolo): match_trades_fifo() agrupaba sus lotes
+# FIFO SOLO por simbolo, lo que podia matchear el cierre de una estrategia
+# contra un lote abierto de OTRA estrategia sobre el mismo simbolo. Esta
+# columna cruza cada fill contra el event journal por client_order_id (mismo
+# cruce exacto que classify_strategy_from_journal) para darle a
+# match_trades_fifo el Position ID real cuando existe - "" si no hay match,
+# en cuyo caso esa funcion cae a agrupar por simbolo+estrategia.
+fills["position_id"] = pe.resolve_position_ids_from_journal(fills, position_events_df_raw)
 fills["option_type"] = fills["symbol"].apply(pe.classify_option_type)
 
 closed_trades, open_lots = pe.match_trades_fifo(fills)
@@ -302,11 +312,13 @@ elif any_journal_mismatch:
     st.error(
         "🔴 RECONCILIACIÓN FALLIDA: el PnL reconstruido de forma independiente desde el Event Journal "
         "no coincide con el PnL FIFO (shadow_trades.csv) para al menos una estrategia — ver la "
-        "diferencia en la tabla de arriba. Motivo probable a investigar: `match_trades_fifo()` agrupa "
-        "lotes abiertos SOLO por simbolo (no por simbolo+estrategia, ver dashboard/pnl_engine.py) — si "
-        "dos estrategias operaron el mismo simbolo en ventanas superpuestas, sus lotes se pueden "
-        "cruzar. Otros motivos posibles: fills sin match en el journal (anteriores a 2026-09-07 17:05 "
-        "UTC, cuando se desplego) o posiciones legacy con datos incompletos."
+        "diferencia en la tabla de arriba. `match_trades_fifo()` ya agrupa lotes abiertos por Position "
+        "ID cuando hay match en el journal (o por simbolo+estrategia si no lo hay — corregido "
+        "2026-09-30, ver docstring de esa funcion), asi que un cruce entre estrategias del mismo "
+        "simbolo ya NO deberia ser la causa. Motivos probables a investigar: fills sin match en el "
+        "journal (anteriores a 2026-09-07 17:05 UTC, cuando se desplego el journal, o de una estrategia "
+        "que todavia no loguea sus ENTRY al journal — vol_arbitrage/delta_hedge) o posiciones legacy "
+        "con datos incompletos."
     )
 else:
     st.success(
