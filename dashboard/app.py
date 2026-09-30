@@ -95,6 +95,33 @@ st.sidebar.caption(
     "Ver dashboard/pnl_engine.py para el detalle y las limitaciones del calculo de PnL."
 )
 
+# ---------------------------------------------------------------------------
+# Descarga de los CSV crudos (2026-09-30, a pedido del usuario): permite
+# bajar shadow_trades.csv y position_events.csv tal cual estan en el
+# volumen del servicio (sin pasar por ningun procesamiento del dashboard),
+# para investigar fuera de Streamlit un ❌ del panel de Reconciliacion (por
+# ejemplo, cruzando fills/eventos con un notebook o Excel local). Lee el
+# archivo crudo del disco en cada click (no cachea): siempre la version mas
+# reciente. Si el archivo todavia no existe, no fabrica nada - no se
+# muestra el boton para ese archivo.
+st.sidebar.divider()
+st.sidebar.caption("Descargar CSV crudos")
+for _raw_path in (SHADOW_TRADES_LOG, POSITION_EVENTS_LOG):
+    if _raw_path.exists():
+        try:
+            _raw_bytes = _raw_path.read_bytes()
+        except OSError:
+            continue
+        st.sidebar.download_button(
+            label=f"⬇️ {_raw_path.name}",
+            data=_raw_bytes,
+            file_name=_raw_path.name,
+            mime="text/csv",
+            key=f"download_{_raw_path.name}",
+        )
+    else:
+        st.sidebar.caption(f"_(`{_raw_path.name}` no existe todavia)_")
+
 
 # ---------------------------------------------------------------------------
 # Carga de datos
