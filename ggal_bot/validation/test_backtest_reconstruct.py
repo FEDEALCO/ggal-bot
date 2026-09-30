@@ -26,6 +26,7 @@ from ggal_bot.backtest.reconstruct import (
     load_closed_trades_export,
     load_lifecycle_journal_rows,
     reconstruct_lifecycle_trades,
+    reconstruct_open_positions,
 )
 
 _LIFECYCLE_HEADER = [
@@ -252,6 +253,110 @@ def test_reconstruct_lifecycle_trades_populates_direction_from_entry_side():
         path.unlink(missing_ok=True)
 
 
+def test_reconstruct_open_positions_returns_open_position_with_real_strategy_tag():
+    """
+    MEJORA 2026-09-30 (gap identificado en el pre-analisis del dashboard
+    Fase 1): a diferencia de reconciliation.py::reconstruct_positions_from_shadow_log
+    (que hardcodea strategy_tag=None), esta reconstruccion viene del
+    journal y trae el strategy_tag REAL de cada fila.
+    """
+    path = _write_csv([
+        ["2026-09-01T10:00:00+00:00", "ENTRY", "GFGC5000O", "weekly_asymmetric", "pos_open", "k", "buy", "10", "10", "100.0", "entrada", ""],
+        # sin CLOSE - todavia abierta
+    ], _LIFECYCLE_HEADER)
+    try:
+        rows = load_lifecycle_journal_rows(path)
+        open_positions, closed_count, incomplete = reconstruct_open_positions(rows)
+        assert closed_count == 0
+        assert incomplete == 0
+        assert len(open_positions) == 1
+        p = open_positions[0]
+        assert p.position_id == "pos_open"
+        assert p.strategy == "weekly_asymmetric"  # nunca None, a diferencia de reconstruct_positions_from_shadow_log
+        assert p.symbol == "GFGC5000O"
+        assert p.quantity_open == 10.0
+        assert p.average_entry_price == 100.0
+        assert p.side == "buy"
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_reconstruct_open_positions_uses_quantity_after_for_partial_exit():
+    path = _write_csv([
+        ["2026-09-01T10:00:00+00:00", "ENTRY", "GFGC5000O", "weekly_asymmetric", "pos1", "k", "buy", "10", "10", "100.0", "entrada", ""],
+        ["2026-09-03T10:00:00+00:00", "PARTIAL_EXIT", "GFGC5000O", "weekly_asymmetric", "pos1", "k", "sell", "-4", "6", "130.0", "partial_profit_take", ""],
+        # nunca llega el CLOSE - sigue abierta con 6 de las 10 originales
+    ], _LIFECYCLE_HEADER)
+    try:
+        rows = load_lifecycle_journal_rows(path)
+        open_positions, closed_count, incomplete = reconstruct_open_positions(rows)
+        assert len(open_positions) == 1
+        p = open_positions[0]
+        assert p.quantity_open == 6.0  # quantity_after del ultimo evento, no la suma de patas de entrada
+        assert p.average_entry_price == 100.0  # promedio de entrada no cambia por un PARTIAL_EXIT
+        assert p.last_event_type == "PARTIAL_EXIT"
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_reconstruct_open_positions_excludes_closed_positions():
+    path = _write_csv([
+        ["2026-09-01T10:00:00+00:00", "ENTRY", "GFGC5000O", "weekly_asymmetric", "pos_closed", "k", "buy", "10", "10", "100.0", "e", ""],
+        ["2026-09-02T10:00:00+00:00", "CLOSE", "GFGC5000O", "weekly_asymmetric", "pos_closed", "k", "sell", "-10", "0", "110.0", "r", ""],
+    ], _LIFECYCLE_HEADER)
+    try:
+        rows = load_lifecycle_journal_rows(path)
+        open_positions, closed_count, incomplete = reconstruct_open_positions(rows)
+        assert open_positions == []
+        assert closed_count == 1
+        assert incomplete == 0
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_reconstruct_open_positions_counts_missing_entry_as_incomplete_data_never_fabricated():
+    # Posicion abierta ANTES del inicio de la ventana del journal: nunca
+    # aparece un ENTRY/ADD parseable. No debe fabricarse un precio de
+    # entrada - se cuenta aparte, explicitamente.
+    path = _write_csv([
+        ["2026-09-01T10:00:00+00:00", "PARTIAL_EXIT", "GFGC5000O", "weekly_asymmetric", "pos_legacy", "k", "sell", "-2", "8", "130.0", "partial_profit_take", ""],
+    ], _LIFECYCLE_HEADER)
+    try:
+        rows = load_lifecycle_journal_rows(path)
+        open_positions, closed_count, incomplete = reconstruct_open_positions(rows)
+        assert open_positions == []
+        assert closed_count == 0
+        assert incomplete == 1
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_reconstruct_open_positions_partition_is_exhaustive_and_matches_closed_trades_invariant():
+    """
+    Invariante documentado en reconstruct_open_positions: llamando ambas
+    funciones sobre el MISMO rows, len(open)+incomplete_open ==
+    still_open_count(de reconstruct_lifecycle_trades), y
+    closed_count(de reconstruct_open_positions) == len(trades)+incomplete_closed.
+    Este es el chequeo cruzado por Position ID que usa el panel de
+    reconciliacion del dashboard.
+    """
+    path = _write_csv([
+        ["2026-09-01T10:00:00+00:00", "ENTRY", "GFGC5000O", "weekly_asymmetric", "pos_ok", "k", "buy", "10", "10", "100.0", "e", ""],
+        ["2026-09-02T10:00:00+00:00", "CLOSE", "GFGC5000O", "weekly_asymmetric", "pos_ok", "k", "sell", "-10", "0", "110.0", "r", ""],
+        ["2026-09-01T10:00:00+00:00", "ENTRY", "GFGV5000O", "weekly_asymmetric", "pos_open", "k2", "buy", "10", "10", "50.0", "e", ""],
+        ["2026-09-05T10:00:00+00:00", "CLOSE", "GFGX5000O", "weekly_asymmetric", "pos_legacy", "k3", "sell", "-10", "0", "120.0", "take_profit", ""],
+    ], _LIFECYCLE_HEADER)
+    try:
+        rows = load_lifecycle_journal_rows(path)
+        trades, still_open, incomplete_closed = reconstruct_lifecycle_trades(rows)
+        open_positions, closed_count, incomplete_open = reconstruct_open_positions(rows)
+
+        assert len(open_positions) + incomplete_open == still_open
+        assert closed_count == len(trades) + incomplete_closed
+    finally:
+        path.unlink(missing_ok=True)
+
+
 ALL_TESTS = [
     test_load_lifecycle_journal_rows_maps_spanish_headers_and_sorts_chronologically,
     test_reconstruct_lifecycle_trades_simple_entry_and_close,
@@ -265,6 +370,11 @@ ALL_TESTS = [
     test_load_closed_trades_export_excludes_rows_with_inconsistent_pnl,
     test_load_closed_trades_export_populates_direction_from_column,
     test_reconstruct_lifecycle_trades_populates_direction_from_entry_side,
+    test_reconstruct_open_positions_returns_open_position_with_real_strategy_tag,
+    test_reconstruct_open_positions_uses_quantity_after_for_partial_exit,
+    test_reconstruct_open_positions_excludes_closed_positions,
+    test_reconstruct_open_positions_counts_missing_entry_as_incomplete_data_never_fabricated,
+    test_reconstruct_open_positions_partition_is_exhaustive_and_matches_closed_trades_invariant,
 ]
 
 

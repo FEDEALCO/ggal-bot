@@ -273,6 +273,129 @@ def reconstruct_lifecycle_trades(
     return trades, still_open_count, incomplete_data_count
 
 
+@dataclass
+class OpenPosition:
+    """
+    Una Position que, dentro de la ventana de filas vistas, TODAVIA no
+    tuvo un evento CLOSE (ver reconstruct_open_positions). Espejo de
+    Trade, pero para lo que dashboard/app.py necesita en el panel de
+    "Posiciones abiertas" (MEJORA 2026-09-30, ver REPORT.md - gap
+    identificado: ninguna funcion existente reconstruye posiciones
+    abiertas con strategy_tag REAL desde el journal;
+    reconciliation.py::reconstruct_positions_from_shadow_log lo hace desde
+    shadow_trades.csv y hardcodea strategy_tag=None por diseño, documentado
+    ahi mismo - no sirve para la fuente unica de verdad que pide el
+    dashboard).
+    """
+    position_id: str
+    strategy: str
+    symbol: str
+    contract_key: Optional[str]
+    side: Optional[str]  # "buy"/"sell" tal cual vino en la ENTRY, SIN normalizar a long/short (a diferencia de Trade.direction)
+    quantity_open: float
+    average_entry_price: Optional[float]
+    opened_at: Optional[datetime]
+    last_event_at: Optional[datetime]
+    last_event_type: Optional[str]
+    entry_legs: List[Leg]
+    data_insufficient_fields: List[str] = field(default_factory=list)
+
+
+def reconstruct_open_positions(
+    rows: List[Dict], strategies: Optional[Tuple[str, ...]] = None
+) -> Tuple[List[OpenPosition], int, int]:
+    """
+    Espejo de reconstruct_lifecycle_trades, pero para posiciones TODAVIA
+    ABIERTAS (nunca tuvieron un evento CLOSE dentro de la ventana de
+    `rows`). Ambas funciones deben llamarse sobre el MISMO `rows` (mismo
+    filtro de `strategies`) para que valga el invariante de particion:
+
+        len(open_positions) + incomplete_data_count (de ESTA funcion)
+            == still_open_count (que devuelve reconstruct_lifecycle_trades)
+        closed_count (de ESTA funcion)
+            == len(trades) + incomplete_data_count (de reconstruct_lifecycle_trades)
+
+    Ese cruce es exactamente el "chequeo por Position ID, sin duplicados"
+    que pide el dashboard: dos recorridos independientes de las mismas
+    filas tienen que coincidir en como particionan cada position_id.
+
+    NUNCA fabrica una cantidad/precio de entrada faltante: una posicion
+    sin ninguna pata de ENTRY/ADD parseable (tipicamente abierta ANTES del
+    inicio de la ventana del journal) se excluye de `open_positions` y se
+    cuenta en `incomplete_data_count`, nunca en silencio.
+    """
+    by_position: Dict[str, List[Dict]] = {}
+    order: List[str] = []
+    for r in rows:
+        if strategies is not None and r.get("strategy_tag") not in strategies:
+            continue
+        pid = str(r.get("position_id") or "")
+        if not pid:
+            continue  # REJECT/CANCEL: nunca tiene position_id
+        if pid not in by_position:
+            by_position[pid] = []
+            order.append(pid)
+        by_position[pid].append(r)
+
+    open_positions: List[OpenPosition] = []
+    closed_count = 0
+    incomplete_data_count = 0
+
+    for pid in order:
+        pos_rows = by_position[pid]
+        close_rows = [r for r in pos_rows if r.get("event_type") == "CLOSE"]
+        if close_rows:
+            closed_count += 1
+            continue  # ya cerrada - la cubre reconstruct_lifecycle_trades, no se duplica aca
+
+        entry_rows = [r for r in pos_rows if r.get("event_type") in _ENTRY_EVENT_TYPES]
+        symbol = str(pos_rows[0].get("symbol") or "")
+        strategy = str(pos_rows[0].get("strategy_tag") or "") or "unknown_legacy"
+        contract_key = str(pos_rows[0].get("contract_key") or "") or None
+
+        entry_legs: List[Leg] = []
+        total_qty = 0.0
+        total_cost = 0.0
+        for r in entry_rows:
+            qty, px = _to_float(r.get("quantity_delta")), _to_float(r.get("price"))
+            if qty is None or px is None:
+                continue
+            qty = abs(qty)
+            entry_legs.append(Leg(quantity=qty, price=px, timestamp=_parse_ts(r.get("timestamp_utc"))))
+            total_qty += qty
+            total_cost += qty * px
+        average_entry = (total_cost / total_qty) if total_qty > 0 else None
+
+        if not entry_legs:
+            incomplete_data_count += 1
+            continue
+
+        # Cantidad neta abierta: la fuente mas confiable es quantity_after
+        # del ULTIMO evento visto (cualquier tipo - ENTRY/ADD/REDUCE/
+        # PARTIAL_EXIT), no la suma de las patas de entrada, que ignoraria
+        # un REDUCE/PARTIAL_EXIT parcial ya aplicado sobre esta posicion.
+        last_row = pos_rows[-1]  # `rows` ya viene ordenado ascendente por el loader (ver dashboard/data/journal.py)
+        data_insufficient: List[str] = []
+        qty_after = _to_float(last_row.get("quantity_after"))
+        if qty_after is None:
+            qty_after = total_qty  # mejor estimacion disponible, documentada explicitamente
+            data_insufficient.append("quantity_open_from_quantity_after")
+
+        entry_side = str(entry_rows[0].get("side") or "").strip().lower() or None
+
+        open_positions.append(OpenPosition(
+            position_id=pid, strategy=strategy, symbol=symbol,
+            contract_key=contract_key, side=entry_side,
+            quantity_open=abs(qty_after), average_entry_price=average_entry,
+            opened_at=_parse_ts(entry_rows[0]["timestamp_utc"]),
+            last_event_at=_parse_ts(last_row.get("timestamp_utc")),
+            last_event_type=str(last_row.get("event_type") or "") or None,
+            entry_legs=entry_legs, data_insufficient_fields=data_insufficient,
+        ))
+
+    return open_positions, closed_count, incomplete_data_count
+
+
 def load_closed_trades_export(path: Path) -> List[Trade]:
     """
     Lee el export de "reconstruccion de cierres" (español, generado por
