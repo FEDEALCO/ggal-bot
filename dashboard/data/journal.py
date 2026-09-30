@@ -110,10 +110,21 @@ def load_journal_rows(csv_path: Optional[Path] = None) -> List[Dict]:
 
 
 def get_closed_trades(
-    rows: List[Dict], strategies: Optional[Tuple[str, ...]] = None
+    rows: List[Dict],
+    strategies: Optional[Tuple[str, ...]] = None,
+    include_partial_realized_for_open_positions: bool = False,
 ) -> Tuple[List[Trade], int, int]:
-    """Delgado: reutiliza reconstruct.reconstruct_lifecycle_trades tal cual (fuente unica de verdad, sin logica propia)."""
-    return bt_reconstruct.reconstruct_lifecycle_trades(rows, strategies=strategies)
+    """
+    Delgado: reutiliza reconstruct.reconstruct_lifecycle_trades tal cual
+    (fuente unica de verdad, sin logica propia). `include_partial_realized_
+    for_open_positions` pasa directo (default False = comportamiento
+    identico a antes de la MEJORA 2026-09-30 - ver docstring de esa
+    funcion para el detalle y el caso real que la motivo).
+    """
+    return bt_reconstruct.reconstruct_lifecycle_trades(
+        rows, strategies=strategies,
+        include_partial_realized_for_open_positions=include_partial_realized_for_open_positions,
+    )
 
 
 def get_open_positions(

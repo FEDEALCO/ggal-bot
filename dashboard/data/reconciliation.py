@@ -102,14 +102,28 @@ def cross_check_partition(
     `closed_result` = reconstruct_lifecycle_trades(rows, strategies=X)
     `open_result` = reconstruct_open_positions(rows, strategies=X)
     Deben llamarse sobre el MISMO `rows` y el MISMO filtro `strategies`.
+
+    MEJORA 2026-09-30: si `closed_result` vino de
+    reconstruct_lifecycle_trades(..., include_partial_realized_for_open_
+    positions=True), puede traer Trade con `position_still_open=True`
+    (PnL ya realizado de un PARTIAL_EXIT/REDUCE sobre una posicion que
+    TODAVIA no cerro - ver docstring de esa funcion). Esos Trade se
+    EXCLUYEN del lado "cerrado" de este chequeo (siguen contando del lado
+    abierto via still_open_count, que reconstruct_lifecycle_trades ya
+    incrementa para ellos) - de lo contrario el invariante daria un falso
+    ❌ de INCONSISTENCIA INTERNA cada vez que el nuevo modo aporta PnL
+    realizado extra, cuando en realidad la particion sigue siendo correcta,
+    solo que ya no es estrictamente disjunta a proposito.
     """
     trades, still_open_count, closed_incomplete = closed_result
     open_positions, closed_count_mirror, open_incomplete = open_result
 
     unique_ids = {str(r.get("position_id") or "") for r in rows if r.get("position_id")}
 
+    fully_closed_trades = [t for t in trades if not t.position_still_open]
+
     left_ok = (len(open_positions) + open_incomplete) == still_open_count
-    right_ok = closed_count_mirror == (len(trades) + closed_incomplete)
+    right_ok = closed_count_mirror == (len(fully_closed_trades) + closed_incomplete)
     is_consistent = left_ok and right_ok
 
     detail = None
@@ -117,8 +131,8 @@ def cross_check_partition(
         detail = (
             f"still_open_count={still_open_count} vs open_positions+incomplete="
             f"{len(open_positions) + open_incomplete}; "
-            f"closed_count_mirror={closed_count_mirror} vs trades+incomplete="
-            f"{len(trades) + closed_incomplete}"
+            f"closed_count_mirror={closed_count_mirror} vs trades_cerrados+incomplete="
+            f"{len(fully_closed_trades) + closed_incomplete}"
         )
 
     return PartitionCrossCheck(

@@ -136,11 +136,42 @@ def test_cross_check_partition_detects_inconsistency_when_results_come_from_diff
         path.unlink(missing_ok=True)
 
 
+def test_cross_check_partition_consistent_with_partial_realized_still_open_trade():
+    """
+    MEJORA 2026-09-30 (ver REPORT.md - posicion real 9bf25bc4c8ca en
+    GFGC7400OC): cuando closed_result viene de get_closed_trades(...,
+    include_partial_realized_for_open_positions=True) y trae un Trade con
+    position_still_open=True (PnL ya realizado de un PARTIAL_EXIT sobre una
+    posicion que sigue abierta), el cruce NO debe reportar una
+    inconsistencia interna falsa - ese Trade se excluye del lado "cerrado"
+    del chequeo (la posicion sigue contando del lado abierto).
+    """
+    path = _write_raw_csv([
+        ["2026-09-15T13:50:23.630511+00:00", "ENTRY", "9bf25bc4c8ca", "k", "GFGC7400OC", "weekly_asymmetric", "buy", "13", "13", "153.0015", "oc1", "e", ""],
+        ["2026-09-16T13:30:29.040963+00:00", "PARTIAL_EXIT", "9bf25bc4c8ca", "k", "GFGC7400OC", "weekly_asymmetric", "sell", "-6", "7", "202.5", "oc2", "partial_profit_take", ""],
+    ])
+    try:
+        rows = dj.load_journal_rows(path)
+        closed_result = dj.get_closed_trades(rows, include_partial_realized_for_open_positions=True)
+        open_result = dj.get_open_positions(rows)
+
+        trades, still_open, _ = closed_result
+        assert len(trades) == 1 and trades[0].position_still_open is True
+        assert still_open == 1
+
+        check = rc.cross_check_partition(rows, closed_result, open_result)
+        assert check.is_consistent is True
+        assert check.detail is None
+    finally:
+        path.unlink(missing_ok=True)
+
+
 ALL_TESTS = [
     test_reconcile_closed_trades_by_strategy_sums_without_duplicates,
     test_reconcile_closed_trades_by_strategy_flags_position_id_counted_twice,
     test_cross_check_partition_consistent_on_real_data,
     test_cross_check_partition_detects_inconsistency_when_results_come_from_different_filters,
+    test_cross_check_partition_consistent_with_partial_realized_still_open_trade,
 ]
 
 

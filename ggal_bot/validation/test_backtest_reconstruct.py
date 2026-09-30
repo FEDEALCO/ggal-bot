@@ -165,6 +165,84 @@ def test_reconstruct_lifecycle_trades_position_counts_are_exhaustive_and_disjoin
         path.unlink(missing_ok=True)
 
 
+def test_reconstruct_lifecycle_trades_partial_exit_without_close_default_excluded():
+    """
+    MEJORA 2026-09-30: reproduce EXACTAMENTE la posicion real de produccion
+    que motivo esta mejora (position_id=9bf25bc4c8ca, GFGC7400OC,
+    weekly_asymmetric, ver REPORT.md): ENTRY de 13 contratos, PARTIAL_EXIT
+    de 6 con ganancia real, y NUNCA un CLOSE de los 7 restantes. Con el
+    default (include_partial_realized_for_open_positions=False), el
+    comportamiento debe ser IDENTICO a antes de la mejora: el PnL ya
+    realizado por el PARTIAL_EXIT NO se cuenta, la posicion es 100%
+    "todavia abierta".
+    """
+    path = _write_csv([
+        ["2026-09-15T13:50:23.630511+00:00", "ENTRY", "GFGC7400OC", "weekly_asymmetric", "9bf25bc4c8ca", "GGAL|GFGC7400OC|2026-10-16", "buy", "13", "13", "153.0015", "iv_cruda", ""],
+        ["2026-09-16T13:30:29.040963+00:00", "PARTIAL_EXIT", "GFGC7400OC", "weekly_asymmetric", "9bf25bc4c8ca", "GGAL|GFGC7400OC|2026-10-16", "sell", "-6", "7", "202.5", "partial_profit_take", ""],
+        # sin CLOSE - los 7 contratos restantes siguen abiertos hoy
+    ], _LIFECYCLE_HEADER)
+    try:
+        rows = load_lifecycle_journal_rows(path)
+        trades, still_open, incomplete = reconstruct_lifecycle_trades(rows)
+        assert trades == []
+        assert still_open == 1
+        assert incomplete == 0
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_reconstruct_lifecycle_trades_include_partial_realized_for_open_positions_counts_realized_pnl():
+    """
+    Mismo fixture que el test anterior, pero con
+    include_partial_realized_for_open_positions=True (MEJORA 2026-09-30,
+    ver docstring de la funcion): el PnL YA REALIZADO por el PARTIAL_EXIT
+    debe contarse (= exactamente lo que match_trades_fifo() ya contaba
+    sobre shadow_trades.csv, verificado contra los datos reales de
+    produccion: ARS 29.699,10), marcando el Trade con
+    position_still_open=True, y SIN dejar de contar la posicion en
+    still_open_count (el remanente de 7 contratos sigue expuesto).
+    """
+    path = _write_csv([
+        ["2026-09-15T13:50:23.630511+00:00", "ENTRY", "GFGC7400OC", "weekly_asymmetric", "9bf25bc4c8ca", "GGAL|GFGC7400OC|2026-10-16", "buy", "13", "13", "153.0015", "iv_cruda", ""],
+        ["2026-09-16T13:30:29.040963+00:00", "PARTIAL_EXIT", "GFGC7400OC", "weekly_asymmetric", "9bf25bc4c8ca", "GGAL|GFGC7400OC|2026-10-16", "sell", "-6", "7", "202.5", "partial_profit_take", ""],
+    ], _LIFECYCLE_HEADER)
+    try:
+        rows = load_lifecycle_journal_rows(path)
+        trades, still_open, incomplete = reconstruct_lifecycle_trades(
+            rows, include_partial_realized_for_open_positions=True,
+        )
+        assert len(trades) == 1
+        assert still_open == 1  # el remanente sigue abierto - no es un conjunto disjunto en este modo
+        assert incomplete == 0
+        t = trades[0]
+        assert t.position_still_open is True
+        assert t.close_reason is None  # nunca se fabrica un motivo de cierre que no existe
+        # PnL = (202.5 - 153.0015) * 6 * 100 = 29,699.10 (verificado contra produccion)
+        assert abs(t.pnl_gross_ars - 29_699.10) < 1e-2
+        assert len(t.exit_legs) == 1 and t.exit_legs[0].quantity == 6.0
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_reconstruct_lifecycle_trades_include_partial_realized_still_excludes_pure_open_positions():
+    """Una posicion SIN ningun exit todavia (puro ENTRY) sigue sin generar
+    Trade aunque include_partial_realized_for_open_positions=True - no hay
+    nada realizado que contar."""
+    path = _write_csv([
+        ["2026-09-01T10:00:00+00:00", "ENTRY", "GFGC5000O", "weekly_asymmetric", "pos1", "k", "buy", "10", "10", "100.0", "entrada", ""],
+    ], _LIFECYCLE_HEADER)
+    try:
+        rows = load_lifecycle_journal_rows(path)
+        trades, still_open, incomplete = reconstruct_lifecycle_trades(
+            rows, include_partial_realized_for_open_positions=True,
+        )
+        assert trades == []
+        assert still_open == 1
+        assert incomplete == 0
+    finally:
+        path.unlink(missing_ok=True)
+
+
 def test_reconstruct_lifecycle_trades_filters_by_strategy():
     path = _write_csv([
         ["2026-09-01T10:00:00+00:00", "ENTRY", "GFGC5000O", "weekly_asymmetric", "pos1", "k", "buy", "10", "10", "100.0", "e", ""],
@@ -362,6 +440,9 @@ ALL_TESTS = [
     test_reconstruct_lifecycle_trades_simple_entry_and_close,
     test_reconstruct_lifecycle_trades_handles_partial_exit_then_close,
     test_reconstruct_lifecycle_trades_excludes_positions_without_close,
+    test_reconstruct_lifecycle_trades_partial_exit_without_close_default_excluded,
+    test_reconstruct_lifecycle_trades_include_partial_realized_for_open_positions_counts_realized_pnl,
+    test_reconstruct_lifecycle_trades_include_partial_realized_still_excludes_pure_open_positions,
     test_reconstruct_lifecycle_trades_counts_close_without_entry_as_incomplete_data,
     test_reconstruct_lifecycle_trades_position_counts_are_exhaustive_and_disjoint,
     test_reconstruct_lifecycle_trades_filters_by_strategy,

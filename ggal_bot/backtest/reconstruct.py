@@ -93,6 +93,7 @@ class Trade:
     contract_key: Optional[str] = None  # "SUBYACENTE|SIMBOLO|YYYY-MM-DD" - solo lifecycle journal
     data_insufficient_fields: List[str] = field(default_factory=list)
     direction: Optional[str] = None  # "long" | "short", normalizado desde "Direccion" (vol_arbitrage) o "Lado" de la ENTRY (lifecycle journal) - ver attribution.attribute_by_option_type_and_direction
+    position_still_open: bool = False  # True SOLO si include_partial_realized_for_open_positions=True genero este Trade a partir de una posicion SIN CLOSE - ver reconstruct_lifecycle_trades
 
     @property
     def entry_notional_ars(self) -> float:
@@ -151,7 +152,9 @@ def load_lifecycle_journal_rows(path: Path) -> List[Dict]:
 
 
 def reconstruct_lifecycle_trades(
-    rows: List[Dict], strategies: Optional[Tuple[str, ...]] = None
+    rows: List[Dict],
+    strategies: Optional[Tuple[str, ...]] = None,
+    include_partial_realized_for_open_positions: bool = False,
 ) -> Tuple[List[Trade], int, int]:
     """
     Reconstruye Trades cerrados a partir de filas de lifecycle journal (ya
@@ -164,20 +167,49 @@ def reconstruct_lifecycle_trades(
     `strategies`: si se pasa, filtra por Estrategia (ej. ("weekly_asymmetric",)) -
     ninguna fila de otra estrategia se mezcla.
 
-    Devuelve (trades_cerrados, cantidad_de_posiciones_todavia_abiertas,
-    cantidad_de_posiciones_con_datos_incompletos). Estos son TRES conjuntos
-    disjuntos que deben sumar exactamente el total de position_id unicos
-    vistos:
+    `include_partial_realized_for_open_positions` (default False, PRESERVA
+    el comportamiento historico - ver MEJORA 2026-09-30 mas abajo):
+
+    Cuando es False (default): devuelve (trades_cerrados,
+    cantidad_de_posiciones_todavia_abiertas, cantidad_de_posiciones_con_
+    datos_incompletos) como TRES conjuntos DISJUNTOS que suman exactamente
+    el total de position_id unicos vistos:
       - trades_cerrados: tienen CLOSE y al menos una pata de entrada Y una
         de salida validas (parseables) -> se les calcula PnL/costo.
       - todavia_abiertas: nunca tuvieron un evento CLOSE dentro de la
-        ventana del export (la posicion seguia viva al cortar el export).
-      - datos_incompletos: SI tuvieron CLOSE (la posicion terminó dentro de
+        ventana del export (la posicion seguia viva al cortar el export) -
+        INCLUIDAS las que tuvieron un PARTIAL_EXIT/REDUCE previo con PnL ya
+        realizado: ese PnL no se calcula ni se reporta en este modo (motivo
+        original: nunca se fabrica un cierre que no ocurrio).
+      - datos_incompletos: SI tuvieron CLOSE (la posicion termino dentro de
         la ventana) pero falta la pata de ENTRY/ADD correspondiente (o no
         se pudo parsear qty/precio) - tipicamente posiciones abiertas ANTES
         de que empezara la ventana del export ("legacy"). Nunca se fabrica
         un precio/cantidad de entrada para estas: se cuentan y se excluyen
         explicitamente, nunca se descartan en silencio.
+
+    MEJORA 2026-09-30 (mandato explicito del usuario, ver REPORT.md -
+    Reconciliacion en produccion detecto un ❌ real en weekly_asymmetric:
+    posicion 9bf25bc4c8ca en GFGC7400OC, ENTRY 13 contratos, PARTIAL_EXIT
+    de 6 con ganancia real de ARS 29.699,10, y NUNCA un CLOSE de los 7
+    restantes - ese PnL YA REALIZADO quedaba 100% afuera de journal_pnl
+    solo por no haber CLOSE, mientras que el FIFO de shadow_trades.csv SI
+    lo contaba, correctamente, produciendo un ❌ de reconciliacion
+    enganoso): cuando include_partial_realized_for_open_positions=True, una
+    posicion SIN CLOSE pero CON al menos un PARTIAL_EXIT/REDUCE valido
+    TAMBIEN genera un Trade (con `position_still_open=True`, `closed_at` =
+    timestamp de su ultima pata de salida, `close_reason=None` - nunca se
+    fabrica un motivo de cierre que no existe) por el PnL YA realizado de
+    esas patas de salida. Esa posicion SIGUE contando en
+    `still_open_count` (su remanente sigue expuesto - ver
+    reconstruct_open_positions, que ya calculaba quantity_open
+    correctamente desde quantity_after y no cambia) - el invariante de
+    conjuntos DISJUNTOS deja de valer a proposito en este modo: usar
+    `[t for t in trades if not t.position_still_open]` para recuperar la
+    vista "solo trades 100% cerrados" comparable 1:1 con still_open/
+    incomplete. Con el default False, el comportamiento (y todos los tests
+    existentes, y ggal_bot/backtest/run_fase0.py) es IDENTICO a antes de
+    esta mejora.
     """
     by_position: Dict[str, List[Dict]] = {}
     order: List[str] = []
@@ -202,9 +234,11 @@ def reconstruct_lifecycle_trades(
         exit_rows = [r for r in pos_rows if r.get("event_type") in _EXIT_EVENT_TYPES]
         close_rows = [r for r in pos_rows if r.get("event_type") == "CLOSE"]
 
-        if not close_rows:
-            still_open_count += 1
-            continue  # nunca se fabrica un cierre - se excluye de las estadisticas de trades cerrados
+        position_still_open = not close_rows
+        if position_still_open:
+            still_open_count += 1  # remanente sigue expuesto - ver reconstruct_open_positions
+            if not (include_partial_realized_for_open_positions and exit_rows):
+                continue  # comportamiento original: nunca se fabrica un cierre que no ocurrio
 
         symbol = str(pos_rows[0].get("symbol") or "")
         strategy = str(pos_rows[0].get("strategy_tag") or "") or "weekly_asymmetric"
@@ -240,8 +274,14 @@ def reconstruct_lifecycle_trades(
             data_insufficient.append("realized_pnl")
 
         opened_at = _parse_ts(entry_rows[0]["timestamp_utc"]) if entry_rows else None
-        closed_at = _parse_ts(close_rows[-1]["timestamp_utc"])
-        close_reason = close_rows[-1].get("reason") or None
+        # Sin CLOSE (solo llega aca en modo include_partial_realized_for_open_positions):
+        # no hay "Cuando (UTC)" de cierre real - se usa la ultima pata de
+        # salida vista como mejor aproximacion honesta, y NUNCA se fabrica
+        # un motivo de cierre (close_reason=None, no hay CLOSE.reason).
+        closed_at = _parse_ts(close_rows[-1]["timestamp_utc"]) if close_rows else (
+            _parse_ts(exit_rows[-1]["timestamp_utc"]) if exit_rows else None
+        )
+        close_reason = close_rows[-1].get("reason") or None if close_rows else None
         # "Lado" de la primera pata de ENTRADA real ("buy"/"sell") normalizado
         # a la misma convencion "long"/"short" que usa el export de cierres
         # de vol_arbitrage (columna "Direccion") - ver
@@ -251,14 +291,26 @@ def reconstruct_lifecycle_trades(
         direction = {"buy": "long", "sell": "short"}.get(entry_side)
 
         if not entry_legs or not exit_legs:
-            # SI tuvo CLOSE (termino dentro de la ventana) pero falta la
-            # pata de entrada (o de salida) valida - no es un "abierto" (ya
-            # cerro) ni un trade costeable (falta un lado). Tipicamente una
-            # posicion legacy abierta ANTES de que empezara la ventana del
-            # export. Se cuenta explicitamente (nunca se descarta en
-            # silencio) para que trades + still_open + incomplete_data
-            # sumen exactamente el total de position_id unicos vistos.
-            incomplete_data_count += 1
+            if close_rows:
+                # SI tuvo CLOSE (termino dentro de la ventana) pero falta la
+                # pata de entrada (o de salida) valida - no es un "abierto"
+                # (ya cerro) ni un trade costeable (falta un lado).
+                # Tipicamente una posicion legacy abierta ANTES de que
+                # empezara la ventana del export. Se cuenta explicitamente
+                # (nunca se descarta en silencio) para que trades +
+                # still_open + incomplete_data sumen exactamente el total
+                # de position_id unicos vistos (modo default).
+                incomplete_data_count += 1
+            # Si NO tuvo CLOSE (solo llega aca con
+            # include_partial_realized_for_open_positions=True: posicion
+            # legacy todavia abierta, con un PARTIAL_EXIT/REDUCE pero sin
+            # pata de entrada parseable), NO se suma aca - ya esta contada
+            # en still_open_count (arriba) y reconstruct_open_positions ya
+            # la clasifica en SU PROPIO open_incomplete_data_count (mismo
+            # criterio: falta ENTRY/ADD parseable). Sumarla aca tambien
+            # duplicaria el conteo y rompería el invariante cruzado de
+            # cross_check_partition (closed_count_mirror vs trades_cerrados
+            # + closed_incomplete, ver dashboard/data/reconciliation.py).
             continue
 
         trades.append(Trade(
@@ -267,7 +319,7 @@ def reconstruct_lifecycle_trades(
             entry_legs=entry_legs, exit_legs=exit_legs,
             pnl_gross_ars=realized_pnl, close_reason=close_reason,
             contract_key=contract_key, data_insufficient_fields=data_insufficient,
-            direction=direction,
+            direction=direction, position_still_open=position_still_open,
         ))
 
     return trades, still_open_count, incomplete_data_count
