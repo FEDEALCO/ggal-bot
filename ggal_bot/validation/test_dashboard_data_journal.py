@@ -18,6 +18,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+from dashboard import pnl_engine as pe
 from dashboard.data import journal as dj
 
 _RAW_HEADER = [
@@ -106,6 +107,30 @@ def test_get_open_positions_reuses_backtest_reconstruct_with_real_strategy_tag()
         path.unlink(missing_ok=True)
 
 
+def test_rows_from_position_events_df_allows_reusing_an_already_loaded_dataframe():
+    """
+    MEJORA 2026-09-30 (panel de reconciliacion): dashboard/app.py ya carga
+    logs/position_events.csv una vez (pe.load_position_events(), tambien
+    usado para la pestaña Lifecycle) - esta funcion le permite reusar ESE
+    DataFrame en vez de que load_journal_rows() vuelva a leer el archivo.
+    """
+    path = _write_raw_csv([
+        ["2026-09-01T10:00:00+00:00", "ENTRY", "pos1", "k", "GFGC5000O", "weekly_asymmetric", "buy", "10", "10", "100.0", "oc1", "e", ""],
+    ])
+    try:
+        df = pe.load_position_events(path)
+        rows = dj.rows_from_position_events_df(df)
+        assert len(rows) == 1
+        assert rows[0]["position_id"] == "pos1"
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_rows_from_position_events_df_empty_for_empty_dataframe():
+    import pandas as pd
+    assert dj.rows_from_position_events_df(pd.DataFrame()) == []
+
+
 def test_get_closed_trades_and_get_open_positions_filter_by_strategy_consistently():
     path = _write_raw_csv([
         ["2026-09-01T10:00:00+00:00", "ENTRY", "pos1", "k", "GFGC5000O", "weekly_asymmetric", "buy", "10", "10", "100.0", "oc1", "e", ""],
@@ -128,6 +153,8 @@ ALL_TESTS = [
     test_load_journal_rows_never_fabricates_missing_numeric_fields,
     test_get_closed_trades_reuses_backtest_reconstruct_without_duplicating_math,
     test_get_open_positions_reuses_backtest_reconstruct_with_real_strategy_tag,
+    test_rows_from_position_events_df_allows_reusing_an_already_loaded_dataframe,
+    test_rows_from_position_events_df_empty_for_empty_dataframe,
     test_get_closed_trades_and_get_open_positions_filter_by_strategy_consistently,
 ]
 

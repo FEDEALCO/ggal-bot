@@ -56,20 +56,21 @@ def _clean(v):
     return v
 
 
-def load_journal_rows(csv_path: Optional[Path] = None) -> List[Dict]:
+def rows_from_position_events_df(df: pd.DataFrame) -> List[Dict]:
     """
-    Lee logs/position_events.csv (via dashboard.pnl_engine.load_position_events,
-    ya testeado en test_dashboard_pnl.py - tolerante a archivo faltante o
-    vacio) y devuelve una lista de dicts en el formato interno que
-    reconstruct.reconstruct_lifecycle_trades / reconstruct_open_positions
+    Convierte un DataFrame YA CARGADO de logs/position_events.csv (formato
+    de dashboard.pnl_engine.load_position_events) a la lista de dicts que
+    reconstruct.reconstruct_lifecycle_trades/reconstruct_open_positions
     esperan, ordenados ASCENDENTE por timestamp_utc (mismo criterio que
     reconstruct.load_lifecycle_journal_rows: no se confia en el orden del
-    archivo, se ordena explicitamente aca).
+    archivo/DataFrame, se ordena explicitamente aca).
 
-    Devuelve [] si el archivo no existe o esta vacio (nunca fabrica filas) -
-    el llamador debe mostrar "SIN DATOS" en ese caso, no un grafico vacio.
+    Separado de load_journal_rows() para que un llamador que YA leyo el
+    CSV una vez (ej. dashboard/app.py, que tambien lo necesita para la
+    pestaña "Lifecycle") pueda reusar ese mismo DataFrame en vez de volver
+    a leer el archivo del disco - una sola lectura, una sola fuente de
+    verdad para "que decia el journal en este refresh del dashboard".
     """
-    df = pe.load_position_events(csv_path)
     if df.empty:
         return []
     df = df.sort_values("timestamp_utc", kind="stable")
@@ -94,6 +95,18 @@ def load_journal_rows(csv_path: Optional[Path] = None) -> List[Dict]:
             "data_unavailable_fields": _clean(r.get("data_unavailable_fields")) or "",
         })
     return rows
+
+
+def load_journal_rows(csv_path: Optional[Path] = None) -> List[Dict]:
+    """
+    Lee logs/position_events.csv (via dashboard.pnl_engine.load_position_events,
+    ya testeado en test_dashboard_pnl.py - tolerante a archivo faltante o
+    vacio) y devuelve rows_from_position_events_df() de ese DataFrame.
+
+    Devuelve [] si el archivo no existe o esta vacio (nunca fabrica filas) -
+    el llamador debe mostrar "SIN DATOS" en ese caso, no un grafico vacio.
+    """
+    return rows_from_position_events_df(pe.load_position_events(csv_path))
 
 
 def get_closed_trades(

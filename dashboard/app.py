@@ -25,6 +25,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
+from typing import Dict
 
 import pandas as pd
 import plotly.express as px
@@ -42,6 +43,8 @@ from ggal_bot.config import SETTINGS  # noqa: E402
 from ggal_bot.paths import POSITION_EVENTS_LOG, SHADOW_TRADES_LOG, STATE_FILE  # noqa: E402
 from ggal_bot.risk.kill_switch import KillSwitch  # noqa: E402
 from dashboard import pnl_engine as pe  # noqa: E402
+from dashboard.data import journal as dj  # noqa: E402
+from dashboard.data import reconciliation as rc  # noqa: E402
 
 st.set_page_config(page_title="GGAL BOT — Dashboard", layout="wide", page_icon="📈")
 
@@ -205,6 +208,124 @@ if _ks_state.tripped:
         "(`python -m ggal_bot.risk.kill_switch --reset \"motivo\"`). Las salidas de "
         "posiciones ya abiertas NO estan bloqueadas por este mecanismo."
     )
+
+st.divider()
+
+
+# ---------------------------------------------------------------------------
+# Panel de reconciliacion (Fase 1, mandato explicito del usuario - ver
+# REPORT.md: "PnL total del dashboard = suma de PnL por estrategia = PnL
+# reconstruido desde el journal, sin duplicados. Si no cuadra, banner rojo
+# con la diferencia.")
+# ---------------------------------------------------------------------------
+
+st.subheader("🔍 Reconciliación")
+
+_JOURNAL_STRATEGIES = ("weekly_asymmetric", "scalping")
+_RECON_TOLERANCE_ARS = 1.0  # redondeo de punto flotante, no una discrepancia real
+
+# IMPORTANTE: reusa position_events_df_raw (ya cargado mas arriba, tambien
+# usado para classify_strategy_from_journal() y la pestaña "Lifecycle") -
+# no se vuelve a leer logs/position_events.csv del disco.
+journal_rows_all = dj.rows_from_position_events_df(position_events_df_raw)
+
+# --- Chequeo 1: la suma de PnL cerrado por estrategia (sobre el universo
+# COMPLETO, closed_df sin filtrar por la sidebar - la reconciliacion no
+# puede depender de lo que el usuario eligio mirar) tiene que coincidir con
+# el PnL realizado total de la KPI de arriba. ---
+if closed_df.empty:
+    fifo_sum_by_strategy: Dict[str, float] = {}
+else:
+    fifo_sum_by_strategy = closed_df.groupby("strategy")["pnl_ars"].sum().to_dict()
+
+fifo_total_check = sum(fifo_sum_by_strategy.values())
+kpi_total = summary["pnl_realized_ars"]
+sum_matches_kpi = abs(fifo_total_check - kpi_total) <= _RECON_TOLERANCE_ARS
+
+# --- Chequeo 2: para las estrategias que SI pasan por el Event Journal
+# (weekly_asymmetric/scalping - vol_arbitrage nunca tagea sus entradas ahi,
+# ver _act_on_signal() en run_bot.py: agrega la Position directo al
+# portfolio sin llamar a position_event_journal.log_event), reconstruccion
+# INDEPENDIENTE desde position_events.csv vs el total FIFO de la MISMA
+# estrategia. Dos fuentes de datos y dos caminos de codigo distintos que
+# deben coincidir (con tolerancia de redondeo) - exactamente la clase de
+# bug que motivo este proyecto entero (ver classify_strategy()).
+recon_table_rows = []
+any_journal_mismatch = False
+partition_issues = []
+
+for strat in _JOURNAL_STRATEGIES:
+    fifo_pnl = float(fifo_sum_by_strategy.get(strat, 0.0))
+    fifo_n = int((closed_df["strategy"] == strat).sum()) if not closed_df.empty else 0
+
+    rows_for_strat = [r for r in journal_rows_all if r.get("strategy_tag") == strat]
+    closed_result = dj.get_closed_trades(journal_rows_all, strategies=(strat,))
+    open_result = dj.get_open_positions(journal_rows_all, strategies=(strat,))
+    trades, _, _ = closed_result
+    journal_pnl = sum(t.pnl_gross_ars for t in trades)
+    journal_n = len(trades)
+
+    diff = fifo_pnl - journal_pnl
+    has_any_data = (fifo_n > 0) or (journal_n > 0)
+    matches = (not has_any_data) or (abs(diff) <= max(_RECON_TOLERANCE_ARS, abs(journal_pnl) * 0.01))
+    if has_any_data and not matches:
+        any_journal_mismatch = True
+
+    partition_check = rc.cross_check_partition(rows_for_strat, closed_result, open_result)
+    if not partition_check.is_consistent:
+        partition_issues.append((strat, partition_check.detail))
+
+    recon_table_rows.append({
+        "Estrategia": strat,
+        "PnL FIFO — shadow_trades.csv (bruto)": fifo_pnl,
+        "N (FIFO)": fifo_n,
+        "PnL Journal — position_events.csv (bruto)": journal_pnl,
+        "N (Journal)": journal_n,
+        "Diferencia": diff,
+        "¿Coincide?": "✅" if matches else ("— sin datos" if not has_any_data else "❌"),
+    })
+
+recon_df = pd.DataFrame(recon_table_rows)
+if not recon_df.empty:
+    for _col in ["PnL FIFO — shadow_trades.csv (bruto)", "PnL Journal — position_events.csv (bruto)", "Diferencia"]:
+        recon_df[_col] = recon_df[_col].round(2)
+    st.dataframe(recon_df, width="stretch", hide_index=True)
+
+if not sum_matches_kpi:
+    st.error(
+        f"🔴 RECONCILIACIÓN FALLIDA: la suma de PnL cerrado por estrategia (\\$ {fifo_total_check:,.2f}) "
+        f"no coincide con el PnL realizado total de la KPI (\\$ {kpi_total:,.2f}) — diferencia "
+        f"\\$ {fifo_total_check - kpi_total:,.2f}. Esto indicaria un bug de agregacion interno; "
+        "no deberia pasar nunca (ambos numeros salen de la misma lista de trades cerrados)."
+    )
+elif any_journal_mismatch:
+    st.error(
+        "🔴 RECONCILIACIÓN FALLIDA: el PnL reconstruido de forma independiente desde el Event Journal "
+        "no coincide con el PnL FIFO (shadow_trades.csv) para al menos una estrategia — ver la "
+        "diferencia en la tabla de arriba. Motivo probable a investigar: `match_trades_fifo()` agrupa "
+        "lotes abiertos SOLO por simbolo (no por simbolo+estrategia, ver dashboard/pnl_engine.py) — si "
+        "dos estrategias operaron el mismo simbolo en ventanas superpuestas, sus lotes se pueden "
+        "cruzar. Otros motivos posibles: fills sin match en el journal (anteriores a 2026-09-07 17:05 "
+        "UTC, cuando se desplego) o posiciones legacy con datos incompletos."
+    )
+else:
+    st.success(
+        "✅ Reconciliación OK: sin duplicados detectados, y el PnL FIFO coincide con el PnL "
+        "reconstruido de forma independiente desde el Event Journal (dentro de tolerancia)."
+    )
+
+if partition_issues:
+    for _strat, _detail in partition_issues:
+        st.warning(f"⚠️ Inconsistencia de partición en el journal para '{_strat}': {_detail}")
+
+st.caption(
+    "Reconciliación de solo lectura: no corrige nada, solo compara dos caminos de calculo "
+    "independientes (FIFO sobre `shadow_trades.csv` vs. reconstruccion desde `position_events.csv`). "
+    "`vol_arbitrage`/`delta_hedge`/`unknown_legacy` no tienen equivalente en el Event Journal por "
+    "diseño (vol_arbitrage nunca tagea sus entradas ahi, delta_hedge es el subyacente, "
+    "unknown_legacy es anterior al deploy del journal el 2026-09-07 17:05 UTC) — para esas, la unica "
+    "fuente disponible es el FIFO, sin verificacion cruzada posible con los datos actuales."
+)
 
 st.divider()
 
