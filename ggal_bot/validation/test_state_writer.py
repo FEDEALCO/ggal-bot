@@ -42,6 +42,7 @@ def test_write_defaults_env_flags_empty_and_git_sha_unknown_when_not_passed():
         data = json.loads(path.read_text(encoding="utf-8"))
         assert data["env_flags"] == {}
         assert data["deployed_git_sha"] == "unknown"
+        assert data["shadow_mode_enabled"] is None
     finally:
         path.unlink(missing_ok=True)
         path.with_suffix(".tmp").unlink(missing_ok=True)
@@ -66,9 +67,37 @@ def test_write_persists_env_flags_and_git_sha_when_passed():
         path.with_suffix(".tmp").unlink(missing_ok=True)
 
 
+def test_write_persists_shadow_mode_enabled_true_and_false_explicitly():
+    """
+    Regresion de la Prioridad 3 (Fase 1 dashboard, 2026-09-30, distincion
+    visual shadow/vivo): shadow_mode_enabled debe persistir el bool TAL CUAL
+    (incluido False - no confundirlo con "no pasado", que persiste None).
+    """
+    path = _temp_path()
+    try:
+        writer = StateWriter(path=path)
+        writer.write(
+            portfolio_greeks_total={}, portfolio_greeks_by_expiry={},
+            active_signals=[], risk_breaches="", shadow_mode_enabled=True,
+        )
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["shadow_mode_enabled"] is True
+
+        writer.write(
+            portfolio_greeks_total={}, portfolio_greeks_by_expiry={},
+            active_signals=[], risk_breaches="", shadow_mode_enabled=False,
+        )
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["shadow_mode_enabled"] is False
+    finally:
+        path.unlink(missing_ok=True)
+        path.with_suffix(".tmp").unlink(missing_ok=True)
+
+
 ALL_TESTS = [
     test_write_defaults_env_flags_empty_and_git_sha_unknown_when_not_passed,
     test_write_persists_env_flags_and_git_sha_when_passed,
+    test_write_persists_shadow_mode_enabled_true_and_false_explicitly,
 ]
 
 

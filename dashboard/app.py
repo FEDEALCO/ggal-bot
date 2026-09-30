@@ -45,6 +45,11 @@ from ggal_bot.risk.kill_switch import KillSwitch  # noqa: E402
 from dashboard import pnl_engine as pe  # noqa: E402
 from dashboard.data import journal as dj  # noqa: E402
 from dashboard.data import reconciliation as rc  # noqa: E402
+from dashboard.data import bot_config as bc  # noqa: E402
+from dashboard.data import freshness as fr  # noqa: E402
+from dashboard.data import market_data as dmd  # noqa: E402
+from dashboard.data import funnel as dfn  # noqa: E402
+from dashboard.data import ccl_bonds as dcb  # noqa: E402
 
 st.set_page_config(page_title="GGAL BOT — Dashboard", layout="wide", page_icon="📈")
 
@@ -169,6 +174,33 @@ st.caption(
     f"Ultima actualizacion del bot: {last_update or 'sin datos de state/bot_state.json todavia'} · "
     f"Ahora: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
 )
+
+# ---------------------------------------------------------------------------
+# Distincion visual SHADOW/VIVO (Fase 1, Prioridad 3 - mandato explicito del
+# usuario). Fuente UNICA de verdad: shadow_mode_enabled publicado por el
+# bot mismo en bot_state.json (ver run_bot.py/state_writer.py) - NUNCA se
+# infiere de SETTINGS.shadow.enabled leido en este proceso (el dashboard
+# puede correr en un servicio/entorno distinto del bot, ver
+# dashboard/data/bot_config.py) ni se asume un modo por default cuando el
+# dato no esta.
+# ---------------------------------------------------------------------------
+_shadow_mode = bc.get_shadow_mode_from_state(bot_state)
+if _shadow_mode is True:
+    st.info(
+        "🟡 **MODO SHADOW** — el bot no envia ordenes reales (fills simulados en "
+        "`shadow_trades.csv`). Dato publicado por el propio bot en este ciclo."
+    )
+elif _shadow_mode is False:
+    st.error(
+        "🔴 **MODO VIVO — DINERO REAL.** El bot esta operando con ordenes reales. "
+        "Dato publicado por el propio bot en este ciclo."
+    )
+else:
+    st.warning(
+        "⚠️ **Modo desconocido (SIN DATOS):** `bot_state.json` no publica `shadow_mode_enabled` "
+        "todavia (deploy anterior a esta mejora, o el archivo no existe/esta vacio). "
+        "No asumir shadow ni vivo - verificar manualmente antes de operar sobre esta informacion."
+    )
 
 kpi_row1 = st.columns(4)
 kpi_row1[0].metric(
@@ -336,9 +368,8 @@ elif any_journal_mismatch:
         "ID cuando hay match en el journal (o por simbolo+estrategia si no lo hay — corregido "
         "2026-09-30, ver docstring de esa funcion), asi que un cruce entre estrategias del mismo "
         "simbolo ya NO deberia ser la causa. Motivos probables a investigar: fills sin match en el "
-        "journal (anteriores a 2026-09-07 17:05 UTC, cuando se desplego el journal, o de una estrategia "
-        "que todavia no loguea sus ENTRY al journal — vol_arbitrage/delta_hedge) o posiciones legacy "
-        "con datos incompletos."
+        "journal (anteriores a 2026-09-07 17:05 UTC, cuando se desplego el journal) o posiciones "
+        "legacy con datos incompletos."
     )
 else:
     st.success(
@@ -361,6 +392,103 @@ st.caption(
     "cruzarla aca daria un ❌ permanente y enganoso, no un bug real. `unknown_legacy` tampoco tiene "
     "equivalente por definicion (fill sin match en el journal, anterior a su deploy el 2026-09-07 "
     "17:05 UTC): para esas dos, la unica fuente disponible es el FIFO, sin verificacion cruzada."
+)
+
+st.divider()
+
+
+# ---------------------------------------------------------------------------
+# Panel de frescura de datos (Fase 1, Prioridad 3 - mandato explicito del
+# usuario). Usa dashboard/data/freshness.py (ya testeado por separado, ver
+# ggal_bot/validation/test_dashboard_data_freshness.py): para cada fuente,
+# timestamp del ULTIMO evento visto y si esta "stale" (umbral en minutos,
+# solo durante la rueda BYMA asumida - ver docstring de ese modulo sobre el
+# supuesto de horario NO verificado). Reusa DataFrames ya cargados (fills,
+# position_events_df_raw) cuando existen; lee market_snapshots.csv/
+# signal_funnel.csv/ccl_bond_quotes.csv aparte (features opt-in, "SIN
+# DATOS" es el resultado ESPERADO si el flag correspondiente esta apagado
+# en este deploy, no un error).
+# ---------------------------------------------------------------------------
+
+st.subheader("🕐 Frescura de datos")
+
+_now_utc = datetime.now(timezone.utc)
+
+
+def _last_ts(df: pd.DataFrame, col: str = "timestamp_utc"):
+    if df.empty or col not in df.columns:
+        return None
+    valid = df[col].dropna()
+    return valid.max() if not valid.empty else None
+
+
+_bot_ts_raw = bot_state.get("timestamp")
+_bot_last_event = pd.to_datetime(_bot_ts_raw, errors="coerce") if _bot_ts_raw else None
+if _bot_last_event is not None and _bot_last_event.tzinfo is None:
+    _bot_last_event = _bot_last_event.tz_localize(timezone.utc)
+
+_freshness_sources = [
+    fr.compute_freshness(
+        "Bot (bot_state.json)", _bot_last_event, now_utc=_now_utc, stale_after_minutes=5.0,
+        no_data_reason="SIN DATOS: el bot todavia no escribio ningun ciclo en bot_state.json.",
+    ),
+    fr.compute_freshness(
+        "Fills (shadow_trades.csv)", _last_ts(fills), now_utc=_now_utc, stale_after_minutes=60.0,
+        no_data_reason="SIN DATOS: no hay ningun fill registrado todavia.",
+    ),
+    fr.compute_freshness(
+        "Journal (position_events.csv)", _last_ts(position_events_df_raw), now_utc=_now_utc,
+        stale_after_minutes=60.0,
+        no_data_reason="SIN DATOS: el Event Journal todavia no tiene ningun evento.",
+    ),
+    fr.compute_freshness(
+        "Snapshots de mercado (market_snapshots.csv)", _last_ts(dmd.load_market_snapshots()),
+        now_utc=_now_utc, stale_after_minutes=10.0,
+        no_data_reason="SIN DATOS: archivo vacio o inexistente (feature opt-in, ver GGAL_BOT_ENABLE_MARKET_SNAPSHOT_LOG).",
+    ),
+    fr.compute_freshness(
+        "Embudo de señales (signal_funnel.csv)", _last_ts(dfn.load_signal_funnel()),
+        now_utc=_now_utc, stale_after_minutes=60.0,
+        no_data_reason="SIN DATOS: archivo vacio o inexistente (feature opt-in, apagada por defecto).",
+    ),
+    fr.compute_freshness(
+        "Cotizaciones CCL (ccl_bond_quotes.csv)", _last_ts(dcb.load_ccl_bond_quotes()),
+        now_utc=_now_utc, stale_after_minutes=15.0,
+        no_data_reason="SIN DATOS: archivo vacio o inexistente (feature opt-in, ver GGAL_BOT_ENABLE_CCL_BOND_QUOTE_LOG).",
+    ),
+]
+
+_freshness_rows = []
+_any_stale = False
+for _src in _freshness_sources:
+    if not _src.has_data:
+        estado = "— sin datos"
+    elif _src.is_stale:
+        estado = "⚠️ desactualizado"
+        _any_stale = True
+    else:
+        estado = "✅ al dia"
+    _freshness_rows.append({
+        "Fuente": _src.source_name,
+        "Ultimo evento (UTC)": _src.last_event_utc.strftime("%Y-%m-%d %H:%M:%S") if _src.last_event_utc is not None else "—",
+        "Hace (min)": f"{_src.minutes_since:.1f}" if _src.minutes_since is not None else "—",
+        "Estado": estado,
+        "Detalle": _src.reason or "",
+    })
+
+st.dataframe(pd.DataFrame(_freshness_rows), width="stretch", hide_index=True)
+
+if _any_stale:
+    st.warning(
+        "⚠️ Al menos una fuente esta desactualizada dentro de la rueda asumida (11:00-17:00 ART, "
+        "lun-vie - SUPUESTO no verificado, ver dashboard/data/freshness.py). Puede indicar que el "
+        "bot se detuvo, perdio conectividad, o que la feature correspondiente esta deshabilitada."
+    )
+
+st.caption(
+    "Frescura de solo lectura: compara el timestamp del ultimo evento de cada fuente contra ahora. "
+    "'SIN DATOS' en una fuente opt-in (snapshots, embudo de señales, CCL) es el resultado esperado "
+    "si su flag GGAL_BOT_ENABLE_* correspondiente esta apagado en este deploy, no un error."
 )
 
 st.divider()

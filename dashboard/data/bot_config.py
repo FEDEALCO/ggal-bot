@@ -72,6 +72,24 @@ def get_env_flags_from_state(state: Optional[Dict[str, Any]]) -> Dict[str, str]:
     return {str(k): str(v) for k, v in flags.items()}
 
 
+def get_shadow_mode_from_state(state: Optional[Dict[str, Any]]) -> Optional[bool]:
+    """
+    Valor RESUELTO de SETTINGS.shadow.enabled publicado por el bot en este
+    snapshot (ver run_bot.py, ambos llamados a state_writer.write() -
+    Fase 1 dashboard, Prioridad 3: distincion visual shadow/vivo). None
+    (nunca se fabrica True/False) si el state es None, no trae la clave
+    (bot_state.json de un deploy anterior a esta mejora), o el valor no es
+    un bool - el llamador debe mostrar "SIN DATOS: modo desconocido" en
+    esos casos, jamas asumir un modo por default.
+    """
+    if not state:
+        return None
+    value = state.get("shadow_mode_enabled")
+    if not isinstance(value, bool):
+        return None
+    return value
+
+
 def get_deployed_git_sha_from_state(state: Optional[Dict[str, Any]]) -> Optional[str]:
     """
     SHA de git publicado por el bot en este snapshot (ver

@@ -38,6 +38,7 @@ class StateWriter:
         option_chain_snapshot: Optional[List[Dict[str, Any]]] = None,
         env_flags: Optional[Dict[str, str]] = None,
         deployed_git_sha: Optional[str] = None,
+        shadow_mode_enabled: Optional[bool] = None,
     ) -> None:
         payload = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -67,6 +68,17 @@ class StateWriter:
             # para la topologia DISEÑADA, no necesariamente la real).
             "env_flags": env_flags or {},
             "deployed_git_sha": deployed_git_sha or "unknown",
+            # MEJORA 2026-09-30 (Fase 1 dashboard, Prioridad 3 - distincion
+            # visual shadow/vivo a pedido explicito del usuario): el bot
+            # publica ACA el valor RESUELTO de SETTINGS.shadow.enabled (no
+            # solo si la env var GGAL_BOT_SHADOW_MODE esta presente en
+            # os.environ - env_flags de arriba solo captura eso, y una env
+            # var que se apoya en su default de Python nunca aparece ahi,
+            # dejando el flag ausente en vez de explicito). None (-> null en
+            # el JSON) si no se pasa: el dashboard debe mostrar "SIN DATOS",
+            # nunca asumir un modo por default. Misma logica de "no
+            # compartir proceso/env vars con el dashboard" que env_flags.
+            "shadow_mode_enabled": shadow_mode_enabled,
         }
         tmp_path = self.path.with_suffix(".tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:

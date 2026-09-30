@@ -75,6 +75,24 @@ def test_get_env_flags_from_state_returns_flags_published_by_bot():
     assert flags["GGAL_BOT_SOME_API_KEY"] == "***"  # el bot ya lo enmascaro, el dashboard no re-enmascara ni desenmascara
 
 
+def test_get_shadow_mode_from_state_none_when_state_is_none():
+    assert bc.get_shadow_mode_from_state(None) is None
+
+
+def test_get_shadow_mode_from_state_none_when_key_missing():
+    """bot_state.json de un deploy anterior a esta mejora - nunca se asume un modo por default."""
+    assert bc.get_shadow_mode_from_state({"timestamp": "x"}) is None
+
+
+def test_get_shadow_mode_from_state_none_when_value_is_not_a_bool():
+    assert bc.get_shadow_mode_from_state({"shadow_mode_enabled": "true"}) is None
+
+
+def test_get_shadow_mode_from_state_returns_true_and_false_explicitly():
+    assert bc.get_shadow_mode_from_state({"shadow_mode_enabled": True}) is True
+    assert bc.get_shadow_mode_from_state({"shadow_mode_enabled": False}) is False
+
+
 def test_get_deployed_git_sha_from_state_none_when_state_is_none():
     assert bc.get_deployed_git_sha_from_state(None) is None
 
@@ -94,6 +112,10 @@ ALL_TESTS = [
     test_get_env_flags_from_state_empty_when_state_is_none,
     test_get_env_flags_from_state_empty_when_key_missing,
     test_get_env_flags_from_state_returns_flags_published_by_bot,
+    test_get_shadow_mode_from_state_none_when_state_is_none,
+    test_get_shadow_mode_from_state_none_when_key_missing,
+    test_get_shadow_mode_from_state_none_when_value_is_not_a_bool,
+    test_get_shadow_mode_from_state_returns_true_and_false_explicitly,
     test_get_deployed_git_sha_from_state_none_when_state_is_none,
     test_get_deployed_git_sha_from_state_none_when_bot_published_unknown,
     test_get_deployed_git_sha_from_state_returns_real_sha,

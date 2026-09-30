@@ -886,6 +886,7 @@ class GgalOptionsBot:
             option_chain_snapshot=self._option_chain_snapshot(),
             env_flags=list_ggal_bot_env_vars(),
             deployed_git_sha=get_deployed_git_sha(),
+            shadow_mode_enabled=SETTINGS.shadow.enabled,
         )
 
     def _check_vol_arbitrage_exits(self, spot: float) -> None:
@@ -2488,6 +2489,7 @@ class GgalOptionsBot:
                 option_chain_snapshot=self._option_chain_snapshot(),
                 env_flags=list_ggal_bot_env_vars(),
                 deployed_git_sha=get_deployed_git_sha(),
+                shadow_mode_enabled=SETTINGS.shadow.enabled,
             )
         except Exception:
             logger.exception("Error escribiendo el estado final durante el shutdown.")
