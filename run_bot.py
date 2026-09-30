@@ -1795,7 +1795,7 @@ class GgalOptionsBot:
         # con tu ALYC, y sin eso la Guarda 2 no sirve fuera de modo shadow.
         if state.status is OrderStatus.FILLED and quote.greeks is not None:
             signed_qty = quantity if side is OrderSide.BUY else -quantity
-            self.portfolio.add(Position(
+            new_pos = Position(
                 symbol=signal.symbol, quantity=signed_qty,
                 multiplier=SETTINGS.instruments.option_multiplier,
                 greeks_per_unit=quote.greeks, expiry=quote.expiry,
@@ -1814,7 +1814,36 @@ class GgalOptionsBot:
                 # decidiera. Tag explicito: aisla sus Griegas/capital/
                 # salidas igual que ya se hace con "scalping".
                 strategy_tag="vol_arbitrage",
-            ))
+            )
+            self.portfolio.add(new_pos)
+            new_pos.contract_key = (
+                f"{SETTINGS.instruments.underlying_symbol}|{new_pos.symbol}|{quote.expiry.isoformat()}"
+                if quote.expiry is not None else None
+            )
+            # MEJORA 2026-09-30 (Prioridad 2, a pedido explicito del
+            # usuario: "que vol_arbitrage tambien escriba eventos en
+            # position_events.csv con su strategy_tag - fuente unica de
+            # verdad sin excepciones"): antes de esto, la salida de una
+            # posicion de vol_arbitrage SI quedaba logueada (via
+            # _act_on_exit_signal/_check_vol_arbitrage_exits, que ya pasa
+            # strategy_tag=pos.strategy_tag), pero su ENTRY nunca se
+            # loggeaba - una asimetria real (verificada leyendo el codigo:
+            # este metodo solo hacia self.portfolio.add(...), sin ningun
+            # log_event) que dejaba a match_trades_fifo() sin Position ID
+            # para resolver estos fills (ver dashboard/pnl_engine.py,
+            # resolve_position_ids_from_journal) y al panel de
+            # reconciliacion sin cobertura de Chequeo 2 para esta
+            # estrategia. Mismo patron exacto que _act_on_entry_signal.
+            self.position_event_journal.log_event(
+                "ENTRY", position_id=new_pos.position_id, contract_key=new_pos.contract_key,
+                symbol=new_pos.symbol, strategy_tag="vol_arbitrage",
+                side="buy" if side is OrderSide.BUY else "sell",
+                quantity_delta=new_pos.quantity, quantity_after=new_pos.quantity,
+                price=new_pos.entry_price,
+                order_client_id=getattr(getattr(state, "request", None), "client_order_id", ""),
+                reason=getattr(signal, "reason", ""),
+                data_unavailable_fields=() if new_pos.contract_key else ("contract_key",),
+            )
 
     def _act_on_exit_signal(self, signal, spot: float, strategy_tag: str = "weekly_asymmetric") -> None:
         """
@@ -2170,12 +2199,37 @@ class GgalOptionsBot:
         )
 
         if state.status is OrderStatus.FILLED and quote.greeks is not None:
-            self.portfolio.add(Position(
+            new_short_leg = Position(
                 symbol=signal.short_symbol, quantity=-quantity,
                 multiplier=SETTINGS.instruments.option_multiplier,
                 greeks_per_unit=quote.greeks, expiry=quote.expiry,
                 entry_price=state.avg_fill_price, entry_time=datetime.now(timezone.utc),
-            ))
+                # strategy_tag queda en None aca a proposito (no se cambia
+                # el comportamiento existente de esta Position) - "por
+                # convencion" el resto del bot (Portfolio.strategy_tag,
+                # _act_on_exit_signal) lo trata como "weekly_asymmetric".
+            )
+            self.portfolio.add(new_short_leg)
+            new_short_leg.contract_key = (
+                f"{SETTINGS.instruments.underlying_symbol}|{new_short_leg.symbol}|{quote.expiry.isoformat()}"
+                if quote.expiry is not None else None
+            )
+            # MEJORA 2026-09-30 (encontrado al implementar la Prioridad 2 del
+            # usuario - "journal para todas las estrategias, sin excepciones":
+            # esta pata corta de spread completion, igual que la entrada de
+            # vol_arbitrage, solo hacia self.portfolio.add(...) sin loguear
+            # al journal. strategy_tag explicito "weekly_asymmetric" aca
+            # (coincide con el fallback `pos.strategy_tag or
+            # "weekly_asymmetric"` que ya usa _act_on_exit_signal al cerrarla).
+            self.position_event_journal.log_event(
+                "ENTRY", position_id=new_short_leg.position_id, contract_key=new_short_leg.contract_key,
+                symbol=new_short_leg.symbol, strategy_tag="weekly_asymmetric", side="sell",
+                quantity_delta=new_short_leg.quantity, quantity_after=new_short_leg.quantity,
+                price=new_short_leg.entry_price,
+                order_client_id=getattr(getattr(state, "request", None), "client_order_id", ""),
+                reason="spread_completion",
+                data_unavailable_fields=() if new_short_leg.contract_key else ("contract_key",),
+            )
 
     def _maybe_hedge(self, totals: Dict[str, float], spot: float) -> None:
         """
@@ -2257,8 +2311,23 @@ class GgalOptionsBot:
                 (p for p in self.portfolio.positions if p.symbol == state.request.symbol and p.greeks_per_unit is None),
                 None,
             )
+            # MEJORA 2026-09-30 (Prioridad 2, a pedido explicito del usuario:
+            # "que las patas de delta_hedge tambien escriban eventos en
+            # position_events.csv con su strategy_tag - fuente unica de
+            # verdad sin excepciones"): antes de esto, ningun fill de
+            # delta-hedge quedaba en el journal (verificado leyendo el
+            # codigo: esta rama solo tocaba self.portfolio directamente).
+            # A diferencia de una posicion de opciones (ENTRY/ADD/REDUCE/
+            # PARTIAL_EXIT/CLOSE claros, disparados por señales discretas),
+            # el hedge es una UNICA Position que se reajusta en cada ciclo
+            # (ver el comentario de "FIX DE FRAGMENTACION" arriba) - nunca
+            # hay un "signal.reason" que distinga partial_profit_take, asi
+            # que el mapeo de evento es puramente por el efecto neto sobre
+            # la cantidad: ENTRY (primera vez, o se reabre desde flat),
+            # ADD (amplia en la misma direccion), REDUCE (angosta sin
+            # llegar a 0) o CLOSE (llega exactamente a 0).
             if existing_hedge is None:
-                self.portfolio.add(Position(
+                new_hedge = Position(
                     symbol=state.request.symbol, quantity=signed_qty,
                     # multiplier=1.0: el subyacente cotiza por ACCION, no por
                     # contrato de opciones de 100 unidades (ver el mismo ajuste
@@ -2269,7 +2338,18 @@ class GgalOptionsBot:
                     # delta=1 por unidad" - nunca se confunde con una opcion.
                     greeks_per_unit=None,
                     entry_price=state.avg_fill_price, entry_time=datetime.now(timezone.utc),
-                ))
+                )
+                self.portfolio.add(new_hedge)
+                self.position_event_journal.log_event(
+                    "ENTRY", position_id=new_hedge.position_id, contract_key=new_hedge.contract_key,
+                    symbol=new_hedge.symbol, strategy_tag="delta_hedge",
+                    side="buy" if signed_qty > 0 else "sell",
+                    quantity_delta=signed_qty, quantity_after=new_hedge.quantity,
+                    price=new_hedge.entry_price,
+                    order_client_id=getattr(getattr(state, "request", None), "client_order_id", ""),
+                    reason="delta_hedge_rebalance",
+                    data_unavailable_fields=() if new_hedge.contract_key else ("contract_key",),
+                )
             else:
                 old_qty = existing_hedge.quantity
                 same_direction_or_flat = old_qty == 0 or (old_qty > 0) == (signed_qty > 0)
@@ -2287,6 +2367,22 @@ class GgalOptionsBot:
                 existing_hedge.quantity = old_qty + signed_qty
                 if existing_hedge.entry_time is None:
                     existing_hedge.entry_time = datetime.now(timezone.utc)
+
+                if same_direction_or_flat:
+                    hedge_event_type = "ENTRY" if old_qty == 0 else "ADD"
+                else:
+                    hedge_event_type = "CLOSE" if abs(existing_hedge.quantity) <= 1e-9 else "REDUCE"
+                self.position_event_journal.log_event(
+                    hedge_event_type, position_id=existing_hedge.position_id,
+                    contract_key=existing_hedge.contract_key,
+                    symbol=existing_hedge.symbol, strategy_tag="delta_hedge",
+                    side="buy" if signed_qty > 0 else "sell",
+                    quantity_delta=signed_qty, quantity_after=existing_hedge.quantity,
+                    price=state.avg_fill_price,
+                    order_client_id=getattr(getattr(state, "request", None), "client_order_id", ""),
+                    reason="delta_hedge_rebalance",
+                    data_unavailable_fields=() if existing_hedge.contract_key else ("contract_key",),
+                )
 
     def _current_option_books(self) -> Dict[str, OrderBookSnapshot]:
         books = {q.symbol: q.book for q in self.option_chain.all_quotes()}

@@ -231,7 +231,7 @@ st.divider()
 
 st.subheader("🔍 Reconciliación")
 
-_JOURNAL_STRATEGIES = ("weekly_asymmetric", "scalping")
+_JOURNAL_STRATEGIES = ("weekly_asymmetric", "scalping", "vol_arbitrage")
 _RECON_TOLERANCE_ARS = 1.0  # redondeo de punto flotante, no una discrepancia real
 
 # IMPORTANTE: reusa position_events_df_raw (ya cargado mas arriba, tambien
@@ -252,14 +252,34 @@ fifo_total_check = sum(fifo_sum_by_strategy.values())
 kpi_total = summary["pnl_realized_ars"]
 sum_matches_kpi = abs(fifo_total_check - kpi_total) <= _RECON_TOLERANCE_ARS
 
-# --- Chequeo 2: para las estrategias que SI pasan por el Event Journal
-# (weekly_asymmetric/scalping - vol_arbitrage nunca tagea sus entradas ahi,
-# ver _act_on_signal() en run_bot.py: agrega la Position directo al
-# portfolio sin llamar a position_event_journal.log_event), reconstruccion
-# INDEPENDIENTE desde position_events.csv vs el total FIFO de la MISMA
-# estrategia. Dos fuentes de datos y dos caminos de codigo distintos que
-# deben coincidir (con tolerancia de redondeo) - exactamente la clase de
-# bug que motivo este proyecto entero (ver classify_strategy()).
+# --- Chequeo 2: reconstruccion INDEPENDIENTE desde position_events.csv vs
+# el total FIFO de la MISMA estrategia. Dos fuentes de datos y dos caminos
+# de codigo distintos que deben coincidir (con tolerancia de redondeo) -
+# exactamente la clase de bug que motivo este proyecto entero (ver
+# classify_strategy()).
+#
+# MEJORA 2026-09-30 (Prioridad 2 a pedido explicito del usuario - "journal
+# para todas las estrategias, sin excepciones"): vol_arbitrage
+# (_act_on_signal en run_bot.py) ya loguea su ENTRY al journal (antes solo
+# tocaba self.portfolio directo) - se suma aca porque su lifecycle es
+# comparable al de weekly_asymmetric/scalping (abre y eventualmente CIERRA
+# via _check_vol_arbitrage_exits, que ya logueaba el CLOSE desde antes).
+#
+# delta_hedge TAMBIEN loguea ya su lifecycle completo (ENTRY/ADD/REDUCE/
+# CLOSE, ver _maybe_hedge) pero DELIBERADAMENTE NO se agrega aca todavia:
+# verificado (ver reconstruct.reconstruct_lifecycle_trades) que una
+# posicion sin evento CLOSE dentro de la ventana se cuenta 100% como
+# "todavia abierta" y su PnL de eventuales REDUCE NUNCA se suma a
+# journal_pnl - y la Position de delta_hedge es UNA sola, continuamente
+# reajustada (ver _maybe_hedge), que en operacion normal casi nunca llega a
+# CLOSE (cantidad exactamente 0). Agregarla aca produciria un ❌ de
+# reconciliacion PERMANENTE y enganoso (PnL FIFO real vs. journal_pnl=0 por
+# diseño de reconstruct_lifecycle_trades), no un bug real - se documenta
+# como limitacion conocida en el caption de abajo en vez de fabricar una
+# comparacion que no es honesta con los datos disponibles.
+# `unknown_legacy` sigue sin cobertura aca: por definicion, es un fill SIN
+# match en el journal (anterior a su deploy, 2026-09-07 17:05 UTC) - no hay
+# nada que reconstruir.
 recon_table_rows = []
 any_journal_mismatch = False
 partition_issues = []
@@ -333,10 +353,14 @@ if partition_issues:
 st.caption(
     "Reconciliación de solo lectura: no corrige nada, solo compara dos caminos de calculo "
     "independientes (FIFO sobre `shadow_trades.csv` vs. reconstruccion desde `position_events.csv`). "
-    "`vol_arbitrage`/`delta_hedge`/`unknown_legacy` no tienen equivalente en el Event Journal por "
-    "diseño (vol_arbitrage nunca tagea sus entradas ahi, delta_hedge es el subyacente, "
-    "unknown_legacy es anterior al deploy del journal el 2026-09-07 17:05 UTC) — para esas, la unica "
-    "fuente disponible es el FIFO, sin verificacion cruzada posible con los datos actuales."
+    "Desde el 2026-09-30 las 4 estrategias (`weekly_asymmetric`, `scalping`, `vol_arbitrage`, "
+    "`delta_hedge`) loguean su lifecycle completo al Event Journal, pero la tabla de arriba solo "
+    "cruza `weekly_asymmetric`/`scalping`/`vol_arbitrage`: `delta_hedge` es UNA sola posicion "
+    "continuamente reajustada que casi nunca llega a un evento CLOSE exacto, y la reconstruccion "
+    "del journal (`reconstruct_lifecycle_trades`) solo cuenta PnL de una posicion que SI cerro — "
+    "cruzarla aca daria un ❌ permanente y enganoso, no un bug real. `unknown_legacy` tampoco tiene "
+    "equivalente por definicion (fill sin match en el journal, anterior a su deploy el 2026-09-07 "
+    "17:05 UTC): para esas dos, la unica fuente disponible es el FIFO, sin verificacion cruzada."
 )
 
 st.divider()

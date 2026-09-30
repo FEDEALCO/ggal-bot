@@ -410,6 +410,176 @@ def test_maybe_hedge_does_nothing_when_delta_hedge_disabled():
         SETTINGS.risk.enable_delta_hedge = original_hedge_enabled
 
 
+def _isolate_position_event_journal(bot):
+    """
+    _shadow_audit_isolation.py redirige paths.POSITION_EVENTS_LOG a UN SOLO
+    archivo temporal COMPARTIDO por TODA la corrida de esta suite (evita
+    contaminar el CSV real - ver ese modulo), no uno por test. Un test que
+    necesite verificar EXACTAMENTE que filas escribio su propia llamada (sin
+    filas de otros tests ya acumuladas ahi) necesita su propio archivo
+    dedicado - mismo patron ya establecido para ShadowAuditLogger (ver
+    test_shadow_trading.py: `gateway._shadow_logger = ShadowAuditLogger(path=...)`).
+    """
+    import tempfile
+    from pathlib import Path
+    from ggal_bot.portfolio.event_journal import PositionEventJournal
+    fd, name = tempfile.mkstemp(suffix=".csv")
+    os.close(fd)
+    dedicated_path = Path(name)
+    dedicated_path.unlink()  # PositionEventJournal escribe su propio header al construirse
+    bot.position_event_journal = PositionEventJournal(path=dedicated_path)
+    return dedicated_path
+
+
+def _read_position_events(bot) -> list:
+    """
+    Lee el CSV DEDICADO de este bot (ver _isolate_position_event_journal) como
+    una lista de dicts crudos - suficiente para verificar event_type/
+    strategy_tag/position_id sin necesitar pandas/dashboard en este archivo.
+    """
+    import csv as _csv
+    path = bot.position_event_journal._path
+    if not path.exists():
+        return []
+    with open(path, newline="", encoding="utf-8") as f:
+        return list(_csv.DictReader(f))
+
+
+def test_act_on_signal_logs_entry_to_position_event_journal_with_vol_arbitrage_tag():
+    """
+    Regresion de la Prioridad 2 (2026-09-30, a pedido explicito del usuario:
+    "que vol_arbitrage tambien escriba eventos en position_events.csv con su
+    strategy_tag - fuente unica de verdad sin excepciones"). Antes de este
+    fix, _act_on_signal() (el path de entrada de VolatilityArbitrageStrategy)
+    solo hacia self.portfolio.add(...) - verificado leyendo el codigo: ningun
+    log_event(). Esto dejaba la entrada de cada posicion de vol_arbitrage sin
+    Position ID resoluble para match_trades_fifo() (ver dashboard/pnl_engine.py,
+    resolve_position_ids_from_journal) y fuera del Chequeo 2 de reconciliacion.
+    """
+    original_enabled = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True
+    try:
+        bot = GgalOptionsBot()
+        _isolate_position_event_journal(bot)
+        book = OrderBookSnapshot("GFGC5200O", bid=99.0, ask=101.0, bid_size=50, ask_size=50)
+        from ggal_bot.data.option_chain import OptionQuote
+        option_quote = OptionQuote(
+            symbol="GFGC5200O", strike=5200.0, expiry=date(2026, 9, 18), option_type=OptionType.CALL,
+            book=book, days_calendar=30, days_business=21,
+        )
+        option_quote.greeks = {"delta": 0.5, "gamma": 0.001, "vega": 2.0, "theta": -1.0, "rho": 0.1, "price": 100.0}
+        bot.option_chain.upsert_quote(option_quote)
+
+        signal = TradeSignal(symbol="GFGC5200O", action="buy", reason="test", iv_dislocation_vol_points=5.0)
+        bot._act_on_signal(signal, spot=5200.0)
+
+        rows = _read_position_events(bot)
+        entry_rows = [r for r in rows if r["event_type"] == "ENTRY" and r["symbol"] == "GFGC5200O"]
+        assert len(entry_rows) == 1, f"esperaba exactamente 1 fila ENTRY, encontre {len(entry_rows)}"
+        assert entry_rows[0]["strategy_tag"] == "vol_arbitrage"
+        assert entry_rows[0]["side"] == "buy"
+        assert entry_rows[0]["position_id"]  # nunca vacio - Position.position_id siempre se genera
+        assert float(entry_rows[0]["quantity_delta"]) == 1.0
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+
+
+def test_maybe_hedge_logs_entry_and_add_events_to_position_event_journal():
+    """
+    Regresion de la Prioridad 2: las patas de delta_hedge tampoco quedaban
+    en el journal (verificado leyendo el codigo: _maybe_hedge() solo tocaba
+    self.portfolio). Reproduce 2 fills de cobertura reales, misma direccion,
+    sobre el mismo subyacente (mismo patron que
+    test_maybe_hedge_consolidates_repeated_fills_into_a_single_position): el
+    primero debe loguear ENTRY, el segundo (amplia en la misma direccion)
+    debe loguear ADD - ambos con strategy_tag="delta_hedge" y el MISMO
+    position_id (es la misma Position, consolidada, en las 2 vueltas). El
+    branch de REDUCE/CLOSE (direccion opuesta) usa el mismo mapeo de
+    event_type que _act_on_exit_signal (ver docstring de _maybe_hedge) - no
+    se fuerza aca por separado para no acoplar el test a la mecanica interna
+    de DeltaHedgingEngine.execute_hedge().
+    """
+    original_enabled = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True
+    try:
+        bot = GgalOptionsBot()
+        _isolate_position_event_journal(bot)
+        bot._spot_book = OrderBookSnapshot(
+            SETTINGS.instruments.contado_ticker, bid=5199.0, ask=5201.0, bid_size=5000, ask_size=5000,
+        )
+
+        # 1) Delta options = 500, banda 150 -> vende 350 (ENTRY, primera vez).
+        bot.portfolio.add(Position(
+            symbol="GFGC5200O", quantity=10, multiplier=100.0,
+            greeks_per_unit={"delta": 0.5, "gamma": 0.01, "vega": 5.0, "theta": -1.0},
+        ))
+        bot._maybe_hedge(bot.portfolio.total_greeks(), spot=5200.0)
+
+        # 2) Mas delta de opciones -> otro fill de venta, MISMA direccion (ADD).
+        bot.portfolio.add(Position(
+            symbol="GFGC5300O", quantity=6, multiplier=100.0,
+            greeks_per_unit={"delta": 0.5, "gamma": 0.01, "vega": 5.0, "theta": -1.0},
+        ))
+        assert bot.delta_hedger.needs_hedge(bot.portfolio.total_greeks()["delta"])
+        bot._maybe_hedge(bot.portfolio.total_greeks(), spot=5200.0)
+
+        hedge_qty_after_add = next(
+            p.quantity for p in bot.portfolio.positions if p.symbol == SETTINGS.instruments.contado_ticker
+        )
+
+        rows = _read_position_events(bot)
+        hedge_rows = [r for r in rows if r["strategy_tag"] == "delta_hedge"]
+        assert len(hedge_rows) == 2, f"esperaba 2 filas delta_hedge (ENTRY+ADD), encontre {len(hedge_rows)}"
+        assert hedge_rows[0]["event_type"] == "ENTRY"
+        assert hedge_rows[1]["event_type"] == "ADD"
+        assert hedge_rows[0]["position_id"] == hedge_rows[1]["position_id"]  # misma Position consolidada
+        assert hedge_rows[0]["position_id"]  # nunca vacio
+        assert float(hedge_rows[0]["quantity_delta"]) == -350.0
+        assert float(hedge_rows[1]["quantity_after"]) == hedge_qty_after_add
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+
+
+def test_act_on_spread_completion_signal_logs_entry_to_position_event_journal():
+    """
+    Regresion adicional encontrada al implementar la Prioridad 2 (el usuario
+    pidio journal "sin excepciones" para todas las estrategias): la pata
+    corta de un spread completion (weekly_asymmetric) tampoco quedaba en el
+    journal - mismo patron exacto que el bug de vol_arbitrage de arriba.
+    """
+    from ggal_bot.strategy.weekly_asymmetric import SpreadCompletionSignal
+    from ggal_bot.data.option_chain import OptionQuote
+
+    original_enabled = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True
+    try:
+        bot = GgalOptionsBot()
+        _isolate_position_event_journal(bot)
+        book = OrderBookSnapshot("GFGC5400O", bid=49.0, ask=51.0, bid_size=50, ask_size=50)
+        option_quote = OptionQuote(
+            symbol="GFGC5400O", strike=5400.0, expiry=date(2026, 9, 18), option_type=OptionType.CALL,
+            book=book, days_calendar=30, days_business=21,
+        )
+        option_quote.greeks = {"delta": 0.2, "gamma": 0.001, "vega": 1.0, "theta": -0.5, "rho": 0.05, "price": 50.0}
+        bot.option_chain.upsert_quote(option_quote)
+
+        signal = SpreadCompletionSignal(
+            long_symbol="GFGC5200O", short_symbol="GFGC5400O", option_type=OptionType.CALL,
+            reason="spread_completion_test", long_quantity_confirmed=3.0,
+        )
+        bot._act_on_spread_completion_signal(signal, spot=5200.0)
+
+        rows = _read_position_events(bot)
+        entry_rows = [r for r in rows if r["event_type"] == "ENTRY" and r["symbol"] == "GFGC5400O"]
+        assert len(entry_rows) == 1, f"esperaba exactamente 1 fila ENTRY, encontre {len(entry_rows)}"
+        assert entry_rows[0]["strategy_tag"] == "weekly_asymmetric"
+        assert entry_rows[0]["side"] == "sell"
+        assert float(entry_rows[0]["quantity_delta"]) == -3.0
+        assert entry_rows[0]["position_id"]
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+
+
 def test_capital_available_ars_excludes_delta_hedge_underlying_position():
     """
     La posicion del subyacente que deja el delta-hedger (greeks_per_unit=None)
@@ -548,6 +718,9 @@ ALL_TESTS = [
     test_maybe_hedge_records_fill_so_delta_reflects_the_hedge,
     test_maybe_hedge_consolidates_repeated_fills_into_a_single_position,
     test_maybe_hedge_does_nothing_when_delta_hedge_disabled,
+    test_act_on_signal_logs_entry_to_position_event_journal_with_vol_arbitrage_tag,
+    test_maybe_hedge_logs_entry_and_add_events_to_position_event_journal,
+    test_act_on_spread_completion_signal_logs_entry_to_position_event_journal,
     test_capital_available_ars_excludes_delta_hedge_underlying_position,
     test_on_book_update_stamps_spot_last_update_at,
     test_is_market_data_stale_false_before_any_update,
