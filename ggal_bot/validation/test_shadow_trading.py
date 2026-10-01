@@ -651,6 +651,20 @@ def test_broker_rest_source_near_the_money_refresh_dedicates_full_budget_to_forc
     original_max_symbols = SETTINGS.broker_rest.individual_quote_max_symbols
     original_expiries_ahead = SETTINGS.instruments.expiries_ahead
     original_forced_expiry = SETTINGS.instruments.forced_expiry
+    # FIX DE AISLAMIENTO (2026-10-01, hallado al verificar en la maquina del
+    # usuario - NO relacionado con los items de Tarea #27, bug preexistente):
+    # este test asume implicitamente SETTINGS.scalping.enabled == False (el
+    # default declarado en .env.example), pero nunca lo fuerza ni lo
+    # restaura, a diferencia del test hermano de mas abajo
+    # (test_..._includes_forced_expiry_plus_nearest_when_scalping_enabled,
+    # que SI lo hace). Si el .env real de quien corre la suite tiene
+    # GGAL_BOT_ENABLE_SCALPING=true (como en la config de produccion de este
+    # bot), el branch de live_shadow_feed.py linea ~1053
+    # (`if forced_expiry is not None and not SETTINGS.scalping.enabled`) cae
+    # al else con Scalping activo, que SI reparte cupo a Octubre - haciendo
+    # fallar la asercion de "Octubre no debe recibir nada". Se fuerza False
+    # explicitamente, como hace su test hermano.
+    original_scalping_enabled = SETTINGS.scalping.enabled
     underlying = SETTINGS.instruments.underlying_symbol
     individual_calls = []
 
@@ -685,6 +699,7 @@ def test_broker_rest_source_near_the_money_refresh_dedicates_full_budget_to_forc
     SETTINGS.broker_rest.individual_quote_max_symbols = 4
     SETTINGS.instruments.expiries_ahead = 2
     SETTINGS.instruments.forced_expiry = "2026-09-18"
+    SETTINGS.scalping.enabled = False
     try:
         source = mod.BrokerRestSource()
         source.bootstrap()
@@ -698,6 +713,8 @@ def test_broker_rest_source_near_the_money_refresh_dedicates_full_budget_to_forc
         mod.BrokerRestSource._login = original_login
         SETTINGS.broker_rest.individual_quote_max_symbols = original_max_symbols
         SETTINGS.instruments.expiries_ahead = original_expiries_ahead
+        SETTINGS.instruments.forced_expiry = original_forced_expiry
+        SETTINGS.scalping.enabled = original_scalping_enabled
         SETTINGS.instruments.forced_expiry = original_forced_expiry
 
 

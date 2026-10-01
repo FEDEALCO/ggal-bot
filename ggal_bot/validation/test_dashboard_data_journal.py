@@ -40,7 +40,16 @@ def _write_raw_csv(rows) -> Path:
 
 
 def test_load_journal_rows_returns_empty_list_when_file_missing():
-    missing = Path(tempfile.mkstemp(suffix=".csv")[1])
+    # FIX DE AISLAMIENTO (2026-10-01, hallado al verificar en Windows):
+    # tempfile.mkstemp() devuelve (fd, path) con el fd YA ABIERTO - hay que
+    # cerrarlo (ver _write_raw_csv de arriba, que si lo hace) antes de poder
+    # borrar el archivo. En POSIX, unlink() sobre un archivo con un handle
+    # abierto funciona igual (el inodo se libera cuando se cierra el ultimo
+    # handle) - en Windows, PermissionError: "El proceso no tiene acceso al
+    # archivo porque esta siendo utilizado por otro proceso".
+    fd, name = tempfile.mkstemp(suffix=".csv")
+    os.close(fd)
+    missing = Path(name)
     missing.unlink()  # no existe
     assert dj.load_journal_rows(missing) == []
 

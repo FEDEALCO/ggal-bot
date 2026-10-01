@@ -35,6 +35,7 @@ from ggal_bot.data.option_chain import OrderBookSnapshot
 from ggal_bot.data.market_data_feed import MarketDataFeed, _third_friday_on_or_after, _business_days_between
 from ggal_bot.data.option_chain import OptionChain
 from ggal_bot.models.black_scholes import OptionType
+import ggal_bot.execution.order_gateway as order_gateway_module
 from ggal_bot.execution.order_gateway import (
     OrderGateway, OrderSide, OrderStatus, send_order, cancel_order, get_account_positions,
 )
@@ -144,19 +145,45 @@ def test_mid_price_exec_submit_shadow_fill_crosses_spread_even_for_a_passive_mid
 
 
 def test_mid_price_exec_cancels_on_underlying_move():
-    gateway = OrderGateway()
-    engine = MidPriceExecutionEngine(gateway)
-    book = OrderBookSnapshot("GFGC5200O", bid=99.0, ask=101.0, bid_size=50, ask_size=50)
-    state = engine.submit(
-        symbol="GFGC5200O", book=book, side=OrderSide.BUY, quantity=1,
-        spot_reference=5200.0, aggressive=False,
-    )
-    # Simular que el subyacente salto mas alla del umbral configurado
-    moved_spot = 5200.0 * (1 + SETTINGS.execution.underlying_move_cancel_pct * 2)
-    engine.monitor_and_reprice(current_books={"GFGC5200O": book}, current_spot=moved_spot)
-    final_state = gateway.get_state(state.request.client_order_id)
-    assert final_state.status == OrderStatus.CANCELLED
-    assert engine.open_order_count() == 0
+    """
+    FIX DE AISLAMIENTO (2026-10-01, hallado al verificar el bundle de Tarea
+    #27 items 1-5 en la maquina Windows del usuario - NO relacionado con esos
+    5 items, bug preexistente de la suite): este archivo entero asume en su
+    docstring de modulo "SIN pyRofex" - OrderGateway() sin shadow mode activo
+    llama al send_order()/cancel_order() REAL de order_gateway.py, que solo
+    se comporta como "simulado" (NEW -> CANCELLED, lo que este test espera)
+    cuando `_PYROFEX_AVAILABLE` es False. Eso es cierto en un entorno limpio
+    donde pyRofex nunca se instalo, pero deja de serlo en CUALQUIER venv que
+    instale requirements.txt del bot real (pyRofex>=0.4.0) - ahi
+    `_PYROFEX_AVAILABLE=True` pero is_environment_ready() sigue en False (sin
+    initialize_environment() real), asi que send_order() devuelve
+    status=error y la orden queda REJECTED de entrada, nunca llega a
+    NEW->CANCELLED. Reproducido tal cual en la maquina del usuario (Windows,
+    venv con requirements.txt instalado). Se fuerza _PYROFEX_AVAILABLE=False
+    SOLO para este test (restaurado en finally) para que el comportamiento
+    sea deterministico sin importar si pyRofex esta instalado en el entorno
+    que corre la suite - no se toca production code, solo se reproduce la
+    misma condicion de "pyRofex no disponible" que el resto de la suite
+    siempre asumio.
+    """
+    original_pyrofex_available = order_gateway_module._PYROFEX_AVAILABLE
+    order_gateway_module._PYROFEX_AVAILABLE = False
+    try:
+        gateway = OrderGateway()
+        engine = MidPriceExecutionEngine(gateway)
+        book = OrderBookSnapshot("GFGC5200O", bid=99.0, ask=101.0, bid_size=50, ask_size=50)
+        state = engine.submit(
+            symbol="GFGC5200O", book=book, side=OrderSide.BUY, quantity=1,
+            spot_reference=5200.0, aggressive=False,
+        )
+        # Simular que el subyacente salto mas alla del umbral configurado
+        moved_spot = 5200.0 * (1 + SETTINGS.execution.underlying_move_cancel_pct * 2)
+        engine.monitor_and_reprice(current_books={"GFGC5200O": book}, current_spot=moved_spot)
+        final_state = gateway.get_state(state.request.client_order_id)
+        assert final_state.status == OrderStatus.CANCELLED
+        assert engine.open_order_count() == 0
+    finally:
+        order_gateway_module._PYROFEX_AVAILABLE = original_pyrofex_available
 
 
 def test_delta_hedging_engine_execute_hedge_submits_aggressive_order():
