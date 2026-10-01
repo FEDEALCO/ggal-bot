@@ -1447,6 +1447,81 @@ def test_scan_spread_completion_signals_disabled_by_config():
 
 
 # ---------------------------------------------------------------------------
+# strategy/weekly_asymmetric.py: build_naked_short_wing_exit_signals (Tarea
+# #27 item 3, 2026-10-01 - caso real GFGV5000OC: la larga GFGV5400OC se
+# cerro entera y la corta -75 quedo sin cobertura, sin que ningun codigo la
+# detectara - build_exit_signals() es deliberadamente long-only).
+# ---------------------------------------------------------------------------
+
+def test_naked_short_wing_detected_when_long_fully_closed():
+    portfolio = Portfolio()
+    portfolio.add(Position(
+        symbol="GFGV5000OC", quantity=-75.0, multiplier=100.0,
+        financed_by_symbol="GFGV5400OC", strategy_tag="weekly_asymmetric",
+    ))
+    # la larga ya no esta en el portfolio (se cerro del todo, consistente
+    # con como Guard 2/_act_on_exit_signal vacian una Position a 0 - no
+    # necesariamente la remueven de la lista, pero con quantity=0 tampoco
+    # cuenta como "confirmada" - ver _confirmed_long_quantity: quantity>0).
+
+    signals = WeeklyAsymmetricStrategy.build_naked_short_wing_exit_signals(portfolio)
+    assert len(signals) == 1
+    sig = signals[0]
+    assert sig.symbol == "GFGV5000OC"
+    assert sig.action == "buy_to_close"
+    assert abs(sig.quantity - 75.0) < 1e-6
+    assert sig.reason == "naked_short_wing_cleanup"
+
+
+def test_naked_short_wing_not_flagged_while_long_still_covers_it():
+    portfolio = Portfolio()
+    portfolio.add(Position(symbol="GFGV5400OC", quantity=75.0, multiplier=100.0, strategy_tag="weekly_asymmetric"))
+    portfolio.add(Position(
+        symbol="GFGV5000OC", quantity=-75.0, multiplier=100.0,
+        financed_by_symbol="GFGV5400OC", strategy_tag="weekly_asymmetric",
+    ))
+    assert WeeklyAsymmetricStrategy.build_naked_short_wing_exit_signals(portfolio) == []
+
+
+def test_naked_short_wing_flags_only_the_uncovered_excess_after_partial_close():
+    portfolio = Portfolio()
+    # la larga se redujo de 75 a 28 (partial profit take parcial) - la
+    # corta sigue en -75: 75-28=47 contratos sin cobertura.
+    portfolio.add(Position(symbol="GFGV5400OC", quantity=28.0, multiplier=100.0, strategy_tag="weekly_asymmetric"))
+    portfolio.add(Position(
+        symbol="GFGV5000OC", quantity=-75.0, multiplier=100.0,
+        financed_by_symbol="GFGV5400OC", strategy_tag="weekly_asymmetric",
+    ))
+    signals = WeeklyAsymmetricStrategy.build_naked_short_wing_exit_signals(portfolio)
+    assert len(signals) == 1
+    assert abs(signals[0].quantity - 47.0) < 1e-6
+
+
+def test_naked_short_wing_ignores_legacy_short_without_financed_by_symbol():
+    """Una pata corta legacy (abierta antes de que financed_by_symbol
+    existiera) no se puede vincular retroactivamente - no se adivina, se
+    ignora (nunca se la marca naked por falta de dato, ni se la asume cubierta)."""
+    portfolio = Portfolio()
+    portfolio.add(Position(symbol="GFGV5000OC", quantity=-75.0, multiplier=100.0, strategy_tag="weekly_asymmetric"))
+    assert WeeklyAsymmetricStrategy.build_naked_short_wing_exit_signals(portfolio) == []
+
+
+def test_naked_short_wing_ignores_other_strategy_tags():
+    portfolio = Portfolio()
+    portfolio.add(Position(
+        symbol="GFGV5000OC", quantity=-75.0, multiplier=100.0,
+        financed_by_symbol="GFGV5400OC", strategy_tag="scalping",
+    ))
+    assert WeeklyAsymmetricStrategy.build_naked_short_wing_exit_signals(portfolio, strategy_tag="weekly_asymmetric") == []
+
+
+def test_naked_short_wing_ignores_long_positions():
+    portfolio = Portfolio()
+    portfolio.add(Position(symbol="GFGC5200O", quantity=5.0, multiplier=100.0, strategy_tag="weekly_asymmetric"))
+    assert WeeklyAsymmetricStrategy.build_naked_short_wing_exit_signals(portfolio) == []
+
+
+# ---------------------------------------------------------------------------
 # strategy/weekly_asymmetric.py: scan_expensive_iv_spread_signals (MEJORA
 # 2026-09-17, ver docstring de SpreadOpenSignal/config.LongFirstConfig.
 # enable_expensive_iv_spread_entry)
@@ -2435,6 +2510,12 @@ ALL_TESTS = [
     test_scan_spread_completion_signals_neutral_trend_never_completes_spreads,
     test_scan_spread_completion_signals_bearish_trend_ignores_call_spread,
     test_scan_spread_completion_signals_disabled_by_config,
+    test_naked_short_wing_detected_when_long_fully_closed,
+    test_naked_short_wing_not_flagged_while_long_still_covers_it,
+    test_naked_short_wing_flags_only_the_uncovered_excess_after_partial_close,
+    test_naked_short_wing_ignores_legacy_short_without_financed_by_symbol,
+    test_naked_short_wing_ignores_other_strategy_tags,
+    test_naked_short_wing_ignores_long_positions,
     test_scan_expensive_iv_spread_signals_disabled_by_default,
     test_scan_expensive_iv_spread_signals_generates_debit_spread_when_enabled_and_expensive,
     test_scan_expensive_iv_spread_signals_neutral_trend_no_signal,

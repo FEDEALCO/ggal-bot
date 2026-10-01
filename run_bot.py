@@ -1358,6 +1358,19 @@ class GgalOptionsBot:
             logger.info("Salida [Long-First]: %s %s x%.2f - %s", ex.action, ex.symbol, ex.quantity, ex.reason)
             self._act_on_exit_signal(ex, spot)
 
+        # -- 1b) Patas cortas de spread descubiertas (Tarea #27 item 3) ---------
+        # Corre INMEDIATAMENTE despues de las salidas de arriba, en el MISMO
+        # ciclo: si una de esas salidas (o cualquier otra anterior) dejo una
+        # pata corta sin su larga, se recompra aca mismo - ver
+        # WeeklyAsymmetricStrategy.build_naked_short_wing_exit_signals.
+        naked_wing_signals = self.strategy.build_naked_short_wing_exit_signals(self.portfolio)
+        all_signals.extend(naked_wing_signals)
+        for nw in naked_wing_signals:
+            logger.warning(
+                "Salida [Long-First]: %s %s x%.2f - %s", nw.action, nw.symbol, nw.quantity, nw.reason,
+            )
+            self._act_on_naked_short_wing_exit_signal(nw, spot)
+
         # -- 1.5) Guardia de staleness de datos de mercado ----------------------
         # Ver RiskConfig.max_market_data_staleness_seconds / _is_market_data_stale().
         # Deliberadamente DESPUES de las salidas (paso 1, arriba) y ANTES de
@@ -2063,6 +2076,75 @@ class GgalOptionsBot:
                     signal.symbol, signal.quantity, signal.quantity - remaining_to_reduce, strategy_tag,
                 )
 
+    def _act_on_naked_short_wing_exit_signal(
+        self, signal, spot: float, strategy_tag: str = "weekly_asymmetric",
+    ) -> None:
+        """
+        Ejecuta un ExitSignal `action="buy_to_close"` producido por
+        WeeklyAsymmetricStrategy.build_naked_short_wing_exit_signals() -
+        Tarea #27 item 3. Analogo a _act_on_exit_signal pero en la direccion
+        opuesta: COMPRA `signal.quantity` contratos para recubrir una pata
+        corta que quedo descubierta, reduciendo (nunca vaciando de mas) los
+        lotes negativos que matcheen symbol+strategy_tag, mas antiguo
+        primero - mismo criterio FIFO-por-lote que el fix de over-close de
+        Fase 5.3 aplico al lado largo.
+        """
+        quote = self.option_chain.get(signal.symbol)
+        if quote is None or quote.book.bid <= 0 or quote.book.ask <= 0:
+            logger.warning(
+                "Recompra de pata corta descubierta %s no ejecutable este ciclo: sin punta operable.",
+                signal.symbol,
+            )
+            return
+        if self.mid_price_exec.has_open_order_for(signal.symbol):
+            logger.debug(
+                "Recompra de pata corta descubierta %s pospuesta: ya hay una orden en vigilancia.",
+                signal.symbol,
+            )
+            return
+
+        logger.warning(
+            "Pata corta descubierta detectada: %s x%.2f (razon=%s) - recomprando para evitar "
+            "exposicion sin cobertura (ver Tarea #27 item 3, GFGV5000OC).",
+            signal.symbol, signal.quantity, signal.reason,
+        )
+
+        state = self.mid_price_exec.submit(
+            symbol=signal.symbol, book=quote.book, side=OrderSide.BUY, quantity=signal.quantity,
+            spot_reference=spot, aggressive=False,
+        )
+
+        if state.status is OrderStatus.FILLED:
+            remaining_to_reduce = signal.quantity
+            matching = [
+                pos for pos in self.portfolio.positions
+                if pos.symbol == signal.symbol and pos.quantity < 0
+                and (pos.strategy_tag or "weekly_asymmetric") == strategy_tag
+            ]
+            matching.sort(key=lambda p: p.entry_time or datetime.min.replace(tzinfo=timezone.utc))
+            for pos in matching:
+                if remaining_to_reduce <= 0:
+                    break
+                reduce_qty = min(abs(pos.quantity), remaining_to_reduce)
+                pos.quantity += reduce_qty  # se acerca a 0 desde negativo
+                remaining_to_reduce -= reduce_qty
+
+                self.position_event_journal.log_event(
+                    "CLOSE" if abs(pos.quantity) <= 1e-9 else "REDUCE",
+                    position_id=pos.position_id, contract_key=pos.contract_key,
+                    symbol=pos.symbol, strategy_tag=pos.strategy_tag or "weekly_asymmetric",
+                    side="buy", quantity_delta=reduce_qty, quantity_after=pos.quantity,
+                    price=state.avg_fill_price,
+                    order_client_id=getattr(getattr(state, "request", None), "client_order_id", ""),
+                    reason=signal.reason,
+                )
+            if remaining_to_reduce > 1e-9:
+                logger.warning(
+                    "Recompra de pata corta %s: se compraron %.2f contratos pero solo %.2f "
+                    "estaban disponibles en patas cortas marcadas '%s' - revisar estado.",
+                    signal.symbol, signal.quantity, signal.quantity - remaining_to_reduce, strategy_tag,
+                )
+
     def _act_on_entry_signal(
         self, signal, spot: float, strategy_tag: str = "weekly_asymmetric",
         position_sizer: Optional[PositionSizer] = None,
@@ -2283,6 +2365,11 @@ class GgalOptionsBot:
                 # el comportamiento existente de esta Position) - "por
                 # convencion" el resto del bot (Portfolio.strategy_tag,
                 # _act_on_exit_signal) lo trata como "weekly_asymmetric".
+                # financed_by_symbol (Tarea #27 item 3): vincula esta pata
+                # corta con la larga que la financio, para que
+                # build_naked_short_wing_exit_signals() pueda detectar si
+                # queda descubierta cuando la larga se reduzca/cierre.
+                financed_by_symbol=signal.long_symbol,
             )
             self.portfolio.add(new_short_leg)
             new_short_leg.contract_key = (

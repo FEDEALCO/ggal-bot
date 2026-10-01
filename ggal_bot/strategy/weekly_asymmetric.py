@@ -1069,3 +1069,57 @@ class WeeklyAsymmetricStrategy:
                             symbol=position.symbol, reason="partial_profit_take", quantity=partial_qty,
                         ))
         return signals
+
+    @staticmethod
+    def build_naked_short_wing_exit_signals(
+        portfolio: Portfolio, strategy_tag: str = "weekly_asymmetric",
+    ) -> List[ExitSignal]:
+        """
+        Tarea #27 item 3 (hallazgo real verificado contra produccion,
+        2026-10-01: GFGV5000OC, pata corta de spread_completion por -75,
+        sigue abierta el 2026-10-01 mientras su pata larga GFGV5400OC ya se
+        cerro entera via salidas parciales + take profit - la pata corta
+        quedo DESCUBIERTA sin que ningun codigo la detectara, porque
+        build_exit_signals() es deliberadamente long-only (`position.quantity
+        <= 0: continue`, ver mas arriba) y nunca gestiona la pata corta).
+
+        Corre en CADA ciclo (ver run_bot.py::_run_weekly_asymmetric_cycle,
+        inmediatamente despues de build_exit_signals()) y compara, para cada
+        pata corta marcada con `strategy_tag` que tenga `financed_by_symbol`
+        poblado (ver Position.financed_by_symbol - una pata corta legacy sin
+        este campo, abierta antes de que existiera, no se puede vincular
+        retroactivamente y queda fuera de este chequeo), su cantidad contra
+        la cantidad larga CONFIRMADA vigente de la base que la financio
+        (misma funcion `_confirmed_long_quantity` que scan_spread_completion_signals
+        usa para decidir si abrir la pata corta en primer lugar - simetrico
+        a proposito). Si la larga bajo de lo que la corta necesita para
+        seguir cubierta (se redujo parcialmente, se cerro del todo, o
+        inclusive ya no esta en el portfolio), emite un ExitSignal
+        `action="buy_to_close"` por EXACTAMENTE el excedente sin cobertura -
+        nunca recompra de mas, nunca dispara si la larga sigue cubriendo.
+
+        No requiere ninguna cotizacion vigente (eso lo valida
+        run_bot.py::_act_on_naked_short_wing_exit_signal, igual que
+        build_exit_signals para las salidas largas) - es puro calculo sobre
+        el estado del portfolio.
+        """
+        signals: List[ExitSignal] = []
+        for position in portfolio.positions:
+            if (position.strategy_tag or "weekly_asymmetric") != strategy_tag:
+                continue
+            if position.quantity >= 0:
+                continue  # solo patas cortas
+            if not position.financed_by_symbol:
+                continue  # pata corta legacy sin vinculo conocido - no se adivina
+
+            confirmed_long = WeeklyAsymmetricStrategy._confirmed_long_quantity(
+                portfolio, position.financed_by_symbol, strategy_tag=strategy_tag,
+            )
+            short_qty = abs(position.quantity)
+            uncovered = short_qty - confirmed_long
+            if uncovered > 1e-9:
+                signals.append(ExitSignal(
+                    symbol=position.symbol, reason="naked_short_wing_cleanup",
+                    action="buy_to_close", quantity=min(uncovered, short_qty),
+                ))
+        return signals

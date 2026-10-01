@@ -100,6 +100,20 @@ class Position:
     # esta fase (ver AUDITORIA_FASE5.3_*.md, seccion de alcance).
     contract_key: Optional[str] = None
 
+    # financed_by_symbol (Tarea #27 item 3, 2026-10-01, a pedido explicito
+    # del usuario: "corregi para que las salidas de un spread cierren ambas
+    # patas juntas, o la pata corta nunca quede descubierta"): para la pata
+    # CORTA de un spread (quantity<0, abierta via
+    # run_bot.py::_act_on_spread_completion_signal), el symbol de la pata
+    # LARGA que la financio (SpreadCompletionSignal.long_symbol) - permite
+    # a WeeklyAsymmetricStrategy.build_naked_short_wing_exit_signals()
+    # saber, cuando la larga se reduce/cierra, cuanto de la corta quedo sin
+    # cobertura. None para cualquier otra Position (incluida cualquier pata
+    # corta abierta ANTES de que este campo existiera - esas posiciones
+    # legacy no se pueden vincular retroactivamente con su larga original
+    # sin fabricar el dato; quedan fuera de este chequeo, nunca se adivina).
+    financed_by_symbol: Optional[str] = None
+
     def contribution(self) -> Dict[str, float]:
         qty_mult = self.quantity * self.multiplier
         if self.greeks_per_unit is None:

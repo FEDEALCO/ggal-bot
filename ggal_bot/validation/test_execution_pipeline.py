@@ -617,6 +617,57 @@ def test_act_on_spread_completion_signal_logs_entry_to_position_event_journal():
         SETTINGS.shadow.enabled = original_enabled
 
 
+def test_act_on_naked_short_wing_exit_signal_closes_it_and_logs_journal():
+    """
+    Tarea #27 item 3 (caso real GFGV5000OC): una vez que
+    WeeklyAsymmetricStrategy.build_naked_short_wing_exit_signals() detecta
+    una pata corta sin cobertura, _act_on_naked_short_wing_exit_signal debe
+    recomprarla (orden BUY), reducir la Position negativa hacia 0 y dejar
+    un CLOSE en el journal - nunca dejarla abierta indefinidamente como
+    paso en produccion.
+    """
+    from ggal_bot.strategy.weekly_asymmetric import ExitSignal
+    from ggal_bot.data.option_chain import OptionQuote
+
+    original_enabled = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True
+    try:
+        bot = GgalOptionsBot()
+        _isolate_position_event_journal(bot)
+
+        book = OrderBookSnapshot("GFGV5000OC", bid=5.0, ask=7.0, bid_size=50, ask_size=50)
+        quote = OptionQuote(
+            symbol="GFGV5000OC", strike=5000.0, expiry=date(2026, 10, 16), option_type=OptionType.PUT,
+            book=book, days_calendar=15, days_business=11,
+        )
+        bot.option_chain.upsert_quote(quote)
+
+        short_leg = Position(
+            symbol="GFGV5000OC", quantity=-75.0, multiplier=100.0,
+            entry_price=6.1205, entry_time=datetime(2026, 10, 1, 10, 47, 59, tzinfo=timezone.utc),
+            strategy_tag="weekly_asymmetric", financed_by_symbol="GFGV5400OC",
+        )
+        bot.portfolio.add(short_leg)
+        assert bot._position_quantity("GFGV5000OC") == -75.0
+
+        naked_signal = ExitSignal(
+            symbol="GFGV5000OC", reason="naked_short_wing_cleanup", action="buy_to_close", quantity=75.0,
+        )
+        bot._act_on_naked_short_wing_exit_signal(naked_signal, spot=5100.0)
+
+        assert bot._position_quantity("GFGV5000OC") == 0.0, "la pata corta debia quedar totalmente recubierta"
+
+        rows = _read_position_events(bot)
+        own_rows = [r for r in rows if r["symbol"] == "GFGV5000OC"]
+        assert len(own_rows) == 1
+        assert own_rows[0]["event_type"] == "CLOSE"
+        assert own_rows[0]["side"] == "buy"
+        assert float(own_rows[0]["quantity_delta"]) == 75.0
+        assert own_rows[0]["reason"] == "naked_short_wing_cleanup"
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+
+
 def test_capital_available_ars_excludes_delta_hedge_underlying_position():
     """
     La posicion del subyacente que deja el delta-hedger (greeks_per_unit=None)
@@ -759,6 +810,7 @@ ALL_TESTS = [
     test_act_on_signal_logs_entry_to_position_event_journal_with_vol_arbitrage_tag,
     test_maybe_hedge_logs_entry_and_add_events_to_position_event_journal,
     test_act_on_spread_completion_signal_logs_entry_to_position_event_journal,
+    test_act_on_naked_short_wing_exit_signal_closes_it_and_logs_journal,
     test_capital_available_ars_excludes_delta_hedge_underlying_position,
     test_on_book_update_stamps_spot_last_update_at,
     test_is_market_data_stale_false_before_any_update,
