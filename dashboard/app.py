@@ -50,6 +50,7 @@ from dashboard.data import freshness as fr  # noqa: E402
 from dashboard.data import market_data as dmd  # noqa: E402
 from dashboard.data import funnel as dfn  # noqa: E402
 from dashboard.data import ccl_bonds as dcb  # noqa: E402
+from dashboard.data import market_hours_quality as mhq  # noqa: E402
 
 st.set_page_config(page_title="GGAL BOT — Dashboard", layout="wide", page_icon="📈")
 
@@ -172,6 +173,18 @@ if not open_positions_marked.empty:
 closed_df = pe.closed_trades_to_frame(closed_trades)
 summary = pe.compute_summary(closed_trades, open_positions_marked)
 equity_curve = pe.compute_equity_curve(closed_trades)
+
+# MEJORA 2026-10-01 (URGENTE a pedido explicito del usuario - ver
+# dashboard/data/market_hours_quality.py para la evidencia completa: 247 de
+# 1183 fills de produccion fuera de 11:00-17:00 ART, caso GFGC6600OC con
+# ~ARS 420.800 de PnL fabricado por el failover de LiveShadowFeed a
+# MockReplaySource fuera de rueda). Flags DE SOLO LECTURA - no alteran
+# pnl_ars/current_price, solo agregan columnas booleanas para que el
+# usuario vea exactamente que filas estan contaminadas por esto.
+closed_df = mhq.flag_closed_trades_outside_session(closed_df)
+if not open_positions_marked.empty:
+    open_positions_marked = mhq.flag_open_positions_outside_session(open_positions_marked)
+_outside_session_summary = mhq.summarize_outside_session_impact(closed_df)
 
 
 def _apply_filters(df: pd.DataFrame, symbol_col: str = "symbol") -> pd.DataFrame:
@@ -549,6 +562,49 @@ st.caption(
     "si su flag GGAL_BOT_ENABLE_* correspondiente esta apagado en este deploy, no un error."
 )
 
+# ---------------------------------------------------------------------------
+# Alerta de fills/trades fuera de horario de rueda (MEJORA 2026-10-01,
+# URGENTE a pedido explicito del usuario - ver dashboard/data/
+# market_hours_quality.py para la evidencia completa y el mecanismo real:
+# LiveShadowFeed cae a MockReplaySource fuera de rueda, que genera precios
+# 100% sinteticos sin ninguna nocion de horario de mercado; el bot evaluaba
+# y ejecutaba salidas/entradas con esos precios. El fix del lado del bot
+# (RiskConfig.enforce_market_hours_gate, default ON) bloquea esto hacia
+# adelante - esta seccion es el diagnostico HISTORICO sobre datos ya
+# registrados, no se puede corregir retroactivamente sin fabricar un
+# resultado distinto al que realmente ocurrio.
+# ---------------------------------------------------------------------------
+if _outside_session_summary["n_total"] > 0 and _outside_session_summary["n_outside"] > 0:
+    _pct_outside = _outside_session_summary["n_outside"] / _outside_session_summary["n_total"] * 100.0
+    st.error(
+        f"🚨 **Calidad de datos: {_outside_session_summary['n_outside']} de "
+        f"{_outside_session_summary['n_total']} trades cerrados ({_pct_outside:.1f}%) tienen al menos "
+        "una pata (entrada o salida) ejecutada FUERA del horario asumido de rueda (11:00-17:00 ART, "
+        "lun-vie).** PnL agregado de esos trades: "
+        f"$ {_outside_session_summary['pnl_outside_ars']:,.2f} (sobre un PnL cerrado total de "
+        f"$ {_outside_session_summary['pnl_total_ars']:,.2f} en este universo de trades). "
+        "Esta NO es una cifra de 'ganancia ficticia' aislada - es una cota de EXPOSICION a datos "
+        "potencialmente fabricados (ver columnas 'Entrada fuera de horario'/'Salida fuera de horario' "
+        "en la tabla de Operaciones mas abajo para identificar cada caso puntual). Causa raiz: el "
+        "failover automatico de LiveShadowFeed a MockReplaySource fuera de rueda (ver "
+        "ggal_bot/market_hours.py) - ya mitigado hacia adelante por RiskConfig."
+        "enforce_market_hours_gate (default ON), pero NO corregido retroactivamente sobre estos "
+        "datos historicos."
+    )
+    st.caption(
+        "Caso verificado puntualmente (sesion 2026-10-01): GFGC6600OC, ENTRY 16 @ 119,00 el "
+        "2026-09-28 (dentro de horario) vs CLOSE 16 @ 382,00 el 2026-09-29 10:28 ART (fuera de "
+        "horario, motivo 'take_profit') = ARS 420.800 de PnL asociado a un precio fuera de rueda. "
+        "Ademas, ese CLOSE quedo registrado en el Event Journal con un Position ID distinto al de su "
+        "propio ENTRY (hallazgo nuevo, no corregido en esta mejora): por eso esa posicion sigue "
+        "apareciendo como DOS posiciones abiertas sin aparear en vez de un trade cerrado, y la "
+        "'ganancia' se ve como PnL no realizado persistente en vez de un cierre puntual."
+    )
+elif _outside_session_summary["n_total"] > 0:
+    st.success(
+        "✅ Ningun trade cerrado en este universo tiene patas fuera del horario asumido de rueda."
+    )
+
 st.divider()
 
 
@@ -585,6 +641,11 @@ with tab_closed:
         st.caption("No hay trades cerrados que coincidan con los filtros.")
     else:
         display = closed_df_f.copy()
+        # MEJORA 2026-10-01: flag por pata (entrada/salida) fuera del horario
+        # asumido de rueda - ver dashboard/data/market_hours_quality.py y el
+        # banner de arriba para el detalle agregado/el caso verificado.
+        display["entry_outside_session"] = display["entry_outside_session"].map({True: "⚠️ Fuera", False: ""})
+        display["exit_outside_session"] = display["exit_outside_session"].map({True: "⚠️ Fuera", False: ""})
         display["entry_time"] = display["entry_time"].dt.strftime("%Y-%m-%d %H:%M:%S")
         display["exit_time"] = display["exit_time"].dt.strftime("%Y-%m-%d %H:%M:%S")
         display["pnl_ars"] = display["pnl_ars"].round(2)
@@ -592,11 +653,14 @@ with tab_closed:
         display["holding_seconds"] = display["holding_seconds"].round(0)
         st.dataframe(
             display[[
-                "symbol", "strategy", "direction", "quantity", "entry_time", "exit_time",
-                "entry_price", "exit_price", "pnl_ars", "pnl_pct", "holding_seconds",
+                "symbol", "strategy", "direction", "quantity", "entry_time", "entry_outside_session",
+                "exit_time", "exit_outside_session", "entry_price", "exit_price", "pnl_ars", "pnl_pct",
+                "holding_seconds",
             ]].rename(columns={
                 "symbol": "Ticker", "strategy": "Estrategia", "direction": "Direccion",
-                "quantity": "Cantidad", "entry_time": "Entrada", "exit_time": "Salida",
+                "quantity": "Cantidad", "entry_time": "Entrada",
+                "entry_outside_session": "Entrada fuera de horario", "exit_time": "Salida",
+                "exit_outside_session": "Salida fuera de horario",
                 "entry_price": "Precio Entrada", "exit_price": "Precio Salida",
                 "pnl_ars": "PnL ($)", "pnl_pct": "PnL (%)", "holding_seconds": "Duracion (s)",
             }),
@@ -610,6 +674,13 @@ with tab_open:
         st.caption("No hay posiciones abiertas que coincidan con los filtros.")
     else:
         display = open_positions_f.copy()
+        # MEJORA 2026-10-01: flag de entrada fuera del horario asumido de
+        # rueda - ver dashboard/data/market_hours_quality.py. El caso
+        # GFGC6600OC@382 (take_profit fuera de horario) aparece aca como DOS
+        # posiciones abiertas sin aparear (ver banner de "Frescura de datos"
+        # arriba), no como un trade cerrado - por eso el flag tambien se
+        # muestra en esta tabla y no solo en "Cerradas".
+        display["entry_outside_session"] = display["entry_outside_session"].map({True: "⚠️ Fuera", False: ""})
         display["entry_time"] = display["entry_time"].dt.strftime("%Y-%m-%d %H:%M:%S")
         display["avg_entry_price"] = display["avg_entry_price"].round(4)
         display["current_price"] = display["current_price"].round(4)
@@ -620,11 +691,12 @@ with tab_open:
         )
         st.dataframe(
             display[[
-                "symbol", "strategy", "quantity", "entry_time", "avg_entry_price",
-                "current_price", "pnl_ars", "pnl_pct", "Estado",
+                "symbol", "strategy", "quantity", "entry_time", "entry_outside_session",
+                "avg_entry_price", "current_price", "pnl_ars", "pnl_pct", "Estado",
             ]].rename(columns={
                 "symbol": "Ticker", "strategy": "Estrategia", "quantity": "Cantidad",
-                "entry_time": "Entrada", "avg_entry_price": "Precio Entrada (prom.)",
+                "entry_time": "Entrada", "entry_outside_session": "Entrada fuera de horario",
+                "avg_entry_price": "Precio Entrada (prom.)",
                 "current_price": "Precio Actual", "pnl_ars": "PnL no realizado ($)",
                 "pnl_pct": "PnL no realizado (%)",
             }),
