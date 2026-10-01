@@ -50,7 +50,7 @@ from ggal_bot.version_info import get_deployed_git_sha
 from ggal_bot.data.dislocation_history import DislocationHistoryTracker
 from ggal_bot.portfolio.reconciliation import (
     ReconciliationUnavailable,
-    reconstruct_positions_from_shadow_log,
+    reconstruct_positions_from_event_journal,
 )
 from ggal_bot.risk.risk_manager import RiskLimits, RiskManager
 from ggal_bot.risk.position_sizer import PositionSizer
@@ -647,13 +647,21 @@ class GgalOptionsBot:
         """
         Fase 5.3 (ver ggal_bot/portfolio/reconciliation.py y
         AUDITORIA_FASE5.3_*.md, "ROOT CAUSE RESOLVED"): reconstruye
-        self.portfolio desde logs/shadow_trades.csv ANTES de que el loop
-        principal evalue ninguna señal, para que un restart de proceso ya
-        no deje a Guarda 2 viendo una posicion "en cero" que en realidad
-        seguia abierta en el historial de fills. Solo corre en shadow mode
-        (ver alcance explicito documentado en reconciliation.py) y solo si
-        el portfolio esta vacio (nunca pisa posiciones ya creadas en este
-        mismo proceso).
+        self.portfolio ANTES de que el loop principal evalue ninguna señal,
+        para que un restart de proceso ya no deje a Guarda 2 viendo una
+        posicion "en cero" que en realidad seguia abierta. Solo corre en
+        shadow mode (ver alcance explicito documentado en reconciliation.py)
+        y solo si el portfolio esta vacio (nunca pisa posiciones ya creadas
+        en este mismo proceso).
+
+        ACTUALIZACION 2026-10-01 (Tarea #27/#28, a pedido explicito del
+        usuario): reconstruye desde logs/position_events.csv (el Event
+        Journal, via reconstruct_positions_from_event_journal) en vez de
+        logs/shadow_trades.csv - ver "ACTUALIZACION 2026-10-01" en el
+        docstring de reconciliation.py para el detalle completo de los dos
+        bugs reales verificados contra produccion que esto corrige
+        (contaminacion de Griegas/cantidad entre estrategias sobre el mismo
+        simbolo, y position_id que se reinventaba en cada restart).
 
         Defensivo por diseño: cualquier problema aca (CSV corrupto, pandas
         no instalado, lo que sea) se loguea y el bot sigue con Portfolio()
@@ -669,7 +677,7 @@ class GgalOptionsBot:
         if self.portfolio.positions:
             return
         try:
-            positions, warnings = reconstruct_positions_from_shadow_log(option_chain=self.option_chain)
+            positions, warnings = reconstruct_positions_from_event_journal(option_chain=self.option_chain)
         except ReconciliationUnavailable as exc:
             logger.warning(
                 "Reconciliacion de portfolio al arranque OMITIDA (arrancando con portfolio "

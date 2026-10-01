@@ -56,6 +56,26 @@ def _write_shadow_csv(path: Path, rows) -> None:
             w.writerow(row)
 
 
+def _write_journal_csv(path: Path, rows) -> None:
+    """
+    Escribe un logs/position_events.csv de prueba (ver
+    ggal_bot/portfolio/event_journal.py::PositionEventJournal._HEADER).
+    `rows`: lista de dicts con las claves que se necesiten - el resto se
+    completa con un default razonable (nunca fabrica datos de negocio,
+    solo rellena campos mecanicos como order_client_id/data_unavailable_fields).
+    """
+    header = [
+        "timestamp_utc", "event_type", "position_id", "contract_key",
+        "symbol", "strategy_tag", "side", "quantity_delta", "quantity_after",
+        "price", "order_client_id", "reason", "data_unavailable_fields",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        for row in rows:
+            w.writerow([row.get(col, "") for col in header])
+
+
 def _make_quote(symbol: str, strike: float = 7000.0) -> OptionQuote:
     book = OrderBookSnapshot(symbol, bid=570.0, ask=575.0, bid_size=50, ask_size=50)
     quote = OptionQuote(
@@ -308,17 +328,24 @@ def test_bot_entry_and_full_close_write_matching_events():
 
 def test_startup_reconciliation_makes_guard2_block_new_entry(tmp_path, monkeypatch):
     """
-    Con una posicion neta abierta en el CSV, tras reconciliar, Guarda 2
-    debe bloquear una entrada nueva sobre esa misma base - EXACTAMENTE lo
-    que faltaba en produccion (ver ROOT CAUSE de Fase 5.3).
+    Con una posicion neta abierta en el Event Journal, tras reconciliar,
+    Guarda 2 debe bloquear una entrada nueva sobre esa misma base -
+    EXACTAMENTE lo que faltaba en produccion (ver ROOT CAUSE de Fase 5.3).
+
+    ACTUALIZACION 2026-10-01: la reconciliacion de arranque ahora lee
+    logs/position_events.csv (Event Journal), no logs/shadow_trades.csv -
+    ver reconstruct_positions_from_event_journal() y la "ACTUALIZACION
+    2026-10-01" en reconciliation.py.
     """
-    csv_path = tmp_path / "shadow_trades.csv"
-    _write_shadow_csv(csv_path, [
-        ["2026-09-01T20:14:00+00:00", "c1", "GFGC7000OC", "buy", "market", 3, 572.5, 572.5, 572.5, "shadow_fill"],
+    csv_path = tmp_path / "position_events.csv"
+    _write_journal_csv(csv_path, [
+        {"timestamp_utc": "2026-09-01T20:14:00+00:00", "event_type": "ENTRY",
+         "position_id": "abc123", "symbol": "GFGC7000OC", "strategy_tag": "weekly_asymmetric",
+         "side": "buy", "quantity_delta": 3, "quantity_after": 3, "price": 572.5, "reason": "test"},
     ])
 
     import ggal_bot.paths as ggal_paths
-    monkeypatch.setattr(ggal_paths, "SHADOW_TRADES_LOG", csv_path)
+    monkeypatch.setattr(ggal_paths, "POSITION_EVENTS_LOG", csv_path)
 
     original_enabled = SETTINGS.shadow.enabled
     SETTINGS.shadow.enabled = True
@@ -328,6 +355,10 @@ def test_startup_reconciliation_makes_guard2_block_new_entry(tmp_path, monkeypat
 
         bot._reconcile_portfolio_on_startup()
         assert bot._position_quantity("GFGC7000OC") == 3.0, "la reconciliacion debia restaurar 3 contratos"
+        pos = next(p for p in bot.portfolio.positions if p.symbol == "GFGC7000OC")
+        assert pos.position_id == "abc123", (
+            "BUG: la reconciliacion debia REUSAR el position_id del journal, no fabricar uno nuevo"
+        )
 
         bot.option_chain.upsert_quote(_make_quote("GFGC7000OC"))
         entry_signal = EntrySignal(
@@ -345,12 +376,14 @@ def test_startup_reconciliation_makes_guard2_block_new_entry(tmp_path, monkeypat
 
 
 def test_reconciliation_disabled_flag_skips_restoration(tmp_path, monkeypatch):
-    csv_path = tmp_path / "shadow_trades.csv"
-    _write_shadow_csv(csv_path, [
-        ["2026-09-01T20:14:00+00:00", "c1", "GFGC7000OC", "buy", "market", 3, 572.5, 572.5, 572.5, "shadow_fill"],
+    csv_path = tmp_path / "position_events.csv"
+    _write_journal_csv(csv_path, [
+        {"timestamp_utc": "2026-09-01T20:14:00+00:00", "event_type": "ENTRY",
+         "position_id": "abc123", "symbol": "GFGC7000OC", "strategy_tag": "weekly_asymmetric",
+         "side": "buy", "quantity_delta": 3, "quantity_after": 3, "price": 572.5, "reason": "test"},
     ])
     import ggal_bot.paths as ggal_paths
-    monkeypatch.setattr(ggal_paths, "SHADOW_TRADES_LOG", csv_path)
+    monkeypatch.setattr(ggal_paths, "POSITION_EVENTS_LOG", csv_path)
 
     original_enabled = SETTINGS.shadow.enabled
     original_flag = SETTINGS.shadow.reconcile_portfolio_on_startup
