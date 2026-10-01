@@ -17,6 +17,21 @@ gatillos de cancelacion/repricing independientes:
 Este modulo NO decide *que* operar (eso es responsabilidad de
 strategy/vol_arbitrage.py y strategy/delta_hedger.py) - solo *como* insertar
 y vigilar la orden una vez que la decision ya fue tomada.
+
+NOTA sobre el FILL SIMULADO en modo Shadow (MEJORA 2026-10-01, a pedido
+explicito del usuario): el precio que este modulo arma aca (mid-price o
+cruzando el spread segun `aggressive`) es el precio LIMITE de la orden, no
+necesariamente el precio al que se simula el fill. OrderGateway.send() en
+modo shadow (ver docstring alli) SIEMPRE simula el fill cruzando el spread
+vigente (compra al ask, vende al bid), sin importar que esta orden se haya
+armado como pasiva (`aggressive=False`) o agresiva - es la asuncion
+conservadora estandar para un simulador que no puede modelar la cola de
+ordenes real (no hay forma honesta de saber si una orden pasiva a mid
+HABRIA sido tomada por otro participante, cuando, o a que precio exacto).
+El precio limite de este modulo si sigue siendo relevante: determina si
+`should_reprice()`/`_improve_price()` necesitan mejorar la cotizacion, y
+queda auditado en `requested_price` en logs/shadow_trades.csv junto con
+`fill_price`/`bid_at_fill`/`ask_at_fill`/`mid_at_fill` para comparar ambos.
 """
 
 from __future__ import annotations
@@ -83,7 +98,7 @@ class MidPriceExecutionEngine:
             symbol=symbol, side=side, quantity=quantity, price=price,
             order_type=OrderTypeEnum.LIMIT,
         )
-        state = self.order_gateway.send(request, reference_price=book.mid)
+        state = self.order_gateway.send(request, reference_price=book.mid, book=book)
         self._contexts[request.client_order_id] = _OpenOrderContext(
             symbol=symbol, side=side, aggressive=aggressive, spot_reference=spot_reference,
         )
@@ -185,7 +200,7 @@ class MidPriceExecutionEngine:
             symbol=ctx.symbol, side=ctx.side, quantity=state.request.quantity,
             price=improved_price, order_type=OrderTypeEnum.LIMIT,
         )
-        new_state = self.order_gateway.send(new_request, reference_price=book.mid)
+        new_state = self.order_gateway.send(new_request, reference_price=book.mid, book=book)
         new_state.price_improvements = state.price_improvements + 1
         self._contexts[new_request.client_order_id] = _OpenOrderContext(
             symbol=ctx.symbol, side=ctx.side, aggressive=ctx.aggressive, spot_reference=ctx.spot_reference,

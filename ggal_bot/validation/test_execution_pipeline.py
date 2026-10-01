@@ -106,6 +106,43 @@ def test_mid_price_exec_aggressive_crosses_spread():
     assert state.request.price == book.ask  # cruza el spread: compra al ask
 
 
+def test_mid_price_exec_submit_shadow_fill_crosses_spread_even_for_a_passive_mid_order():
+    """
+    MEJORA 2026-10-01 (a pedido explicito del usuario, verificado contra
+    produccion: fill_price == reference_price en el 100% de los fills de
+    shadow_trades.csv). El PRECIO LIMITE de una orden pasiva (aggressive=
+    False) sigue siendo el mid (ver test_mid_price_exec_submits_at_mid_for_
+    illiquid_book y MarketMakingEngine.decide_price), pero el FILL SIMULADO
+    en modo shadow debe cruzar el spread igual - OrderGateway.send() ahora
+    recibe el `book` completo (no solo reference_price=book.mid) y usa
+    book.ask/book.bid para el fill, sin importar que tan pasivo haya sido
+    el precio limite con el que se armo la orden.
+    """
+    original_enabled = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True
+    try:
+        gateway = OrderGateway()
+        engine = MidPriceExecutionEngine(gateway)
+        # Spread relativo >2% (umbral de "liquido" en MarketMakingEngine):
+        # con este book, decide_price() SI cotiza pasivo a mid (ver
+        # test_mid_price_exec_submits_at_mid_for_illiquid_book) - necesario
+        # para que este test distinga el precio LIMITE (mid) del precio de
+        # FILL simulado (cruza el spread), que es lo que se quiere probar.
+        book = OrderBookSnapshot("GFGC5200O", bid=95.0, ask=105.0, bid_size=50, ask_size=50)
+        state = engine.submit(
+            symbol="GFGC5200O", book=book, side=OrderSide.BUY, quantity=1,
+            spot_reference=5200.0, aggressive=False,
+        )
+        assert abs(state.request.price - book.mid) < 1e-6  # el LIMITE sigue siendo a mid
+        assert state.status is OrderStatus.FILLED
+        assert state.avg_fill_price == book.ask  # pero el FILL simulado cruza el spread
+        assert state.bid_at_fill == book.bid
+        assert state.ask_at_fill == book.ask
+        assert state.mid_at_fill == book.mid
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+
+
 def test_mid_price_exec_cancels_on_underlying_move():
     gateway = OrderGateway()
     engine = MidPriceExecutionEngine(gateway)
@@ -707,6 +744,7 @@ ALL_TESTS = [
     test_order_gateway_send_marks_state,
     test_mid_price_exec_submits_at_mid_for_illiquid_book,
     test_mid_price_exec_aggressive_crosses_spread,
+    test_mid_price_exec_submit_shadow_fill_crosses_spread_even_for_a_passive_mid_order,
     test_mid_price_exec_cancels_on_underlying_move,
     test_delta_hedging_engine_execute_hedge_submits_aggressive_order,
     test_delta_hedging_engine_returns_none_when_within_band,

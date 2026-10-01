@@ -37,6 +37,7 @@ from typing import Callable, Dict, Optional
 
 from ggal_bot.config import SETTINGS
 from ggal_bot import paths
+from ggal_bot.data.option_chain import OrderBookSnapshot
 
 logger = logging.getLogger("ggal_bot.order_gateway")
 
@@ -94,6 +95,14 @@ class OrderState:
     # Precio de referencia (mid o spot) al momento de armar la orden, usado
     # por execution/mid_price_exec.py para medir slippage acumulado.
     reference_price: float = 0.0
+    # MEJORA 2026-10-01 (a pedido explicito del usuario - ver docstring de
+    # ShadowAuditLogger.log_fill): bid/ask/mid del book vigente al momento
+    # del fill (solo poblado en modo shadow, cuando send() recibe un `book`
+    # valido - ver OrderGateway.send()). 0.0 si no aplica (modo real, o
+    # shadow sin book disponible en ese llamado).
+    bid_at_fill: float = 0.0
+    ask_at_fill: float = 0.0
+    mid_at_fill: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -406,11 +415,22 @@ class ShadowAuditLogger:
     poder auditar la logica de señales/ejecucion del bot sin haber tocado
     la API real del broker en ningun momento. Un archivo por proyecto (se
     va agregando una fila por evento; nunca se sobreescribe ni se rota).
+
+    MEJORA 2026-10-01 (a pedido explicito del usuario - punto 2 de la
+    mejora de calidad de datos de shadow, sesion 2026-10-01): columnas
+    nuevas `bid_at_fill`/`ask_at_fill`/`mid_at_fill` con el book vigente al
+    momento exacto del fill (antes, el unico precio registrado era
+    fill_price == reference_price == mid en el 100% de los fills - ver
+    OrderGateway.send() para el fix de que fill_price cruce el spread).
+    Retrocompatible: un shadow_trades.csv viejo sin estas 3 columnas se
+    sigue leyendo bien (pandas las completa con NaN, ver dashboard/
+    pnl_engine.py::load_fills) - no hace falta migrar el archivo historico.
     """
 
     _HEADER = [
         "timestamp_utc", "client_order_id", "symbol", "side", "order_type",
         "quantity", "requested_price", "fill_price", "reference_price", "event",
+        "bid_at_fill", "ask_at_fill", "mid_at_fill",
     ]
 
     def __init__(self, path: Optional[Path] = None):
@@ -426,17 +446,21 @@ class ShadowAuditLogger:
                 with open(self._path, "a", newline="", encoding="utf-8") as f:
                     csv.writer(f).writerow(self._HEADER)
 
-    def log_fill(self, request: "OrderRequest", fill_price: float, reference_price: float) -> None:
+    def log_fill(
+        self, request: "OrderRequest", fill_price: float, reference_price: float,
+        bid_at_fill: float = 0.0, ask_at_fill: float = 0.0, mid_at_fill: float = 0.0,
+    ) -> None:
         self._write_row([
             datetime.now(timezone.utc).isoformat(), request.client_order_id, request.symbol,
             request.side.value, request.order_type.value, request.quantity,
             request.price, fill_price, reference_price, "shadow_fill",
+            bid_at_fill, ask_at_fill, mid_at_fill,
         ])
 
     def log_cancel(self, client_order_id: str, symbol: str = "") -> None:
         self._write_row([
             datetime.now(timezone.utc).isoformat(), client_order_id, symbol,
-            "", "", "", "", "", "", "shadow_cancel",
+            "", "", "", "", "", "", "shadow_cancel", "", "", "",
         ])
 
     def _write_row(self, row) -> None:
@@ -488,27 +512,70 @@ class OrderGateway:
         # normales contra el ALYC real.
         self._shadow_logger = ShadowAuditLogger(path=shadow_audit_path) if SETTINGS.shadow.enabled else None
 
-    def send(self, request: OrderRequest, reference_price: float = 0.0) -> OrderState:
+    def send(
+        self, request: OrderRequest, reference_price: float = 0.0,
+        book: Optional[OrderBookSnapshot] = None,
+    ) -> OrderState:
         state = OrderState(request=request, reference_price=reference_price or request.price)
         self._orders[request.client_order_id] = state
 
         if SETTINGS.shadow.enabled:
-            # Paper Execution: nunca se llama a send_order() (ni por lo tanto
-            # a pyRofex/la API real). Se simula un fill inmediato y completo
-            # al precio de referencia (el mid vigente al armar la orden), que
-            # es la aproximacion estandar para no sesgar optimistamente al
-            # motor de señales con fills al propio limite. Cada fill queda
-            # auditado en logs/shadow_trades.csv.
-            fill_price = state.reference_price or request.price
+            # Paper Execution.
+            #
+            # BUG REAL CORREGIDO (2026-10-01, a pedido explicito del usuario -
+            # punto 2 de la mejora de calidad de datos de shadow, sesion
+            # 2026-10-01, verificado contra produccion: fill_price ==
+            # reference_price en el 100% de los fills de shadow_trades.csv):
+            # ANTES de este fix, CUALQUIER orden simulada - inclusive las
+            # "agresivas" del delta-hedger, que arman su propio limite en
+            # book.ask/book.bid via MidPriceExecutionEngine.submit(aggressive=
+            # True) - se llenaba igual al MID (`reference_price`, que
+            # mid_price_exec.py siempre pasa como book.mid sin importar
+            # aggressive), ignorando por completo `request.price`. Eso le
+            # regalaba al bot una ejecucion sin spread ni slippage en el
+            # 100% de los fills (ni siquiera las mejoras de precio de
+            # MidPriceExecutionEngine._reprice() tenian ningun efecto sobre
+            # el precio simulado) - un sesgo optimista sistematico que
+            # invalida cualquier lectura de PnL/EV de shadow_trades.csv como
+            # "lo que habria pasado en la realidad".
+            #
+            # Fix: si hay un `book` vigente con bid/ask validos (>0), el
+            # fill simulado CRUZA EL SPREAD - compra al ask, vende al bid -,
+            # la asuncion conservadora estandar para un simulador que no
+            # puede modelar la cola de ordenes real (en la practica, lo
+            # unico que se sabe con certeza es que cruzar el spread SI se
+            # ejecuta; asumir que una orden pasiva a mid siempre se llena
+            # instantaneamente y gratis es la asuncion optimista que este
+            # fix reemplaza). Si no hay book (o bid/ask invalido, ej. 0.0
+            # fuera de rueda - ver ggal_bot/market_hours.py), se cae al
+            # comportamiento anterior (reference_price/precio propio) en vez
+            # de fabricar un cruce de spread que no existe.
+            book_has_valid_quote = book is not None and book.bid > 0 and book.ask > 0
+            if book_has_valid_quote:
+                fill_price = book.ask if request.side is OrderSide.BUY else book.bid
+                bid_at_fill, ask_at_fill, mid_at_fill = book.bid, book.ask, book.mid
+            else:
+                fill_price = state.reference_price or request.price
+                bid_at_fill = book.bid if book is not None else 0.0
+                ask_at_fill = book.ask if book is not None else 0.0
+                mid_at_fill = book.mid if book is not None else (state.reference_price or 0.0)
+
             state.status = OrderStatus.FILLED
             state.filled_quantity = request.quantity
             state.avg_fill_price = fill_price
+            state.bid_at_fill = bid_at_fill
+            state.ask_at_fill = ask_at_fill
+            state.mid_at_fill = mid_at_fill
             state.last_update_at = time.time()
             if self._shadow_logger is not None:
-                self._shadow_logger.log_fill(request, fill_price, state.reference_price)
+                self._shadow_logger.log_fill(
+                    request, fill_price, state.reference_price, bid_at_fill, ask_at_fill, mid_at_fill,
+                )
             logger.info(
-                "[SHADOW] Fill simulado: %s %s x%.2f @ %.4f (id=%s, mercado real NO tocado)",
-                request.side.value, request.symbol, request.quantity, fill_price, request.client_order_id,
+                "[SHADOW] Fill simulado: %s %s x%.2f @ %.4f (%s, bid=%.4f/ask=%.4f, id=%s, mercado real NO tocado)",
+                request.side.value, request.symbol, request.quantity, fill_price,
+                "cruzando spread" if book_has_valid_quote else "sin book, fallback a referencia",
+                bid_at_fill, ask_at_fill, request.client_order_id,
             )
             return state
 

@@ -20,10 +20,14 @@ from ggal_bot.ops.manual_close import close_position_manually, determine_close_o
 pytest.importorskip("pandas")
 
 
-_HEADER = [
-    "timestamp_utc", "client_order_id", "symbol", "side", "order_type",
-    "quantity", "requested_price", "fill_price", "reference_price", "event",
-]
+# Se reusa el HEADER real de ShadowAuditLogger (en vez de duplicarlo a mano)
+# para que este fixture nunca vuelva a desincronizarse de el - BUG REAL
+# EVITADO ACA (2026-10-01): una copia local desactualizada del header (10
+# columnas, sin bid_at_fill/ask_at_fill/mid_at_fill) escribia una fila
+# "jagged" apenas close_position_manually() agregaba su propio fill via
+# ShadowAuditLogger (13 columnas) - pandas no pudo parsear el CSV resultante
+# y load_fills() devolvia un DataFrame vacio en silencio.
+_HEADER = ShadowAuditLogger._HEADER
 
 
 # Timestamps con microsegundos (formato real de datetime.now(timezone.utc).
@@ -40,7 +44,10 @@ def _write_fill(path, *, symbol, side, quantity, price, ts):
         writer = csv_module.writer(f)
         if needs_header:
             writer.writerow(_HEADER)
-        writer.writerow([ts, f"cid-{ts}", symbol, side, "limit", quantity, price, price, price, "shadow_fill"])
+        # bid_at_fill/ask_at_fill/mid_at_fill en blanco: estos fixtures
+        # existian antes de esa mejora y no necesitan ese dato para lo que
+        # este archivo testea (deteccion/cierre manual de posiciones).
+        writer.writerow([ts, f"cid-{ts}", symbol, side, "limit", quantity, price, price, price, "shadow_fill", "", "", ""])
 
 
 def test_determine_close_order_detects_sell_needed_for_a_long_option_position(tmp_path):

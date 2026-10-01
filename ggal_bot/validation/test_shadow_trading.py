@@ -38,6 +38,7 @@ from ggal_bot.data.live_shadow_feed import (
     _parse_data912_option_symbol,
 )
 from ggal_bot.models.black_scholes import OptionType
+from ggal_bot.data.option_chain import OrderBookSnapshot
 from ggal_bot.execution.order_gateway import (
     OrderGateway, OrderRequest, OrderSide, OrderStatus, OrderTypeEnum,
 )
@@ -1008,6 +1009,12 @@ def test_live_shadow_feed_advance_to_next_source_falls_back_to_mock_when_priorit
 
 
 def test_order_gateway_shadow_mode_fills_immediately_at_reference_price():
+    """
+    Caso SIN `book` (comportamiento historico, retrocompatible): ningun
+    caller real deja de pasar `book` hoy (ver mid_price_exec.py), pero algun
+    llamador futuro que no lo tenga disponible no debe fallar ni fabricar un
+    cruce de spread inexistente - cae al precio de referencia/propio.
+    """
     original_enabled = SETTINGS.shadow.enabled
     SETTINGS.shadow.enabled = True
     try:
@@ -1021,6 +1028,93 @@ def test_order_gateway_shadow_mode_fills_immediately_at_reference_price():
         assert state.status is OrderStatus.FILLED
         assert state.filled_quantity == 3
         assert state.avg_fill_price == 99.5  # fill al mid de referencia, no al precio limite
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+
+
+def test_order_gateway_shadow_mode_crosses_the_spread_when_book_is_provided():
+    """
+    MEJORA 2026-10-01 (a pedido explicito del usuario - punto 2 de la mejora
+    de calidad de datos de shadow): con un `book` vigente de bid/ask
+    validos, el fill simulado CRUZA EL SPREAD - compra al ask, vende al bid
+    - sin importar el precio limite con el que se armo la orden. Antes de
+    este fix, fill_price == reference_price (el mid) en el 100% de los
+    fills, verificado contra produccion.
+    """
+    original_enabled = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True
+    try:
+        gateway = OrderGateway()
+        book = OrderBookSnapshot(symbol="GFGC5200O", bid=98.0, ask=102.0, bid_size=10, ask_size=10)
+
+        buy_request = OrderRequest(
+            symbol="GFGC5200O", side=OrderSide.BUY, quantity=3, price=100.0,
+            order_type=OrderTypeEnum.LIMIT,
+        )
+        buy_state = gateway.send(buy_request, reference_price=book.mid, book=book)
+        assert buy_state.avg_fill_price == 102.0  # compra al ask, no al mid (100.0) ni al limite (100.0)
+
+        sell_request = OrderRequest(
+            symbol="GFGC5200O", side=OrderSide.SELL, quantity=2, price=100.0,
+            order_type=OrderTypeEnum.LIMIT,
+        )
+        sell_state = gateway.send(sell_request, reference_price=book.mid, book=book)
+        assert sell_state.avg_fill_price == 98.0  # vende al bid, no al mid (100.0) ni al limite (100.0)
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+
+
+def test_order_gateway_shadow_mode_falls_back_when_book_has_no_valid_quote():
+    """
+    Sin bid/ask vigente (ej. book con bid=ask=0.0, el caso real que devuelve
+    BrokerRestSource fuera de rueda - ver live_shadow_feed.py) no hay spread
+    que cruzar: cae al precio de referencia en vez de fabricar un cruce con
+    datos invalidos.
+    """
+    original_enabled = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True
+    try:
+        gateway = OrderGateway()
+        empty_book = OrderBookSnapshot(symbol="GFGC5200O", bid=0.0, ask=0.0, bid_size=0, ask_size=0)
+        request = OrderRequest(
+            symbol="GFGC5200O", side=OrderSide.BUY, quantity=1, price=100.0,
+            order_type=OrderTypeEnum.LIMIT,
+        )
+        state = gateway.send(request, reference_price=99.5, book=empty_book)
+        assert state.avg_fill_price == 99.5
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+
+
+def test_order_gateway_shadow_mode_logs_bid_ask_mid_at_fill_to_audit_csv():
+    import csv
+    import tempfile
+    from pathlib import Path
+    from ggal_bot.execution.order_gateway import ShadowAuditLogger
+
+    original_enabled = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audit_path = Path(tmp_dir) / "shadow_trades_test.csv"
+            gateway = OrderGateway()
+            gateway._shadow_logger = ShadowAuditLogger(path=audit_path)
+            book = OrderBookSnapshot(symbol="GFGV4800F", bid=48.0, ask=50.0, bid_size=5, ask_size=5)
+
+            request = OrderRequest(
+                symbol="GFGV4800F", side=OrderSide.SELL, quantity=2, price=49.0,
+                order_type=OrderTypeEnum.LIMIT,
+            )
+            gateway.send(request, reference_price=book.mid, book=book)
+
+            with open(audit_path, newline="", encoding="utf-8") as f:
+                rows = list(csv.reader(f))
+            header, data_row = rows[0], rows[1]
+            assert header[-3:] == ["bid_at_fill", "ask_at_fill", "mid_at_fill"]
+            assert float(data_row[7]) == 48.0   # fill_price: vende al bid
+            assert float(data_row[-3]) == 48.0  # bid_at_fill
+            assert float(data_row[-2]) == 50.0  # ask_at_fill
+            assert float(data_row[-1]) == 49.0  # mid_at_fill
     finally:
         SETTINGS.shadow.enabled = original_enabled
 
@@ -1139,6 +1233,9 @@ ALL_TESTS = [
     test_broker_rest_source_fetch_snapshot_flags_soft_error_but_keeps_serving_cache,
     test_live_shadow_feed_advance_to_next_source_falls_back_to_mock_when_priority_exhausted,
     test_order_gateway_shadow_mode_fills_immediately_at_reference_price,
+    test_order_gateway_shadow_mode_crosses_the_spread_when_book_is_provided,
+    test_order_gateway_shadow_mode_falls_back_when_book_has_no_valid_quote,
+    test_order_gateway_shadow_mode_logs_bid_ask_mid_at_fill_to_audit_csv,
     test_order_gateway_shadow_mode_logs_fill_to_audit_csv,
     test_order_gateway_shadow_mode_never_touches_real_send_order,
     test_order_gateway_get_account_positions_shadow_mode_reflects_local_fills,
