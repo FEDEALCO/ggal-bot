@@ -55,6 +55,15 @@ logger = logging.getLogger("ggal_bot.portfolio.event_journal")
 # futuro (dashboard, reconciliation.py, etc.).
 VALID_EVENT_TYPES = (
     "ENTRY", "ADD", "REDUCE", "PARTIAL_EXIT", "CLOSE", "REJECT", "CANCEL",
+    # SHADOW_RESET (Tarea #27 item 5, 2026-10-01, a pedido explicito del
+    # usuario): cierre administrativo de TODAS las posiciones shadow
+    # abiertas al mid vigente, disparado una sola vez con
+    # GGAL_BOT_SHADOW_RESET_ON_START=true - ver run_bot.py::
+    # _perform_shadow_reset. Se trata como un cierre mas para
+    # reconstruct_positions_from_event_journal() (consume el lote FIFO
+    # igual que CLOSE), pero queda distinguible por su propio event_type
+    # para que el dashboard pueda separar PnL antes/despues del reset.
+    "SHADOW_RESET",
 )
 
 

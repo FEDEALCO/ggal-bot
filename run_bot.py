@@ -29,6 +29,7 @@ import logging
 import signal
 import sys
 import time
+import uuid
 from datetime import date, datetime, timezone
 from typing import Dict, List, Optional
 
@@ -60,8 +61,10 @@ from ggal_bot.execution.market_making import MarketMakingEngine
 from ggal_bot.execution.mid_price_exec import MidPriceExecutionEngine
 from ggal_bot.execution.order_gateway import (
     OrderGateway,
+    OrderRequest,
     OrderSide,
     OrderStatus,
+    OrderTypeEnum,
     WebSocketConnectionManager,
     initialize_environment,
 )
@@ -400,6 +403,13 @@ class GgalOptionsBot:
         # -- Position Lifecycle Event Journal (Fase 5.3, ver
         # ggal_bot/portfolio/event_journal.py) --------------------------------
         self.position_event_journal = PositionEventJournal()
+
+        # SHADOW_RESET pendiente (Tarea #27 item 5, ver recompute_cycle y
+        # _perform_shadow_reset): solo se marca en modo shadow (SETTINGS.
+        # shadow.enabled, no self.shadow_mode - se asigna mas abajo en este
+        # mismo __init__) - en modo LIVE este flag nunca se evalua (nada
+        # cierra ordenes reales a mano por este camino).
+        self._shadow_reset_pending = SETTINGS.shadow.enabled and SETTINGS.shadow.reset_on_start
 
         # -- Snapshot de mercado (MEJORA 2026-09-28, ver
         # ggal_bot/data/market_snapshot_log.py) - corre SIEMPRE, sin importar
@@ -771,6 +781,89 @@ class GgalOptionsBot:
                 {k: round(v, 4) for k, v in orphaned.items()},
             )
 
+    def _perform_shadow_reset(self) -> None:
+        """
+        Tarea #27 item 5 (a pedido explicito del usuario, 2026-10-01):
+        cierra TODAS las posiciones shadow abiertas al mid VIGENTE (nunca
+        fabricado - una posicion sin cotizacion bid/ask operable ahora
+        mismo queda SIN cerrar, con un error explicito, en vez de inventar
+        un precio), registrando un evento SHADOW_RESET por posicion en el
+        Event Journal (con la lista completa de lo cerrado en el log) y un
+        fill de cierre real en logs/shadow_trades.csv (mismo mecanismo que
+        ggal_bot/ops/manual_close.py, reusando el ShadowAuditLogger ya
+        instanciado en self.order_gateway) - asi dashboard/pnl_engine.py
+        sigue viendo estas posiciones como cerradas, no como "abiertas para
+        siempre". Pensado para correr UNA sola vez, disparado a mano con
+        GGAL_BOT_SHADOW_RESET_ON_START=true (ver recompute_cycle, que lo
+        llama en el primer ciclo con cotizaciones reales y apaga
+        self._shadow_reset_pending de inmediato) - motivado por la
+        contaminacion verificada de la Tarea #27 (fills de la fuente mock
+        fuera de horario mezclados con posiciones reales, ver REPORT.md).
+
+        Tras esto, el portfolio en memoria queda en 0 para cada simbolo
+        cerrado - el bot sigue el ciclo normal desde ahi, sin ninguna
+        posicion heredada.
+        """
+        closed_summary: List[str] = []
+        skipped: List[str] = []
+        for pos in list(self.portfolio.positions):
+            if abs(pos.quantity) < 1e-9:
+                continue
+
+            is_underlying = pos.symbol in (SETTINGS.instruments.contado_ticker, SETTINGS.instruments.futuro_ticker)
+            if is_underlying:
+                book = self._spot_book
+            else:
+                quote = self.option_chain.get(pos.symbol)
+                book = quote.book if quote is not None else None
+            mid = book.mid if (book is not None and book.bid > 0 and book.ask > 0) else None
+
+            if mid is None:
+                skipped.append(f"{pos.symbol}={pos.quantity:g}")
+                logger.error(
+                    "SHADOW_RESET: %s (qty=%.4f) NO se pudo cerrar - sin cotizacion bid/ask operable "
+                    "ahora mismo. Queda abierta; nunca se fabrica un precio de cierre. Reintentar "
+                    "manualmente (ggal_bot/ops/manual_close.py) o en un proximo arranque con el flag "
+                    "todavia activo.",
+                    pos.symbol, pos.quantity,
+                )
+                continue
+
+            side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
+            qty = abs(pos.quantity)
+            request = OrderRequest(
+                symbol=pos.symbol, side=side, quantity=qty, price=mid,
+                order_type=OrderTypeEnum.MARKET, client_order_id=f"shadow-reset-{uuid.uuid4().hex[:8]}",
+            )
+            if self.order_gateway._shadow_logger is not None:
+                self.order_gateway._shadow_logger.log_fill(request, fill_price=mid, reference_price=mid)
+
+            self.position_event_journal.log_event(
+                "SHADOW_RESET", position_id=pos.position_id, contract_key=pos.contract_key,
+                symbol=pos.symbol, strategy_tag=pos.strategy_tag or "weekly_asymmetric",
+                side=side.value, quantity_delta=-pos.quantity, quantity_after=0.0,
+                price=mid, order_client_id=request.client_order_id, reason="shadow_reset",
+            )
+            closed_summary.append(f"{pos.symbol}={pos.quantity:g}@{mid:.4f}")
+            pos.quantity = 0.0
+
+        if closed_summary:
+            logger.warning(
+                "SHADOW_RESET completo (GGAL_BOT_SHADOW_RESET_ON_START=true): %d posicion(es) "
+                "cerradas al mid vigente - %s. El bot arranca desde cero a partir de aca. "
+                "IMPORTANTE: este flag NO se auto-apaga - volver a ponerlo en false antes del "
+                "proximo deploy para no repetir el reset.",
+                len(closed_summary), "; ".join(closed_summary),
+            )
+        if skipped:
+            logger.error(
+                "SHADOW_RESET: %d posicion(es) NO se pudieron cerrar por falta de cotizacion "
+                "operable: %s - quedan abiertas, revisar a mano.",
+                len(skipped), "; ".join(skipped),
+            )
+        if not closed_summary and not skipped:
+            logger.info("SHADOW_RESET: no habia ninguna posicion abierta para cerrar.")
+
     def connect_and_subscribe(self) -> bool:
         if self.shadow_mode:
             # Sin PyRofex, sin websocket: bootstrap_universe() arma el
@@ -820,6 +913,16 @@ class GgalOptionsBot:
         if self._spot_book is None:
             logger.debug("Sin spot de GGAL todavia, se omite el ciclo.")
             return
+
+        # SHADOW_RESET (Tarea #27 item 5) - UNA sola vez, en el primer ciclo
+        # que ya tiene cotizaciones reales (recien aca, no en connect_and_
+        # subscribe: bootstrap_universe solo deja books placeholder bid=ask=0,
+        # ver live_shadow_feed.py). Se ubica ANTES de cualquier señal/hedge
+        # de este mismo ciclo para que el portfolio arranque realmente en
+        # cero desde el primer calculo.
+        if self._shadow_reset_pending:
+            self._perform_shadow_reset()
+            self._shadow_reset_pending = False
 
         spot = self._spot_book.mid
         # `max_quote_age_seconds` (BUG REAL CORREGIDO, ver RiskConfig.

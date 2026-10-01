@@ -633,6 +633,23 @@ class ShadowConfig:
     # forma segura (portfolio vacio + warning) si no puede ejecutarse.
     reconcile_portfolio_on_startup: bool = _env_bool("GGAL_BOT_SHADOW_RECONCILE_ON_STARTUP", True)
 
+    # Tarea #27 item 5 (a pedido explicito del usuario, 2026-10-01): "como
+    # las posiciones abiertas estan contaminadas por fills sinteticos, al
+    # arrancar despues del deploy cerra todas las posiciones shadow
+    # abiertas al mid vigente con un evento SHADOW_RESET en el journal (con
+    # la lista de lo cerrado), y arranca desde cero. Que sea un paso
+    # explicito que yo disparo con un flag... por un UNICO arranque, no
+    # automatico." - ver run_bot.py::_perform_shadow_reset.
+    #
+    # Default False A PROPOSITO, a diferencia de las demas guardas de este
+    # archivo (enforce_market_hours_gate, enforce_position_invariants,
+    # etc.) que defaultean ON por ser reductoras de riesgo: esto NO es una
+    # guarda continua, es una ACCION administrativa de una sola vez que el
+    # usuario mismo decide disparar explicitamente para el proximo
+    # arranque (y se espera que vuelva a False despues, a mano - este
+    # modulo no se auto-apaga, ver docstring de _perform_shadow_reset).
+    reset_on_start: bool = _env_bool("GGAL_BOT_SHADOW_RESET_ON_START", False)
+
     def source_priority(self) -> Tuple[str, ...]:
         """
         Devuelve la lista de fuentes candidatas, en orden de preferencia,

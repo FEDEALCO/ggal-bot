@@ -500,7 +500,10 @@ def reconstruct_positions_from_event_journal(
     if df.empty:
         return [], warnings
 
-    df = df[df["event_type"].isin(("ENTRY", "ADD", "REDUCE", "PARTIAL_EXIT", "CLOSE"))].copy()
+    # SHADOW_RESET (Tarea #27 item 5) se incluye junto a los cierres
+    # normales - _fifo_remaining_lot la consume igual que un CLOSE (no esta
+    # en ("ENTRY","ADD"), cae a la rama de reduccion generica).
+    df = df[df["event_type"].isin(("ENTRY", "ADD", "REDUCE", "PARTIAL_EXIT", "CLOSE", "SHADOW_RESET"))].copy()
     if df.empty:
         return [], warnings
     df["quantity_delta"] = _to_numeric(df["quantity_delta"])
