@@ -5,26 +5,28 @@ Frescura de datos (Fase 1, mandato explicito del usuario): timestamp del
 ultimo evento de cada fuente y alerta si esta desactualizado, "por
 ejemplo, mas de N minutos en horario de rueda".
 
-SUPUESTO EXPLICITO, NO VERIFICADO (mismo criterio de honestidad que
-ggal_bot/backtest/costs.py con el 0.20% de "derecho de mercado" BYMA -
-una asuncion razonable pero marcada como tal, nunca escondida): no existe
-en ningun otro lugar del codigo una constante ya establecida de horario
-de rueda de BYMA. Se asume aca 11:00-17:00 ART (UTC-3 fijo, sin horario
-de verano desde 2009 - mismo offset que
-ggal_bot/config.py::eod_timezone_offset_hours), de lunes a viernes. Si
-este supuesto es incorrecto, corregir BYMA_SESSION_START_HOUR_ART /
-BYMA_SESSION_END_HOUR_ART aca abajo (un solo lugar, usado por todos los
-paneles de frescura).
+MEJORA 2026-10-01: la logica de "¿esta la rueda de BYMA abierta ahora?"
+(incluido el supuesto explicito y no verificado de 11:00-17:00 ART) se
+movio a ggal_bot/market_hours.py, que ahora es la UNICA fuente de verdad -
+la usa tambien run_bot.py (RiskConfig.enforce_market_hours_gate) para
+dejar de evaluar entradas/salidas/hedge fuera de horario (ver docstring de
+ese modulo para el bug real que esto corrigio). Este archivo re-exporta
+los mismos nombres para no romper a nadie que ya importaba
+dashboard.data.freshness.is_within_byma_session /
+BYMA_SESSION_START_HOUR_ART / BYMA_SESSION_END_HOUR_ART.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 
-ART_OFFSET_HOURS = -3.0  # UTC-3 fijo (Argentina no tiene horario de verano desde 2009)
-BYMA_SESSION_START_HOUR_ART = 11.0  # SUPUESTO no verificado, ver docstring del modulo
-BYMA_SESSION_END_HOUR_ART = 17.0    # SUPUESTO no verificado, ver docstring del modulo
+from ggal_bot.market_hours import (  # noqa: F401 - re-exportado por compatibilidad
+    ART_OFFSET_HOURS,
+    BYMA_SESSION_END_HOUR_ART,
+    BYMA_SESSION_START_HOUR_ART,
+    is_within_byma_session,
+)
 
 
 @dataclass
@@ -39,16 +41,6 @@ class SourceFreshness:
 
 def _to_aware_utc(dt: datetime) -> datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
-
-
-def is_within_byma_session(now_utc: Optional[datetime] = None) -> bool:
-    """True si `now_utc` cae dentro de la rueda asumida (ver supuesto arriba), lunes a viernes."""
-    now_utc = _to_aware_utc(now_utc) if now_utc is not None else datetime.now(timezone.utc)
-    art = now_utc + timedelta(hours=ART_OFFSET_HOURS)
-    if art.weekday() >= 5:  # 5=sabado, 6=domingo
-        return False
-    hour_frac = art.hour + art.minute / 60.0
-    return BYMA_SESSION_START_HOUR_ART <= hour_frac < BYMA_SESSION_END_HOUR_ART
 
 
 def compute_freshness(
