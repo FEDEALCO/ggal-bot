@@ -149,8 +149,8 @@ def close_position_manually(
             "esta funcion nunca fabrica un precio de cierre."
         )
 
+    detected = determine_close_order(symbol, csv_path=csv_path, option_multiplier=option_multiplier)
     if quantity is None or side is None:
-        detected = determine_close_order(symbol, csv_path=csv_path, option_multiplier=option_multiplier)
         if detected is None:
             raise ValueError(
                 f"{symbol}: no se encontro una posicion abierta en "
@@ -159,6 +159,22 @@ def close_position_manually(
         side, quantity = detected
     if quantity <= 0:
         raise ValueError(f"{symbol}: quantity debe ser > 0 (recibido {quantity!r}).")
+
+    # INVARIANTE 1 (Tarea #27 item 4, ggal_bot/risk/invariants.py): a
+    # diferencia de run_bot.py::_act_on_exit_signal (que SIEMPRE recorta de
+    # forma segura lote por lote), esta herramienta escribe el fill tal
+    # cual se le pide - un --quantity/--side explicito que exceda la
+    # posicion neta real dejaria, al proximo reconciliar, una posicion
+    # NETA CORTA fabricada por una herramienta manual. Se bloquea.
+    if side is OrderSide.SELL:
+        available = detected[1] if (detected is not None and detected[0] is OrderSide.SELL) else 0.0
+        if quantity > available + 1e-9:
+            raise ValueError(
+                f"{symbol}: se pidio vender {quantity:g} contratos pero la posicion neta real "
+                f"vendible es de solo {available:g} - venderla de mas dejaria una posicion NETA "
+                "CORTA fabricada a mano. Si el objetivo es cerrar todo, omiti --quantity (se "
+                "detecta automaticamente)."
+            )
 
     audit_logger = ShadowAuditLogger(path=csv_path)
     request = OrderRequest(

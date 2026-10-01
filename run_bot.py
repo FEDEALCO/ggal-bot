@@ -55,6 +55,7 @@ from ggal_bot.portfolio.reconciliation import (
 from ggal_bot.risk.risk_manager import RiskLimits, RiskManager
 from ggal_bot.risk.position_sizer import PositionSizer
 from ggal_bot.risk.kill_switch import KillSwitch
+from ggal_bot.risk import invariants
 from ggal_bot.execution.market_making import MarketMakingEngine
 from ggal_bot.execution.mid_price_exec import MidPriceExecutionEngine
 from ggal_bot.execution.order_gateway import (
@@ -858,6 +859,7 @@ class GgalOptionsBot:
         # este ciclo) y ANTES del kill switch/dispatch de estrategia, para
         # que la alerta sea lo mas temprana posible dentro del ciclo.
         self._warn_positions_without_valid_quote()
+        self._warn_position_invariant_violations()
 
         # Snapshot de mercado (MEJORA 2026-09-28, ver
         # data/market_snapshot_log.py): corre SIEMPRE, sin importar la
@@ -1030,6 +1032,24 @@ class GgalOptionsBot:
                     self._vol_arbitrage_reentry_cooldown_until[position.symbol] = (
                         time.time() + cfg.reentry_cooldown_seconds
                     )
+
+    def _warn_position_invariant_violations(self) -> None:
+        """
+        Tarea #27 item 4: escaneo PASIVO (solo alerta, no bloquea nada - los
+        pre-trade guards de _act_on_exit_signal ya bloquean lo que pueden
+        ANTES de que ocurra) del estado ACTUAL del portfolio contra los dos
+        invariantes de ggal_bot/risk/invariants.py. Corre SIEMPRE que la
+        guarda este activada (ver RiskConfig.enforce_position_invariants),
+        sin importar la estrategia activa - detecta una violacion ya
+        consumada (ej. remanente de un bug anterior a este fix, o una
+        ventana breve entre dos pasos del mismo ciclo) incluso si ningun
+        guard la bloqueo a tiempo.
+        """
+        if not SETTINGS.risk.enforce_position_invariants:
+            return
+        violations = invariants.check_portfolio_invariants(self.portfolio)
+        for v in violations:
+            logger.error("INVARIANTE DE RIESGO VIOLADA (estado actual del portfolio): %s", v)
 
     def _warn_positions_without_valid_quote(self, now: Optional[float] = None) -> None:
         """
@@ -1677,6 +1697,20 @@ class GgalOptionsBot:
         """Posicion neta (signed) actualmente registrada en self.portfolio para `symbol`."""
         return sum(p.quantity for p in self.portfolio.positions if p.symbol == symbol)
 
+    def _symbol_is_tradeable_now(self, symbol: str) -> bool:
+        """
+        True si `symbol` tiene una cotizacion operable AHORA MISMO (bid/ask
+        validos) y no hay ya una orden en vigilancia sobre esa base - mismo
+        criterio exacto que _act_on_exit_signal/_act_on_naked_short_wing_exit_signal
+        usan antes de intentar ejecutar. Inyectado en
+        ggal_bot.risk.invariants.naked_short_wing_violation (Tarea #27 item
+        4) para decidir si una pata corta se puede recubrir ESTE ciclo.
+        """
+        quote = self.option_chain.get(symbol)
+        if quote is None or quote.book.bid <= 0 or quote.book.ask <= 0:
+            return False
+        return not self.mid_price_exec.has_open_order_for(symbol)
+
     def _log_guard2(
         self, *, caller: str, symbol: str, strategy_tag: str, existing_quantity: float,
         reason: str, blocked: bool,
@@ -1971,6 +2005,43 @@ class GgalOptionsBot:
         if self.mid_price_exec.has_open_order_for(signal.symbol):
             logger.debug("Salida %s pospuesta: ya hay una orden en vigilancia sobre esa base.", signal.symbol)
             return
+
+        # Invariantes duros de posicion (Tarea #27 item 4, ver
+        # ggal_bot/risk/invariants.py) - ultima linea de defensa, nunca
+        # deberian dispararse en el camino normal, pero si lo hacen,
+        # BLOQUEAN la orden y alertan en vez de dejarla pasar.
+        if SETTINGS.risk.enforce_position_invariants:
+            confirmed_long = invariants.confirmed_long_quantity(self.portfolio, signal.symbol, strategy_tag)
+            # INVARIANTE 1: solo se bloquea para partial_profit_take - ese
+            # motivo SI es una cantidad exacta que nunca deberia exceder lo
+            # confirmado (pedirlo seria un bug real). Un cierre TOTAL
+            # (cualquier otro motivo) puede legitimamente pedir "cerrar todo"
+            # con una cantidad nominal mayor a la disponible - el bucle de
+            # abajo ya la recorta de forma segura lote por lote (fix de
+            # over-close de Fase 5.3, nunca deja una Position negativa), asi
+            # que no hay nada que bloquear ahi.
+            violation = None
+            if getattr(signal, "reason", "") == "partial_profit_take":
+                violation = invariants.long_only_net_short_violation(
+                    self.portfolio, signal.symbol, strategy_tag, signal.quantity,
+                )
+            # INVARIANTE 2: se evalua contra lo que REALMENTE se va a reducir
+            # (recortado a lo confirmado, igual criterio que el bucle de
+            # abajo), no contra `signal.quantity` crudo - evita falsos
+            # positivos en un cierre total "de sobra".
+            if violation is None:
+                effective_reduce = min(signal.quantity, confirmed_long) if confirmed_long > 0 else 0.0
+                violation = invariants.naked_short_wing_violation(
+                    self.portfolio, signal.symbol, strategy_tag, effective_reduce,
+                    wing_is_closable_now=self._symbol_is_tradeable_now,
+                )
+            if violation is not None:
+                logger.error("INVARIANTE DE RIESGO VIOLADA - orden bloqueada: %s", violation)
+                self.position_event_journal.log_event(
+                    "REJECT", symbol=signal.symbol, strategy_tag=strategy_tag,
+                    side="sell", reason=f"position_invariant_violation: {violation}",
+                )
+                return
 
         # INSTRUMENTACION DE CALIDAD DE EJECUCION (TANDA 2 "OPTIMIZACION
         # EJECUTABLE", seccion 9, 2026-09-08): a diferencia del path de

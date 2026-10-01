@@ -451,6 +451,20 @@ class RiskConfig:
     # horario con MockReplaySource a proposito).
     enforce_market_hours_gate: bool = _env_bool("GGAL_BOT_ENFORCE_MARKET_HOURS_GATE", True)
 
+    # --- Invariantes duros de posicion (Tarea #27 item 4, a pedido explicito ---
+    # --- del usuario, 2026-10-01) ---------------------------------------------
+    # "agregá límites duros de delta por estrategia y de cartera... una
+    # estrategia long-only nunca puede quedar neta corta en un contrato;
+    # ninguna pata corta puede quedar sin su pata larga. Si se viola,
+    # bloquear la orden y alertar" - ver ggal_bot/risk/invariants.py.
+    # Default True: guarda de riesgo (misma categoria que
+    # enforce_market_hours_gate arriba, el kill switch, y las guardias de
+    # staleness), no una estrategia nueva - dejarla apagada por defecto
+    # dejaria sin corregir el bug URGENTE que la motiva (GFGV5000OC, pata
+    # corta descubierta). Configurable igual, para poder desactivarla
+    # explicitamente (ej. debugging local).
+    enforce_position_invariants: bool = _env_bool("GGAL_BOT_ENFORCE_POSITION_INVARIANTS", True)
+
     # --- Presupuesto PREVENTIVO de Griegas por entrada (MEJORA 2026-09-28) ---
     # A pedido explicito del usuario ("mejor trader quant... presupuesto de
     # riesgo agregado en vez de esperar al muro duro"): hasta esta mejora, el

@@ -141,6 +141,33 @@ def test_close_position_manually_supports_explicit_partial_close(tmp_path):
     assert row["quantity"].iloc[0] == pytest.approx(5.0)
 
 
+def test_close_position_manually_rejects_explicit_quantity_that_would_go_net_short(tmp_path):
+    """
+    Tarea #27 item 4 (invariante 1, ggal_bot/risk/invariants.py): a
+    diferencia de run_bot.py::_act_on_exit_signal (que siempre recorta de
+    forma segura), esta herramienta escribe el fill tal cual se le pide -
+    un --quantity explicito mayor a la posicion neta real dejaria una
+    posicion NETA CORTA fabricada a mano. Debe rechazarse.
+    """
+    csv_path = tmp_path / "shadow_trades.csv"
+    _write_fill(csv_path, symbol="GFGC7600OC", side="buy", quantity=17.0, price=500.0, ts="2026-09-01T10:00:00.123456+00:00")
+
+    with pytest.raises(ValueError, match="posicion NETA CORTA"):
+        close_position_manually(
+            "GFGC7600OC", 612.5, quantity=25.0, side=OrderSide.SELL, csv_path=csv_path,
+        )
+
+
+def test_close_position_manually_rejects_sell_when_symbol_already_flat(tmp_path):
+    csv_path = tmp_path / "shadow_trades.csv"
+    csv_path.write_text("")
+
+    with pytest.raises(ValueError, match="posicion NETA CORTA"):
+        close_position_manually(
+            "GFGC9999OC", 100.0, quantity=5.0, side=OrderSide.SELL, csv_path=csv_path,
+        )
+
+
 ALL_TESTS = [
     test_determine_close_order_detects_sell_needed_for_a_long_option_position,
     test_determine_close_order_detects_buy_needed_for_a_short_underlying_position,
