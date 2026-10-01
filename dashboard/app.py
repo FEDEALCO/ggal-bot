@@ -51,6 +51,7 @@ from dashboard.data import market_data as dmd  # noqa: E402
 from dashboard.data import funnel as dfn  # noqa: E402
 from dashboard.data import ccl_bonds as dcb  # noqa: E402
 from dashboard.data import market_hours_quality as mhq  # noqa: E402
+from dashboard.data import shadow_reset as dsr  # noqa: E402
 
 st.set_page_config(page_title="GGAL BOT — Dashboard", layout="wide", page_icon="📈")
 
@@ -186,6 +187,17 @@ if not open_positions_marked.empty:
     open_positions_marked = mhq.flag_open_positions_outside_session(open_positions_marked)
 _outside_session_summary = mhq.summarize_outside_session_impact(closed_df)
 
+# MEJORA 2026-10-01 (Tarea #27 item 5, a pedido explicito del usuario: "El
+# dashboard y los reportes tienen que separar el PnL antes/despues del
+# reset"). Ver dashboard/data/shadow_reset.py para el detalle completo: el
+# corte es el evento SHADOW_RESET mas reciente en el journal (None si
+# todavia no se disparo ese flag - el caso normal). closed_df se reusa tal
+# cual (sin filtrar por la sidebar todavia) para que el corte, igual que el
+# panel de Reconciliacion, no dependa de lo que el usuario eligio mirar.
+_shadow_reset_ts = dsr.most_recent_shadow_reset_timestamp(position_events_df_raw)
+_shadow_reset_summary = dsr.summarize_pnl_before_after_reset(closed_df, open_positions_marked, _shadow_reset_ts)
+closed_df = dsr.tag_closed_trades_with_reset_period(closed_df, _shadow_reset_ts)
+
 
 def _apply_filters(df: pd.DataFrame, symbol_col: str = "symbol") -> pd.DataFrame:
     if df.empty:
@@ -241,6 +253,42 @@ else:
         "todavia (deploy anterior a esta mejora, o el archivo no existe/esta vacio). "
         "No asumir shadow ni vivo - verificar manualmente antes de operar sobre esta informacion."
     )
+
+# MEJORA 2026-10-01 (Tarea #27 item 5, a pedido explicito del usuario). Si
+# ya se disparo GGAL_BOT_SHADOW_RESET_ON_START alguna vez, el PnL Total de
+# abajo (que suma TODO el historico, incluido lo previo al reset) puede
+# confundir - este banner + fila de KPIs aislan lo que paso DESPUES del
+# ultimo reset (el periodo "limpio", sin el arrastre de fills sinteticos de
+# los items 1/2 del mismo pedido) de lo anterior (que se mantiene visible,
+# nunca se borra del dashboard, pero separado). Si nunca hubo un
+# SHADOW_RESET en el journal, no se muestra nada aca - ver docstring de
+# dashboard/data/shadow_reset.py.
+if _shadow_reset_summary["has_reset"]:
+    st.warning(
+        f"🔄 **Reset del shadow aplicado** el `{_shadow_reset_summary['reset_timestamp']}` "
+        "(evento `SHADOW_RESET` en el journal, Tarea #27 item 5 - posiciones shadow abiertas "
+        "cerradas administrativamente al mid vigente porque estaban contaminadas por fills "
+        "sinteticos / position_id fragmentados por restarts, ver items 1-2 del mismo pedido). "
+        "El PnL Total de las KPIs de abajo sigue sumando TODO el historico; estas tres tarjetas "
+        "separan lo de ANTES (descartable para evaluar la estrategia) de lo de DESPUES (periodo limpio)."
+    )
+    kpi_reset_row = st.columns(3)
+    kpi_reset_row[0].metric(
+        "PnL realizado ANTES del reset (ARS)",
+        f"$ {_shadow_reset_summary['pnl_realized_before_ars']:,.2f}",
+        delta=f"{_shadow_reset_summary['n_trades_before']} trades · periodo descartado",
+    )
+    kpi_reset_row[1].metric(
+        "PnL realizado DESPUES del reset (ARS)",
+        f"$ {_shadow_reset_summary['pnl_realized_after_ars']:,.2f}",
+        delta=f"{_shadow_reset_summary['n_trades_after']} trades · periodo limpio",
+    )
+    kpi_reset_row[2].metric(
+        "PnL DESPUES del reset, total (ARS)",
+        f"$ {_shadow_reset_summary['pnl_after_total_ars']:,.2f}",
+        delta=f"No realizado $ {_shadow_reset_summary['pnl_unrealized_ars']:,.2f}",
+    )
+    st.divider()
 
 kpi_row1 = st.columns(4)
 kpi_row1[0].metric(
@@ -651,19 +699,30 @@ with tab_closed:
         display["pnl_ars"] = display["pnl_ars"].round(2)
         display["pnl_pct"] = display["pnl_pct"].round(2)
         display["holding_seconds"] = display["holding_seconds"].round(0)
+        # MEJORA 2026-10-01 (Tarea #27 item 5): columna "Periodo" solo se
+        # muestra si alguna vez hubo un SHADOW_RESET en el journal - sin
+        # eso, todas las filas dirian lo mismo (dsr.NO_RESET_LABEL) y la
+        # columna no aportaria nada.
+        _reset_columns = ["symbol", "strategy", "direction", "quantity", "entry_time", "entry_outside_session",
+                           "exit_time", "exit_outside_session", "entry_price", "exit_price", "pnl_ars", "pnl_pct",
+                           "holding_seconds"]
+        _reset_rename = {
+            "symbol": "Ticker", "strategy": "Estrategia", "direction": "Direccion",
+            "quantity": "Cantidad", "entry_time": "Entrada",
+            "entry_outside_session": "Entrada fuera de horario", "exit_time": "Salida",
+            "exit_outside_session": "Salida fuera de horario",
+            "entry_price": "Precio Entrada", "exit_price": "Precio Salida",
+            "pnl_ars": "PnL ($)", "pnl_pct": "PnL (%)", "holding_seconds": "Duracion (s)",
+        }
+        if _shadow_reset_summary["has_reset"] and "reset_period" in display.columns:
+            display["reset_period"] = display["reset_period"].map({
+                dsr.BEFORE_RESET_LABEL: "Antes del reset",
+                dsr.AFTER_RESET_LABEL: "Despues del reset",
+            }).fillna(display["reset_period"])
+            _reset_columns = _reset_columns + ["reset_period"]
+            _reset_rename["reset_period"] = "Periodo"
         st.dataframe(
-            display[[
-                "symbol", "strategy", "direction", "quantity", "entry_time", "entry_outside_session",
-                "exit_time", "exit_outside_session", "entry_price", "exit_price", "pnl_ars", "pnl_pct",
-                "holding_seconds",
-            ]].rename(columns={
-                "symbol": "Ticker", "strategy": "Estrategia", "direction": "Direccion",
-                "quantity": "Cantidad", "entry_time": "Entrada",
-                "entry_outside_session": "Entrada fuera de horario", "exit_time": "Salida",
-                "exit_outside_session": "Salida fuera de horario",
-                "entry_price": "Precio Entrada", "exit_price": "Precio Salida",
-                "pnl_ars": "PnL ($)", "pnl_pct": "PnL (%)", "holding_seconds": "Duracion (s)",
-            }),
+            display[_reset_columns].rename(columns=_reset_rename),
             width="stretch", hide_index=True,
         )
 
