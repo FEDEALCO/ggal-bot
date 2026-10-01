@@ -1240,6 +1240,20 @@ class LiveShadowFeed:
         self._consecutive_failures = 0
         self._last_reprobe_at: Optional[float] = None
 
+    @property
+    def active_source_name(self) -> str:
+        """
+        Nombre de la clase de la fuente activa en este momento (ej.
+        "MockReplaySource", "Data912RestSource") - MEJORA 2026-10-01,
+        a pedido explicito del usuario, ver RiskConfig.
+        enforce_market_hours_gate: run_bot.py usa esto para saber si el
+        dato que esta por usar es 100% sintetico (MockReplaySource, sin
+        ningun concepto de horario de rueda) y, en ese caso, tratarlo igual
+        que "fuera de horario" aunque el reloj diga que la rueda esta
+        abierta - los datos siguen siendo fabricados, no reales.
+        """
+        return type(self._source).__name__
+
     # -- Seleccion de fuente / failover -------------------------------------
 
     @staticmethod

@@ -412,6 +412,45 @@ class RiskConfig:
         _env_float("GGAL_BOT_STALE_QUOTE_WARNING_SECONDS", 300.0) or None
     )
 
+    # --- Gate de horario de rueda (MEJORA 2026-10-01, URGENTE a pedido
+    # explicito del usuario) ---
+    # VERIFICADO contra datos reales de produccion (247 de 1183 fills en
+    # shadow_trades.csv con timestamp fuera de 11:00-17:00 ART Lun-Vie, ver
+    # ggal_bot/market_hours.py para el detalle completo y un caso concreto
+    # con ~ARS 420.000 de PnL fabricado en 23 minutos sobre GFGC6600OC):
+    # fuera de horario, las fuentes reales de datos devuelven correctamente
+    # puntas vacias, pero el failover automatico de LiveShadowFeed (pensado
+    # como red de seguridad para una caida REAL de la fuente durante la
+    # rueda, ver ShadowConfig.source_failure_threshold) termina activando
+    # MockReplaySource - un generador 100% sintetico sin ningun concepto de
+    # horario de rueda, que corre 24/7. Con este flag en True (default), el
+    # ciclo principal (run_bot.py:GgalOptionsBot.recompute_cycle) NO evalua
+    # entradas/salidas/hedge cuando ggal_bot.market_hours.is_within_byma_
+    # session() es False, O cuando la fuente activa en modo shadow es
+    # MockReplaySource (aunque el reloj diga que es horario de rueda - los
+    # datos siguen siendo fabricados, no reales).
+    #
+    # ESTO NO CONTRADICE la guardia de arriba (max_market_data_staleness_
+    # seconds, "las SALIDAS... siguen evaluandose con la ultima punta
+    # conocida" durante una caida transitoria DENTRO de la rueda): ese
+    # diseño sigue vigente sin cambios para su caso de uso original (datos
+    # REALES levemente viejos por un corte momentaneo de red). Este flag
+    # cubre un escenario categoricamente distinto: no hay rueda en
+    # absoluto (noche/fin de semana), o el dato activo es DIRECTAMENTE
+    # fabricado (Mock) - ahi "seguir gestionando con lo ultimo conocido" ya
+    # no es prudente, es la causa raiz del PnL ficticio detectado.
+    #
+    # Default True (a diferencia de los flags "nuevos" de este archivo que
+    # preservan comportamiento apagados por defecto): esto es una guardia
+    # de riesgo/correctitud, misma categoria que el kill switch y las
+    # guardias de staleness de arriba (siempre activas), no una estrategia
+    # nueva que pueda introducir riesgo - dejarla apagada por defecto
+    # dejaria el bug URGENTE reportado sin corregir hasta que alguien la
+    # prenda a mano. Configurable igual, para poder desactivarla
+    # explicitamente si hiciera falta (ej. debugging local fuera de
+    # horario con MockReplaySource a proposito).
+    enforce_market_hours_gate: bool = _env_bool("GGAL_BOT_ENFORCE_MARKET_HOURS_GATE", True)
+
     # --- Presupuesto PREVENTIVO de Griegas por entrada (MEJORA 2026-09-28) ---
     # A pedido explicito del usuario ("mejor trader quant... presupuesto de
     # riesgo agregado en vez de esperar al muro duro"): hasta esta mejora, el

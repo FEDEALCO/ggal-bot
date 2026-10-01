@@ -33,6 +33,7 @@ from datetime import date, datetime, timezone
 from typing import Dict, List, Optional
 
 from ggal_bot.config import SETTINGS, VALID_STRATEGIES
+from ggal_bot import market_hours
 from ggal_bot.paths import LOG_FILE
 from ggal_bot.data.market_data_feed import MarketDataFeed
 from ggal_bot.data.live_shadow_feed import LiveShadowFeed
@@ -512,6 +513,9 @@ class GgalOptionsBot:
         # RiskConfig.max_option_quote_staleness_seconds / recompute_cycle()):
         # evita repetir la alerta cada ciclo mientras haya opciones stale.
         self._option_staleness_logged = False
+        # Idem, para el gate de horario de rueda (MEJORA 2026-10-01, ver
+        # RiskConfig.enforce_market_hours_gate / recompute_cycle()).
+        self._market_hours_gate_logged = False
 
     # -- Callbacks de mercado ---------------------------------------------
 
@@ -577,6 +581,45 @@ class GgalOptionsBot:
         if staleness is None:
             return False
         return staleness > SETTINGS.risk.max_market_data_staleness_seconds
+
+    def _active_market_data_source_name(self) -> str:
+        """
+        Nombre de la fuente de datos activa este ciclo - "real" (broker/
+        pyRofex de verdad, modo no-shadow) o, en modo shadow, el nombre de
+        la clase de LiveShadowFeed._source (ej. "MockReplaySource",
+        "Data912RestSource"). Usado por _market_data_is_reliable_for_trading()
+        y en el log del gate de horario (MEJORA 2026-10-01).
+        """
+        if not self.shadow_mode:
+            return "real"
+        return self.market_feed.active_source_name
+
+    def _market_data_is_reliable_for_trading(self) -> bool:
+        """
+        Gate de horario de rueda (MEJORA 2026-10-01, URGENTE a pedido
+        explicito del usuario - ver RiskConfig.enforce_market_hours_gate y
+        ggal_bot/market_hours.py para la evidencia real completa). False si
+        no se debe evaluar NINGUNA entrada/salida/hedge este ciclo porque:
+
+          1. El flag esta desactivado explicitamente
+             (RiskConfig.enforce_market_hours_gate=False) - siempre True en
+             ese caso, comportamiento previo a esta mejora.
+          2. Estamos fuera de la rueda asumida (ggal_bot.market_hours.
+             is_within_byma_session(), 11:00-17:00 ART Lun-Vie, SUPUESTO no
+             verificado - ver docstring de ese modulo).
+          3. En modo shadow, la fuente activa es MockReplaySource (100%
+             sintetica, sin ningun concepto de horario de rueda) - AUNQUE
+             el reloj diga que es horario de rueda: si el failover
+             automatico cayo a Mock (ver ShadowConfig.source_failure_
+             threshold), el dato sigue siendo fabricado, no real.
+        """
+        if not SETTINGS.risk.enforce_market_hours_gate:
+            return True
+        if not market_hours.is_within_byma_session():
+            return False
+        if self.shadow_mode and self.market_feed.active_source_name == "MockReplaySource":
+            return False
+        return True
 
     def _is_earnings_blackout(self, today: date) -> bool:
         """
@@ -843,36 +886,59 @@ class GgalOptionsBot:
         if not self.kill_switch.is_tripped():
             self.kill_switch.evaluate(self.portfolio, SETTINGS.risk_limits, spot=spot)
 
-        if self.active_strategy_name == "vol_arbitrage":
-            all_signals = self._run_vol_arbitrage_cycle(spot)
-        elif self.active_strategy_name == "scalping":
-            # Seleccion EXCLUYENTE (ver VALID_STRATEGIES en config.py):
-            # ni weekly_asymmetric ni vol_arbitrage corren en absoluto bajo
-            # este valor - self.strategy es None (ver __init__), asi que
-            # ninguna de esas dos ramas puede llamarse aca. El ciclo de
-            # scalping en si se dispara mas abajo, igual que en modo
-            # aditivo (self.scalping_enabled esta FORZADO a True en
-            # __init__ cuando active_strategy_name=="scalping").
-            all_signals = []
+        # Gate de horario de rueda (MEJORA 2026-10-01, URGENTE - ver
+        # RiskConfig.enforce_market_hours_gate y ggal_bot/market_hours.py
+        # para el detalle completo y la evidencia real que lo motivo).
+        # Deliberadamente UN SOLO punto de corte para entradas+salidas+hedge
+        # de las 3 estrategias, en vez de tocar cada evaluate_position_exit()
+        # por separado: evita entradas Y salidas basadas en un precio
+        # fabricado/no vigente, sin alterar la guardia de staleness existente
+        # (max_market_data_staleness_seconds), que sigue cubriendo su caso
+        # original (una caida REAL y transitoria de la fuente DURANTE la
+        # rueda - ver docstring de esa guardia en config.py).
+        if not self._market_data_is_reliable_for_trading():
+            if not self._market_hours_gate_logged:
+                logger.info(
+                    "Fuera de horario de rueda o fuente de datos sintetica (%s): se omite "
+                    "evaluacion de entradas/salidas/hedge este ciclo (spot=%.4f). No vuelve a "
+                    "logearse hasta que la condicion cambie.",
+                    self._active_market_data_source_name(), spot,
+                )
+                self._market_hours_gate_logged = True
+            all_signals: List[object] = []
         else:
-            all_signals = self._run_weekly_asymmetric_cycle(spot)
+            self._market_hours_gate_logged = False
+            if self.active_strategy_name == "vol_arbitrage":
+                all_signals = self._run_vol_arbitrage_cycle(spot)
+            elif self.active_strategy_name == "scalping":
+                # Seleccion EXCLUYENTE (ver VALID_STRATEGIES en config.py):
+                # ni weekly_asymmetric ni vol_arbitrage corren en absoluto bajo
+                # este valor - self.strategy es None (ver __init__), asi que
+                # ninguna de esas dos ramas puede llamarse aca. El ciclo de
+                # scalping en si se dispara mas abajo, igual que en modo
+                # aditivo (self.scalping_enabled esta FORZADO a True en
+                # __init__ cuando active_strategy_name=="scalping").
+                all_signals = []
+            else:
+                all_signals = self._run_weekly_asymmetric_cycle(spot)
 
-        # Modulo de Scalping Intradia (ver ScalpingConfig/
-        # GGAL_BOT_ENABLE_SCALPING y el comentario largo en __init__): con
-        # GGAL_BOT_ACTIVE_STRATEGY=scalping corre como estrategia PRINCIPAL
-        # (self.scalping_enabled forzado a True en __init__, la rama de
-        # arriba ya dejo all_signals=[]); en cualquier otro caso, sigue
-        # siendo el modulo ADITIVO original que corre SIEMPRE DESPUES de la
-        # estrategia principal, nunca en su lugar - con el flag apagado
-        # (default) esta llamada es un no-op completo.
-        if self.scalping_enabled:
-            all_signals.extend(self._run_scalping_cycle(spot))
+            # Modulo de Scalping Intradia (ver ScalpingConfig/
+            # GGAL_BOT_ENABLE_SCALPING y el comentario largo en __init__): con
+            # GGAL_BOT_ACTIVE_STRATEGY=scalping corre como estrategia PRINCIPAL
+            # (self.scalping_enabled forzado a True en __init__, la rama de
+            # arriba ya dejo all_signals=[]); en cualquier otro caso, sigue
+            # siendo el modulo ADITIVO original que corre SIEMPRE DESPUES de la
+            # estrategia principal, nunca en su lugar - con el flag apagado
+            # (default) esta llamada es un no-op completo.
+            if self.scalping_enabled:
+                all_signals.extend(self._run_scalping_cycle(spot))
 
         totals = self.portfolio.total_greeks()
         if self.risk_manager.should_halt_new_positions(totals):
             logger.warning(self.risk_manager.breach_report(totals))
 
-        self._maybe_hedge(totals, spot)
+        if self._market_data_is_reliable_for_trading():
+            self._maybe_hedge(totals, spot)
 
         # Vigilancia de ordenes abiertas: timeout, slippage y movimiento del subyacente.
         self.mid_price_exec.monitor_and_reprice(self._current_option_books(), spot)

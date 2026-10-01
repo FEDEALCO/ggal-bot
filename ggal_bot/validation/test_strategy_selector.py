@@ -167,11 +167,21 @@ def test_scalping_exclusive_selection_recompute_cycle_never_calls_other_strategi
     market_feed.poll() se reemplaza por un no-op para no pegarle a la red
     real de data912.com en este test (mismo criterio que el resto de la
     suite, que nunca llama a recompute_cycle() directamente por esto mismo).
+
+    enforce_market_hours_gate se desactiva aca (MEJORA 2026-10-01, ver
+    RiskConfig.enforce_market_hours_gate): este test corre a la hora real
+    del sandbox (puede caer fuera de 11:00-17:00 ART) y, sin red, el
+    LiveShadowFeed de este bot cae a MockReplaySource - cualquiera de las
+    dos cosas activaria el gate nuevo y dejaria scalping_calls en 0 sin que
+    eso tenga nada que ver con lo que este test verifica (el dispatch por
+    estrategia activa, no el horario de rueda).
     """
     original_strategy = SETTINGS.strategy.active
     original_shadow = SETTINGS.shadow.enabled
+    original_gate = SETTINGS.risk.enforce_market_hours_gate
     SETTINGS.strategy.active = "scalping"
     SETTINGS.shadow.enabled = True
+    SETTINGS.risk.enforce_market_hours_gate = False
     try:
         bot = GgalOptionsBot()
         bot.market_feed.poll = lambda *_a, **_kw: None
@@ -200,6 +210,7 @@ def test_scalping_exclusive_selection_recompute_cycle_never_calls_other_strategi
     finally:
         SETTINGS.strategy.active = original_strategy
         SETTINGS.shadow.enabled = original_shadow
+        SETTINGS.risk.enforce_market_hours_gate = original_gate
 
 
 # ---------------------------------------------------------------------------
