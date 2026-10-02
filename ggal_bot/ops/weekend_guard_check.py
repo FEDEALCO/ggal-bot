@@ -46,6 +46,30 @@ Northflank):
 Sin --friday, usa el viernes mas reciente (hoy mismo si hoy es viernes).
 Exit code 0 si no se encontraron violaciones, 1 si se encontro al menos una
 (para poder encadenarlo en un script/cron que avise por su propio canal).
+
+ACTUALIZACION 2026-10-02 (a pedido explicito del usuario, tras el hallazgo
+en logs de produccion del 2026-10-02 - kill switch de cartera disparado:
+"Agregá a weekend_guard_check que distinga 'sin entradas porque el guard
+bloqueó' de 'sin entradas por kill switch u otra causa', leyendo los
+REJECT y el estado del kill switch. Si no, el lunes un OK no prueba nada"):
+
+El RESULTADO OK original (ninguna entrada CONFIRMADA que violara el guard)
+es necesario pero NO suficiente: si el kill switch ya estaba disparado, o
+si el limite de Griegas (duro o preventivo) ya frenaba toda entrada nueva
+de weekly_asymmetric ese mismo viernes, NINGUNA señal habria llegado a
+abrirse de todos modos, con o sin el weekend guard - un OK en ese escenario
+no es evidencia de que el guard haya hecho su trabajo, es solo ausencia de
+dato. El guard de fin de semana en si (weekend_theta_guard_block_new_entries)
+bloquea ANTES de que la señal se genere (ver
+strategy/weekly_asymmetric.py::scan_entry_signals) y por eso NUNCA deja un
+evento REJECT en el Event Journal - es, precisamente, esa ausencia la que
+permite la distincion: se buscan los REJECT de entrada (side="buy") de
+weekly_asymmetric ese viernes (kill_switch_tripped/greeks_limit_exceeded/
+greeks_budget_preemptive/unknown_greeks/sizing_not_tradeable - ver
+run_bot.py::_act_on_entry_signal) y el estado ACTUAL del kill switch
+(ultimo trip conocido, NO un historial completo - ver
+ggal_bot/risk/kill_switch.py, que solo persiste el ULTIMO trip) para
+avisar explicitamente cuando un OK no es una prueba real.
 """
 from __future__ import annotations
 
@@ -53,10 +77,26 @@ import argparse
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from ggal_bot.market_hours import ART_OFFSET_HOURS
-from ggal_bot.paths import POSITION_EVENTS_LOG
+from ggal_bot.paths import KILL_SWITCH_STATE_FILE, POSITION_EVENTS_LOG
+from ggal_bot.risk.kill_switch import KillSwitch, KillSwitchState
+
+# Prefijos REALES de reason= en los REJECT de ENTRADA (side="buy") que
+# run_bot.py::_act_on_entry_signal puede loguear - ver el modulo para cada
+# call site exacto. "weekend_entry_guard" DELIBERADAMENTE no esta en esta
+# lista: ese bloqueo ocurre ANTES de generar la señal (scan_entry_signals),
+# nunca llega a loguearse como REJECT - su ausencia total en el Event
+# Journal es justamente la señal que distingue "la bloqueo el guard" de
+# "nunca llego a intentarse".
+_ENTRY_REJECT_REASON_BUCKETS = {
+    "kill_switch_tripped": "kill_switch",
+    "greeks_limit_exceeded": "greeks_limit",
+    "greeks_budget_preemptive": "greeks_limit",
+    "unknown_greeks": "greeks_limit",
+    "sizing_not_tradeable": "sizing",
+}
 
 
 class WeekendGuardCheckUnavailable(RuntimeError):
@@ -173,7 +213,87 @@ def entries_without_expiry_on_friday(
     return candidates.drop(columns=["_art_date"])
 
 
-def format_report(violations: List[WeekendGuardViolation], friday: date, unknown_count: int) -> str:
+def find_entry_rejects_on_day(
+    position_events_df, day: date, strategy_tag: str = "weekly_asymmetric",
+):
+    """
+    Eventos REJECT de ENTRADA (side="buy") de `strategy_tag` cuyo timestamp
+    cae en `day` (calendario ART) - a diferencia de
+    find_friday_entries_that_should_have_been_blocked() (que mira ENTRY ya
+    CONFIRMADOS), esto captura señales que ni siquiera llegaron a abrirse,
+    por cualquier motivo DISTINTO del weekend guard (ver
+    _ENTRY_REJECT_REASON_BUCKETS y el docstring del modulo para por que el
+    guard en si nunca aparece aca).
+    """
+    if position_events_df.empty:
+        return position_events_df
+    df = position_events_df
+    mask = (
+        (df["event_type"] == "REJECT")
+        & (df["strategy_tag"] == strategy_tag)
+        & (df["side"] == "buy")
+    )
+    candidates = df[mask]
+    if candidates.empty:
+        return candidates
+    return candidates[candidates["timestamp_utc"].apply(_to_art_date) == day]
+
+
+def _reject_reason_bucket(reason: str) -> str:
+    prefix = reason.split(":", 1)[0].strip() if reason else ""
+    return _ENTRY_REJECT_REASON_BUCKETS.get(prefix, "other")
+
+
+def summarize_entry_rejects(rejects_df) -> Dict[str, int]:
+    """{bucket: cantidad} de los REJECT de entrada pasados - ver
+    _reject_reason_bucket. Dict vacio si no hay ninguno."""
+    counts: Dict[str, int] = {}
+    if rejects_df.empty:
+        return counts
+    for reason in rejects_df["reason"].fillna(""):
+        bucket = _reject_reason_bucket(str(reason))
+        counts[bucket] = counts.get(bucket, 0) + 1
+    return counts
+
+
+def kill_switch_status_note(friday: date, kill_switch_state: Optional[KillSwitchState]) -> Optional[str]:
+    """
+    Texto de advertencia si el ULTIMO trip CONOCIDO del kill switch cae en
+    o antes de `friday` - `kill_switch_state` solo guarda el trip mas
+    reciente (ver ggal_bot/risk/kill_switch.py: nunca un historial
+    completo), asi que esto NUNCA afirma que estuvo disparado TODO el dia,
+    solo que hay evidencia parcial de que pudo estarlo. None si el kill
+    switch no esta disparado, o si su ultimo trip conocido es POSTERIOR a
+    `friday` (no es evidencia relevante para ese dia en particular).
+    """
+    if kill_switch_state is None or not kill_switch_state.tripped:
+        return None
+    tripped_at_date: Optional[date] = None
+    if kill_switch_state.tripped_at:
+        try:
+            tripped_at_date = _to_art_date(datetime.fromisoformat(kill_switch_state.tripped_at))
+        except ValueError:
+            tripped_at_date = None
+    if tripped_at_date is not None and tripped_at_date > friday:
+        return None
+    since = f", desde {tripped_at_date.isoformat()} (ART)" if tripped_at_date else " (fecha de disparo desconocida)"
+    return (
+        f"Kill switch ACTUALMENTE disparado ({kill_switch_state.tripped_by}: {kill_switch_state.reason})"
+        f"{since}. Esto es el estado ACTUAL/ultimo conocido, NO un historial completo del "
+        "viernes evaluado - si cubrio ese dia, un RESULTADO OK de arriba no prueba que el "
+        "weekend guard haya sido la causa real de la ausencia de entradas."
+    )
+
+
+def format_report(
+    violations: List[WeekendGuardViolation],
+    friday: date,
+    unknown_count: int,
+    reject_counts: Optional[Dict[str, int]] = None,
+    kill_switch_note: Optional[str] = None,
+    kill_switch_state_available: bool = True,
+) -> str:
+    reject_counts = reject_counts or {}
     lines = [f"Chequeo weekend guard - viernes {friday.isoformat()} (ART)"]
     if not violations:
         lines.append(
@@ -195,7 +315,49 @@ def format_report(violations: List[WeekendGuardViolation], friday: date, unknown
             "seteado en el deploy (default False - sin el env var explicito, el codigo ya "
             "soporta el fix pero no esta activo)."
         )
+
+    # NUEVO 2026-10-02 (ver docstring del modulo): distingue "sin entradas
+    # porque el guard bloqueo" de "sin entradas por kill switch u otra
+    # causa" - un OK de arriba, por si solo, no alcanza para probar que el
+    # guard funciono.
+    total_rejects = sum(reject_counts.values())
+    lines.append("")
+    if total_rejects:
+        lines.append(
+            f"ATENCION: {total_rejects} señal(es) de ENTRADA de weekly_asymmetric fueron "
+            "RECHAZADAS ese mismo viernes por motivos AJENOS al weekend guard (el guard "
+            "bloquea ANTES de generar la señal, nunca deja un REJECT - ver docstring del "
+            "modulo):"
+        )
+        for bucket, count in sorted(reject_counts.items()):
+            lines.append(f"  - {bucket}: {count}")
+        lines.append(
+            "Un RESULTADO OK de arriba, en presencia de estos rechazos, NO prueba que el "
+            "weekend guard haya sido la causa de la ausencia de entradas - pudo ser "
+            "cualquiera de estos otros motivos actuando primero, con o sin el guard."
+        )
+    elif not violations:
+        lines.append(
+            "Sin señales de ENTRADA rechazadas por otro motivo ese viernes (segun el Event "
+            "Journal) - hasta donde este chequeo puede ver, el RESULTADO OK de arriba es "
+            "evidencia real, no un silencio sin explicacion."
+        )
+
+    if kill_switch_state_available:
+        if kill_switch_note:
+            lines.append("")
+            lines.append(kill_switch_note)
+    else:
+        lines.append("")
+        lines.append(
+            "NOTA: no se encontro el archivo de estado del kill switch en este entorno - no "
+            "se pudo verificar si estuvo disparado ese viernes (correr este chequeo dentro "
+            "del mismo contenedor/volumen de Northflank, o pasar --kill-switch-state, para "
+            "incluir esa verificacion)."
+        )
+
     if unknown_count:
+        lines.append("")
         lines.append(
             f"NOTA: {unknown_count} entrada(s) de weekly_asymmetric ese viernes sin "
             "contract_key parseable (dato no disponible) - no se pudieron evaluar, revisar a mano."
@@ -214,20 +376,46 @@ def _load_position_events(csv_path):
     return load_position_events(csv_path)
 
 
-def run_check(position_events_csv: Optional[Path] = None, friday: Optional[date] = None) -> int:
+def _load_kill_switch_state(path: Path) -> Optional[KillSwitchState]:
+    """None si el archivo de estado no existe en este entorno (ej. corriendo
+    el chequeo contra un CSV descargado, fuera del volumen de Northflank) -
+    se distingue explicitamente de "no disparado" (ver format_report,
+    `kill_switch_state_available`), nunca se asume lo segundo sin evidencia."""
+    if not path.exists():
+        return None
+    return KillSwitch(path=path).status()
+
+
+def run_check(
+    position_events_csv: Optional[Path] = None,
+    friday: Optional[date] = None,
+    kill_switch_state_path: Optional[Path] = None,
+) -> int:
     """
     Corre el chequeo completo e imprime el reporte. Devuelve el exit code
     (0 = OK, 1 = se encontraron violaciones) para uso en linea de comandos
-    o encadenado en otro script.
+    o encadenado en otro script - el exit code sigue midiendo SOLO
+    violaciones confirmadas del guard (comportamiento preexistente, sin
+    cambios); la distincion nueva de REJECT/kill switch es informativa, en
+    el texto del reporte (ver docstring del modulo).
     """
     path = position_events_csv if position_events_csv is not None else POSITION_EVENTS_LOG
     target_friday = friday if friday is not None else most_recent_friday()
+    ks_path = kill_switch_state_path if kill_switch_state_path is not None else KILL_SWITCH_STATE_FILE
 
     position_events_df = _load_position_events(path)
     violations = find_friday_entries_that_should_have_been_blocked(position_events_df, target_friday)
     unknown = entries_without_expiry_on_friday(position_events_df, target_friday)
+    reject_df = find_entry_rejects_on_day(position_events_df, target_friday)
+    reject_counts = summarize_entry_rejects(reject_df)
+    ks_state = _load_kill_switch_state(ks_path)
+    ks_note = kill_switch_status_note(target_friday, ks_state) if ks_state is not None else None
 
-    print(format_report(violations, target_friday, len(unknown)))
+    print(format_report(
+        violations, target_friday, len(unknown),
+        reject_counts=reject_counts, kill_switch_note=ks_note,
+        kill_switch_state_available=ks_state is not None,
+    ))
     return 1 if violations else 0
 
 
@@ -235,11 +423,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--position-events", default=str(POSITION_EVENTS_LOG), help="Ruta a position_events.csv")
     parser.add_argument("--friday", default=None, help="YYYY-MM-DD (ART). Default: el viernes mas reciente.")
+    parser.add_argument(
+        "--kill-switch-state", default=str(KILL_SWITCH_STATE_FILE),
+        help="Ruta a kill_switch.json (default: state/kill_switch.json). Ausente = no disponible, nunca se asume 'no disparado'.",
+    )
     args = parser.parse_args(argv)
 
     friday = date.fromisoformat(args.friday) if args.friday else None
     try:
-        return run_check(Path(args.position_events), friday)
+        return run_check(Path(args.position_events), friday, Path(args.kill_switch_state))
     except WeekendGuardCheckUnavailable as exc:
         print(f"ERROR: {exc}")
         return 2
