@@ -33,10 +33,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import TYPE_CHECKING, Callable, Dict, Optional
 
 from ggal_bot.config import SETTINGS
 from ggal_bot import paths
+
+if TYPE_CHECKING:  # evita el import real en runtime (ver source_name_provider abajo)
+    from ggal_bot.data.market_data_source_log import MarketDataSourceLogger
 from ggal_bot.data.option_chain import OrderBookSnapshot
 
 logger = logging.getLogger("ggal_bot.order_gateway")
@@ -433,10 +436,39 @@ class ShadowAuditLogger:
         "bid_at_fill", "ask_at_fill", "mid_at_fill",
     ]
 
-    def __init__(self, path: Optional[Path] = None):
+    def __init__(
+        self,
+        path: Optional[Path] = None,
+        source_name_provider: Optional[Callable[[], str]] = None,
+        market_data_source_log: Optional["MarketDataSourceLogger"] = None,
+    ):
+        """
+        `source_name_provider`/`market_data_source_log`: MEJORA 2026-10-02
+        (Tarea #27/#28 item 3(b), a pedido explicito del usuario) - si ambos
+        se pasan, cada log_fill()/log_cancel() registra ADEMAS, en un
+        archivo separado (ver ggal_bot/data/market_data_source_log.py para
+        el por que de un archivo nuevo y no una columna en este mismo CSV),
+        cual era la fuente de datos activa en ese instante
+        (`source_name_provider()`, tipicamente GgalOptionsBot.
+        _active_market_data_source_name). Ambos opcionales (default None)
+        para no romper ningun caller/test existente que construya
+        ShadowAuditLogger directamente sin pasarlos.
+        """
         self._path = Path(path) if path is not None else paths.SHADOW_TRADES_LOG
         self._lock = threading.Lock()
+        self._source_name_provider = source_name_provider
+        self._market_data_source_log = market_data_source_log
         self._ensure_header()
+
+    def _log_active_source(self, context: str, correlation_id: str) -> None:
+        if self._source_name_provider is None or self._market_data_source_log is None:
+            return
+        try:
+            source_name = self._source_name_provider()
+        except Exception as exc:  # noqa: BLE001 - nunca debe tumbar el fill real ya registrado
+            logger.warning("ShadowAuditLogger: source_name_provider() lanzo una excepcion (%s); se omite el registro de fuente.", exc)
+            return
+        self._market_data_source_log.log_source(context, correlation_id, source_name)
 
     def _ensure_header(self) -> None:
         with self._lock:
@@ -456,12 +488,14 @@ class ShadowAuditLogger:
             request.price, fill_price, reference_price, "shadow_fill",
             bid_at_fill, ask_at_fill, mid_at_fill,
         ])
+        self._log_active_source("shadow_fill", request.client_order_id)
 
     def log_cancel(self, client_order_id: str, symbol: str = "") -> None:
         self._write_row([
             datetime.now(timezone.utc).isoformat(), client_order_id, symbol,
             "", "", "", "", "", "", "shadow_cancel", "", "", "",
         ])
+        self._log_active_source("shadow_cancel", client_order_id)
 
     def _write_row(self, row) -> None:
         with self._lock:
@@ -484,7 +518,12 @@ class OrderGateway:
     sus ordenes sin acoplarse a la API del broker.
     """
 
-    def __init__(self, shadow_audit_path: Optional[Path] = None):
+    def __init__(
+        self,
+        shadow_audit_path: Optional[Path] = None,
+        source_name_provider: Optional[Callable[[], str]] = None,
+        market_data_source_log: Optional["MarketDataSourceLogger"] = None,
+    ):
         """
         `shadow_audit_path`: override explicito de donde escribe el
         ShadowAuditLogger (por defecto None -> paths.SHADOW_TRADES_LOG, el
@@ -502,6 +541,10 @@ class OrderGateway:
         filas rastreadas a fixtures de tests). Ver
         ggal_bot/validation/conftest.py para la red de seguridad adicional
         a nivel de suite.
+
+        `source_name_provider`/`market_data_source_log`: ver
+        ShadowAuditLogger.__init__ - se pasan tal cual (ambos opcionales,
+        default None) a su ShadowAuditLogger interno.
         """
         self._orders: Dict[str, OrderState] = {}
         self._timeout_seconds = SETTINGS.execution.order_timeout_seconds
@@ -510,7 +553,15 @@ class OrderGateway:
         # el logger solo se instancia (y solo entonces crea el CSV) cuando el
         # modo esta activo, para no dejar artefactos de auditoria en corridas
         # normales contra el ALYC real.
-        self._shadow_logger = ShadowAuditLogger(path=shadow_audit_path) if SETTINGS.shadow.enabled else None
+        self._shadow_logger = (
+            ShadowAuditLogger(
+                path=shadow_audit_path,
+                source_name_provider=source_name_provider,
+                market_data_source_log=market_data_source_log,
+            )
+            if SETTINGS.shadow.enabled
+            else None
+        )
 
     def send(
         self, request: OrderRequest, reference_price: float = 0.0,

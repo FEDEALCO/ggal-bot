@@ -43,9 +43,12 @@ import logging
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import TYPE_CHECKING, Callable, Iterable, Optional
 
 from ggal_bot import paths
+
+if TYPE_CHECKING:  # evita el import real en runtime (ver source_name_provider abajo)
+    from ggal_bot.data.market_data_source_log import MarketDataSourceLogger
 
 logger = logging.getLogger("ggal_bot.portfolio.event_journal")
 
@@ -80,9 +83,24 @@ class PositionEventJournal:
         "price", "order_client_id", "reason", "data_unavailable_fields",
     ]
 
-    def __init__(self, path: Optional[Path] = None):
+    def __init__(
+        self,
+        path: Optional[Path] = None,
+        source_name_provider: Optional[Callable[[], str]] = None,
+        market_data_source_log: Optional["MarketDataSourceLogger"] = None,
+    ):
+        """
+        `source_name_provider`/`market_data_source_log`: MEJORA 2026-10-02
+        (Tarea #27/#28 item 3(b), a pedido explicito del usuario) - ver el
+        mismo parametro en ShadowAuditLogger.__init__ (execution/
+        order_gateway.py) para el diseño completo; aca aplica igual a cada
+        evento de lifecycle en vez de a cada fill. Ambos opcionales (default
+        None) para no romper ningun caller/test existente.
+        """
         self._path = Path(path) if path is not None else paths.POSITION_EVENTS_LOG
         self._lock = threading.Lock()
+        self._source_name_provider = source_name_provider
+        self._market_data_source_log = market_data_source_log
         self._ensure_header()
 
     def _ensure_header(self) -> None:
@@ -92,6 +110,16 @@ class PositionEventJournal:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
                 with open(self._path, "a", newline="", encoding="utf-8") as f:
                     csv.writer(f).writerow(self._HEADER)
+
+    def _log_active_source(self, context: str, correlation_id: str) -> None:
+        if self._source_name_provider is None or self._market_data_source_log is None:
+            return
+        try:
+            source_name = self._source_name_provider()
+        except Exception as exc:  # noqa: BLE001 - nunca debe tumbar el evento real ya registrado
+            logger.warning("PositionEventJournal: source_name_provider() lanzo una excepcion (%s); se omite el registro de fuente.", exc)
+            return
+        self._market_data_source_log.log_source(context, correlation_id, source_name)
 
     def log_event(
         self,
@@ -137,6 +165,7 @@ class PositionEventJournal:
             reason,
             ",".join(data_unavailable_fields),
         ])
+        self._log_active_source(event_type, position_id or order_client_id)
 
     def _write_row(self, row) -> None:
         with self._lock:

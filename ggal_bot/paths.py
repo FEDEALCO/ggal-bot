@@ -77,5 +77,18 @@ SIGNAL_FUNNEL_LOG = LOGS_DIR / "signal_funnel.csv"
 # apagado por defecto.
 CCL_BOND_QUOTES_LOG = LOGS_DIR / "ccl_bond_quotes.csv"
 
+# Tarea #27/#28 item 3(b) (a pedido explicito del usuario, 2026-10-02):
+# "que la fuente activa quede registrada en cada fill y evento del
+# journal". Archivo NUEVO, mismo criterio que MARKET_SNAPSHOT_LOG/
+# SIGNAL_FUNNEL_LOG/POSITION_EVENTS_LOG de arriba - NUNCA se agregan
+# columnas a un CSV de produccion que ya existe con un header fijo
+# (ShadowAuditLogger/PositionEventJournal, ver sus docstrings) por el
+# riesgo real y documentado de romper pandas.read_csv contra las filas
+# viejas. Correlaciona por `correlation_id` (client_order_id para fills/
+# cancelaciones, position_id para eventos de lifecycle) contra
+# shadow_trades.csv/position_events.csv - ver
+# ggal_bot/data/market_data_source_log.py.
+MARKET_DATA_SOURCE_LOG = LOGS_DIR / "market_data_source_log.csv"
+
 for _dir in (LOGS_DIR, STATE_DIR, DATA_DIR):
     _dir.mkdir(parents=True, exist_ok=True)

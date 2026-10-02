@@ -46,6 +46,7 @@ from ggal_bot.portfolio.event_journal import PositionEventJournal
 from ggal_bot.data.market_snapshot_log import MarketSnapshotLogger
 from ggal_bot.data.signal_funnel_log import SignalFunnelLogger
 from ggal_bot.data.ccl_bond_quote_log import CclBondQuoteLogger
+from ggal_bot.data.market_data_source_log import MarketDataSourceLogger
 from ggal_bot.env_introspection import list_ggal_bot_env_vars
 from ggal_bot.version_info import get_deployed_git_sha
 from ggal_bot.data.dislocation_history import DislocationHistoryTracker
@@ -389,12 +390,34 @@ class GgalOptionsBot:
                     SETTINGS.scalping.eod_close_time if SETTINGS.scalping.eod_close_enabled else "DESACTIVADO",
                 )
 
+        # -- Fuente de datos activa, para auditoria (Tarea #27/#28 item
+        # 3(b), a pedido explicito del usuario, 2026-10-02: "que la fuente
+        # activa quede registrada en cada fill y evento del journal") - ver
+        # ggal_bot/data/market_data_source_log.py para el diseño completo
+        # (archivo nuevo, correlacionado por client_order_id/position_id,
+        # nunca una columna en shadow_trades.csv/position_events.csv).
+        # Instanciado SIEMPRE (mismo criterio que market_snapshot_log mas
+        # abajo), ANTES de order_gateway/position_event_journal para
+        # poder pasarselo a ambos. self._active_market_data_source_name
+        # todavia no se puede LLAMAR aca (self.shadow_mode/self.market_feed
+        # se asignan mas abajo en este mismo __init__), pero pasar el
+        # metodo bound como callable es seguro: recien se invoca en el
+        # primer fill/evento real, mucho despues de que __init__ termine.
+        self.market_data_source_log = MarketDataSourceLogger()
+
         # -- Ejecucion -----------------------------------------------------
         self.mm_engine = MarketMakingEngine(
             tick_size=SETTINGS.execution.tick_size,
             liquid_spread_relative_threshold=SETTINGS.execution.liquid_spread_relative_threshold,
         )
-        self.order_gateway = order_gateway if order_gateway is not None else OrderGateway()
+        self.order_gateway = (
+            order_gateway
+            if order_gateway is not None
+            else OrderGateway(
+                source_name_provider=self._active_market_data_source_name,
+                market_data_source_log=self.market_data_source_log,
+            )
+        )
         self.mid_price_exec = MidPriceExecutionEngine(self.order_gateway, self.mm_engine)
 
         # -- Persistencia de estado ------------------------------------------
@@ -402,7 +425,10 @@ class GgalOptionsBot:
 
         # -- Position Lifecycle Event Journal (Fase 5.3, ver
         # ggal_bot/portfolio/event_journal.py) --------------------------------
-        self.position_event_journal = PositionEventJournal()
+        self.position_event_journal = PositionEventJournal(
+            source_name_provider=self._active_market_data_source_name,
+            market_data_source_log=self.market_data_source_log,
+        )
 
         # SHADOW_RESET pendiente (Tarea #27 item 5, ver recompute_cycle y
         # _perform_shadow_reset): solo se marca en modo shadow (SETTINGS.

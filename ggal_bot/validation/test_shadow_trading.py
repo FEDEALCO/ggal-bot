@@ -1257,6 +1257,84 @@ def test_order_gateway_shadow_mode_logs_fill_to_audit_csv(tmp_path=None):
         SETTINGS.shadow.enabled = original_enabled
 
 
+def test_shadow_audit_logger_records_active_source_for_fill_and_cancel():
+    """
+    Tarea #27/#28 item 3(b) (2026-10-02, a pedido explicito del usuario):
+    cada log_fill()/log_cancel() debe, cuando se le paso un
+    source_name_provider + MarketDataSourceLogger, dejar una fila
+    correlacionada (por client_order_id) con la fuente de datos activa en
+    ese instante - sin tocar el header fijo de shadow_trades.csv.
+    """
+    import csv
+    import tempfile
+    from pathlib import Path
+    from ggal_bot.execution.order_gateway import ShadowAuditLogger
+    from ggal_bot.data.market_data_source_log import MarketDataSourceLogger
+
+    original_enabled = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audit_path = Path(tmp_dir) / "shadow_trades_test.csv"
+            source_log_path = Path(tmp_dir) / "market_data_source_log_test.csv"
+            source_log = MarketDataSourceLogger(path=source_log_path)
+
+            gateway = OrderGateway()
+            gateway._shadow_logger = ShadowAuditLogger(
+                path=audit_path,
+                source_name_provider=lambda: "Data912RestSource",
+                market_data_source_log=source_log,
+            )
+
+            request = OrderRequest(
+                symbol="GFGV4800F", side=OrderSide.SELL, quantity=2, price=50.0,
+                order_type=OrderTypeEnum.LIMIT,
+            )
+            gateway.send(request, reference_price=49.0)
+            gateway._shadow_logger.log_cancel(request.client_order_id, request.symbol)
+
+            with open(source_log_path, newline="", encoding="utf-8") as f:
+                rows = list(csv.reader(f))
+            assert rows[0] == ["timestamp_utc", "context", "correlation_id", "active_source_name"]
+            assert len(rows) == 3  # header + fill + cancel
+            assert rows[1][1:] == ["shadow_fill", request.client_order_id, "Data912RestSource"]
+            assert rows[2][1:] == ["shadow_cancel", request.client_order_id, "Data912RestSource"]
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+
+
+def test_shadow_audit_logger_fill_does_not_crash_when_source_provider_raises():
+    """La auditoria de fuente NUNCA debe tumbar un fill real ya registrado, ni siquiera si
+    source_name_provider() (tipicamente un metodo del bot) lanza una excepcion."""
+    import tempfile
+    from pathlib import Path
+    from ggal_bot.execution.order_gateway import ShadowAuditLogger
+    from ggal_bot.data.market_data_source_log import MarketDataSourceLogger
+
+    original_enabled = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audit_path = Path(tmp_dir) / "shadow_trades_test.csv"
+            source_log = MarketDataSourceLogger(path=Path(tmp_dir) / "source_log_test.csv")
+
+            def _raising_provider():
+                raise RuntimeError("simulado")
+
+            gateway = OrderGateway()
+            gateway._shadow_logger = ShadowAuditLogger(
+                path=audit_path, source_name_provider=_raising_provider, market_data_source_log=source_log,
+            )
+            request = OrderRequest(
+                symbol="GFGV4800F", side=OrderSide.SELL, quantity=2, price=50.0,
+                order_type=OrderTypeEnum.LIMIT,
+            )
+            gateway.send(request, reference_price=49.0)  # no debe lanzar
+            assert audit_path.exists()
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+
+
 def test_order_gateway_shadow_mode_never_touches_real_send_order(monkeypatch=None):
     """
     Regresion critica: en modo shadow, OrderGateway.send() NUNCA debe llamar
@@ -1346,6 +1424,8 @@ ALL_TESTS = [
     test_order_gateway_shadow_mode_falls_back_when_book_has_no_valid_quote,
     test_order_gateway_shadow_mode_logs_bid_ask_mid_at_fill_to_audit_csv,
     test_order_gateway_shadow_mode_logs_fill_to_audit_csv,
+    test_shadow_audit_logger_records_active_source_for_fill_and_cancel,
+    test_shadow_audit_logger_fill_does_not_crash_when_source_provider_raises,
     test_order_gateway_shadow_mode_never_touches_real_send_order,
     test_order_gateway_get_account_positions_shadow_mode_reflects_local_fills,
 ]

@@ -273,6 +273,48 @@ def test_event_journal_writes_header_and_rows(tmp_path):
     assert "abc123" in content[1]
 
 
+def test_event_journal_records_active_source_when_provider_is_wired(tmp_path):
+    """
+    Tarea #27/#28 item 3(b) (2026-10-02, a pedido explicito del usuario):
+    log_event() debe, cuando se le paso un source_name_provider +
+    MarketDataSourceLogger, dejar una fila correlacionada (por position_id)
+    con la fuente de datos activa - sin tocar el header fijo de
+    position_events.csv.
+    """
+    from ggal_bot.data.market_data_source_log import MarketDataSourceLogger
+
+    path = tmp_path / "position_events.csv"
+    source_log_path = tmp_path / "market_data_source_log.csv"
+    source_log = MarketDataSourceLogger(path=source_log_path)
+    journal = PositionEventJournal(
+        path=path, source_name_provider=lambda: "MockReplaySource", market_data_source_log=source_log,
+    )
+    journal.log_event(
+        "ENTRY", position_id="abc123", symbol="GFGC7000OC", strategy_tag="weekly_asymmetric",
+        side="buy", quantity_delta=3.0, quantity_after=3.0, price=572.5, reason="test",
+    )
+    with open(source_log_path, newline="", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+    assert rows[0] == ["timestamp_utc", "context", "correlation_id", "active_source_name"]
+    assert rows[1][1:] == ["ENTRY", "abc123", "MockReplaySource"]
+
+
+def test_event_journal_log_event_does_not_crash_when_source_provider_raises(tmp_path):
+    """Igual que ShadowAuditLogger: la auditoria de fuente NUNCA debe tumbar un evento real
+    ya registrado, ni siquiera si source_name_provider() lanza."""
+    from ggal_bot.data.market_data_source_log import MarketDataSourceLogger
+
+    path = tmp_path / "position_events.csv"
+    source_log = MarketDataSourceLogger(path=tmp_path / "source_log.csv")
+
+    def _raising_provider():
+        raise RuntimeError("simulado")
+
+    journal = PositionEventJournal(path=path, source_name_provider=_raising_provider, market_data_source_log=source_log)
+    journal.log_event("ENTRY", position_id="abc123", symbol="GFGC7000OC")  # no debe lanzar
+    assert "ENTRY" in path.read_text(encoding="utf-8")
+
+
 def test_bot_entry_and_full_close_write_matching_events():
     """
     Reproduce ENTRY (3 contratos) seguido de un cierre TOTAL (stop_loss) y
