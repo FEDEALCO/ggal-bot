@@ -88,14 +88,33 @@ class RiskManager:
             checks["delta_ok"] = abs(totals.get("delta", 0.0)) <= self.limits.max_delta_total
         return checks
 
-    def should_halt_new_positions(self, totals: Dict[str, float]) -> bool:
+    def should_halt_new_positions(self, totals: Dict[str, float], has_unknown_greeks: bool = False) -> bool:
+        """
+        `has_unknown_greeks` (BUG CORREGIDO 2026-10-02, a pedido explicito
+        del usuario: "posicion con griegas desconocidas -> la estrategia y
+        la cartera no aceptan entradas nuevas" - ver Portfolio.
+        has_unknown_greeks y el docstring de Position.contribution() para
+        el bug real que esto corrige, hallado en logs de produccion):
+        fail-closed, SIEMPRE True sin importar `totals` - Position.
+        contribution() ya no fabrica un delta de reemplazo para una opcion
+        sin cotizacion viva, asi que `totals` en ese caso subestima el
+        riesgo real (puede incluso dar "dentro de limite" cuando no hay
+        forma de saberlo). Default False: cualquier caller/test existente
+        que no lo pase preserva el comportamiento exacto de antes de este
+        parametro.
+        """
+        if has_unknown_greeks:
+            return True
         checks = self.check_greeks_limits(totals)
         return not all(checks.values())
 
-    def breach_report(self, totals: Dict[str, float]) -> str:
-        """Texto corto para logging/alertas cuando se excede algun limite."""
+    def breach_report(self, totals: Dict[str, float], has_unknown_greeks: bool = False) -> str:
+        """Texto corto para logging/alertas cuando se excede algun limite
+        (ver should_halt_new_positions para `has_unknown_greeks`)."""
         checks = self.check_greeks_limits(totals)
         breaches = [name for name, ok in checks.items() if not ok]
+        if has_unknown_greeks:
+            breaches = ["griegas_desconocidas"] + breaches
         if not breaches:
             return "Griegas dentro de limite."
         return f"LIMITE EXCEDIDO: {', '.join(breaches)} | totales={totals}"

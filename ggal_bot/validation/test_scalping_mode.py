@@ -37,6 +37,7 @@ Correr con:
 
 from __future__ import annotations
 
+import csv
 import os
 import sys
 
@@ -878,6 +879,54 @@ def test_bot_act_on_entry_signal_weekly_asymmetric_blocked_by_its_own_delta_brea
         SETTINGS.shadow.enabled = original_shadow
 
 
+def test_bot_act_on_entry_signal_weekly_asymmetric_blocked_by_unknown_greeks_fail_closed():
+    """
+    BUG REAL CORREGIDO 2026-10-02 (a pedido explicito del usuario, hallado
+    en logs de produccion: el kill switch de cartera se disparo con un
+    delta de -5.300 que resulto ser integramente posiciones reconciliadas
+    SIN cotizacion viva, aproximadas con un delta=1 fabricado - signo
+    incorrecto para un put vendido). Con una posicion de weekly_asymmetric
+    sin Griegas conocidas (greeks_per_unit=None, opcion real - multiplier
+    != 1), los totales de Griegas quedan en CERO (ver Position.
+    contribution()/Portfolio.has_unknown_greeks) - "sanos" segun cualquier
+    limite configurado - pero la entrada debe bloquearse igual
+    (fail-closed) y quedar un REJECT con motivo "unknown_greeks" en el
+    Event Journal, nunca un silencio que deje operar a ciegas.
+    """
+    original_shadow = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True
+    try:
+        bot = GgalOptionsBot()
+
+        bot.portfolio.add(Position(
+            symbol="GFGV5000OC", quantity=-75, multiplier=100,
+            greeks_per_unit=None, strategy_tag="weekly_asymmetric",
+        ))
+        totals = bot.portfolio.greeks_for_strategy_tag("weekly_asymmetric")
+        assert totals == {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0}
+        assert bot.risk_manager.should_halt_new_positions(
+            totals, has_unknown_greeks=bot.portfolio.has_unknown_greeks("weekly_asymmetric"),
+        ) is True
+
+        new_quote = _quote("GFWEEKLY3", 6600.0, 0.30, 6600.0, 5, bid=95.0, ask=105.0,
+                            greeks={"delta": 0.4, "gamma": 0.0005, "vega": 0.05, "theta": -1.0})
+        bot.option_chain.upsert_quote(new_quote)
+        signal = EntrySignal(
+            symbol="GFWEEKLY3", option_type=OptionType.CALL, premium_reference=new_quote.book.mid,
+        )
+        bot._act_on_entry_signal(signal, spot=6600.0, strategy_tag="weekly_asymmetric")
+
+        assert bot._position_quantity("GFWEEKLY3") == 0
+
+        with open(bot.position_event_journal._path, newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        header = rows[0]
+        reject_rows = [dict(zip(header, r)) for r in rows[1:] if dict(zip(header, r))["event_type"] == "REJECT"]
+        assert any(r["reason"].startswith("unknown_greeks") for r in reject_rows)
+    finally:
+        SETTINGS.shadow.enabled = original_shadow
+
+
 def test_bot_act_on_entry_signal_scalping_still_blocked_by_its_own_vega_breach():
     original_enabled = SETTINGS.scalping.enabled
     SETTINGS.scalping.enabled = True
@@ -1005,6 +1054,7 @@ ALL_TESTS = [
     test_bot_act_on_entry_signal_scalping_not_blocked_by_weekly_asymmetric_vega_breach,
     test_bot_act_on_entry_signal_weekly_asymmetric_not_blocked_by_scalping_vega_breach,
     test_bot_act_on_entry_signal_weekly_asymmetric_blocked_by_its_own_delta_breach,
+    test_bot_act_on_entry_signal_weekly_asymmetric_blocked_by_unknown_greeks_fail_closed,
     test_bot_act_on_entry_signal_scalping_still_blocked_by_its_own_vega_breach,
     test_bot_act_on_entry_signal_scalping_blocked_by_its_own_delta_breach,
 ]

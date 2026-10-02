@@ -1087,8 +1087,15 @@ class GgalOptionsBot:
                 all_signals.extend(self._run_scalping_cycle(spot))
 
         totals = self.portfolio.total_greeks()
-        if self.risk_manager.should_halt_new_positions(totals):
-            logger.warning(self.risk_manager.breach_report(totals))
+        # BUG CORREGIDO 2026-10-02 (ver Position.contribution()/Portfolio.
+        # has_unknown_greeks): `totals` ya no incluye un delta fabricado
+        # para una opcion sin cotizacion viva - `portfolio_has_unknown_greeks`
+        # es lo que permite que should_halt_new_positions/breach_report
+        # sigan reflejando ese riesgo (fail-closed) en vez de ver un total
+        # artificialmente mas bajo.
+        portfolio_has_unknown_greeks = self.portfolio.has_unknown_greeks()
+        if self.risk_manager.should_halt_new_positions(totals, has_unknown_greeks=portfolio_has_unknown_greeks):
+            logger.warning(self.risk_manager.breach_report(totals, has_unknown_greeks=portfolio_has_unknown_greeks))
 
         # Tarea #27/#28 item 5 (2026-10-02, a pedido explicito del
         # usuario): registro periodico de Griegas de cartera + por
@@ -1116,7 +1123,7 @@ class GgalOptionsBot:
             portfolio_greeks_total=totals,
             portfolio_greeks_by_expiry=self.portfolio.greeks_by_expiry(),
             active_signals=[s.__dict__ for s in all_signals],
-            risk_breaches=self.risk_manager.breach_report(totals),
+            risk_breaches=self.risk_manager.breach_report(totals, has_unknown_greeks=portfolio_has_unknown_greeks),
             extra={"open_orders": self.mid_price_exec.open_order_count(), "spot_mid": spot},
             option_chain_snapshot=self._option_chain_snapshot(),
             env_flags=list_ggal_bot_env_vars(),
@@ -2048,10 +2055,13 @@ class GgalOptionsBot:
         # para que un book de scalping corriendo en paralelo (bolt-on, ver
         # ScalpingConfig) no bloquee entradas de vol_arbitrage ni viceversa.
         totals = self.portfolio.greeks_for_strategy_tag("weekly_asymmetric")
-        if self.risk_manager.should_halt_new_positions(totals):
+        unknown_greeks = self.portfolio.has_unknown_greeks("weekly_asymmetric")
+        if self.risk_manager.should_halt_new_positions(totals, has_unknown_greeks=unknown_greeks):
             logger.info(
-                "Señal %s descartada: la cartera de '%s' ya excede sus limites de riesgo (Griegas: %s).",
+                "Señal %s descartada: la cartera de '%s' ya excede sus limites de riesgo "
+                "(Griegas: %s%s).",
                 signal.symbol, self.active_strategy_name, totals,
+                ", con posiciones de Griegas desconocidas" if unknown_greeks else "",
             )
             return
 
@@ -2457,14 +2467,30 @@ class GgalOptionsBot:
 
         rm = risk_manager if risk_manager is not None else self.risk_manager
         totals = self.portfolio.greeks_for_strategy_tag(strategy_tag)
-        if rm.should_halt_new_positions(totals):
-            logger.info(
-                "Señal %s descartada: la cartera de '%s' ya excede sus limites de riesgo (Griegas: %s).",
-                signal.symbol, strategy_tag, totals,
-            )
+        # BUG CORREGIDO 2026-10-02 (a pedido explicito del usuario, ver
+        # Position.contribution()/Portfolio.has_unknown_greeks): fail-closed
+        # - una opcion de esta estrategia sin cotizacion viva ya no fabrica
+        # un delta de reemplazo, asi que `totals` solo no es evidencia
+        # suficiente de que es seguro abrir una entrada nueva.
+        unknown_greeks = self.portfolio.has_unknown_greeks(strategy_tag)
+        if rm.should_halt_new_positions(totals, has_unknown_greeks=unknown_greeks):
+            if unknown_greeks:
+                logger.info(
+                    "Señal %s descartada: '%s' tiene al menos una posicion con Griegas "
+                    "desconocidas (sin cotizacion viva) - no se abren entradas nuevas hasta "
+                    "que se resuelva (Griegas conocidas: %s).",
+                    signal.symbol, strategy_tag, totals,
+                )
+                reject_reason = f"unknown_greeks: {totals}"
+            else:
+                logger.info(
+                    "Señal %s descartada: la cartera de '%s' ya excede sus limites de riesgo (Griegas: %s).",
+                    signal.symbol, strategy_tag, totals,
+                )
+                reject_reason = f"greeks_limit_exceeded: {totals}"
             self.position_event_journal.log_event(
                 "REJECT", symbol=signal.symbol, strategy_tag=strategy_tag,
-                side="buy", reason=f"greeks_limit_exceeded: {totals}",
+                side="buy", reason=reject_reason,
             )
             return
 
@@ -2875,7 +2901,9 @@ class GgalOptionsBot:
                 portfolio_greeks_total=totals,
                 portfolio_greeks_by_expiry=self.portfolio.greeks_by_expiry(),
                 active_signals=[],
-                risk_breaches=self.risk_manager.breach_report(totals),
+                risk_breaches=self.risk_manager.breach_report(
+                    totals, has_unknown_greeks=self.portfolio.has_unknown_greeks(),
+                ),
                 extra={"shutdown": True, "spot_mid": spot_mid},
                 option_chain_snapshot=self._option_chain_snapshot(),
                 env_flags=list_ggal_bot_env_vars(),

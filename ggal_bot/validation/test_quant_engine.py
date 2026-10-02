@@ -377,6 +377,93 @@ def test_portfolio_greeks_aggregation():
     assert abs(totals["delta"] - expected_delta) < 1e-6
 
 
+def test_sold_put_without_live_quote_contributes_zero_delta_never_fabricated():
+    """
+    BUG REAL CORREGIDO 2026-10-02 (hallado en logs de produccion: el kill
+    switch de cartera se disparo con un delta de -5.300 que resulto ser
+    integramente la suma de posiciones reconciliadas SIN cotizacion viva,
+    tratadas con el viejo "delta=1 por unidad" - signo INCORRECTO para un
+    put vendido, que tiene delta POSITIVO, no negativo). Un put vendido
+    (quantity<0) sin greeks_per_unit ya NO debe contribuir qty*multiplier
+    (que daria un delta negativo fabricado, de signo opuesto al real) -
+    debe contribuir 0.0 (nunca un numero inventado) y marcarse como Griegas
+    desconocidas.
+    """
+    portfolio = Portfolio()
+    sold_put = Position(
+        symbol="GFGV5000OC", quantity=-75, multiplier=100,
+        greeks_per_unit=None, strategy_tag="weekly_asymmetric",
+    )
+    portfolio.add(sold_put)
+    assert sold_put.has_unknown_greeks() is True
+    totals = portfolio.total_greeks()
+    assert totals["delta"] == 0.0
+    assert totals["gamma"] == 0.0 and totals["vega"] == 0.0 and totals["theta"] == 0.0
+    assert portfolio.has_unknown_greeks() is True
+    assert portfolio.has_unknown_greeks("weekly_asymmetric") is True
+    assert portfolio.has_unknown_greeks("scalping") is False
+
+
+def test_bought_call_without_live_quote_contributes_zero_delta_never_fabricated():
+    """Mismo fix, para una posicion LARGA (quantity>0) - antes tambien
+    fabricaba delta=qty_mult (positivo, en este caso del mismo signo que un
+    call largo real tendria, pero igual de inventado: ninguna posicion sin
+    Griegas conocidas debe contribuir un numero que aparente ser un dato
+    real)."""
+    portfolio = Portfolio()
+    bought_call = Position(symbol="GFGC6800OC", quantity=7, multiplier=100, greeks_per_unit=None)
+    portfolio.add(bought_call)
+    assert bought_call.has_unknown_greeks() is True
+    totals = portfolio.total_greeks()
+    assert totals["delta"] == 0.0
+    assert portfolio.has_unknown_greeks() is True
+
+
+def test_underlying_without_greeks_per_unit_still_gets_delta_one_per_share():
+    """Regresion: el subyacente (multiplier=1) con greeks_per_unit=None
+    sigue siendo la marca DELIBERADA de "delta=1 por accion" (ver
+    run_bot.py:_maybe_hedge) - el fix de las dos pruebas de arriba NO debe
+    tocar este caso, que nunca fue el bug."""
+    underlying = Position(symbol="GGAL", quantity=100, multiplier=1, greeks_per_unit=None)
+    assert underlying.has_unknown_greeks() is False
+    assert underlying.contribution()["delta"] == 100.0
+
+
+def test_closed_option_position_with_unknown_greeks_does_not_block_entries():
+    """
+    Regresion (hallada al correr la suite completa tras el fix de arriba):
+    una posicion de opciones YA CERRADA (quantity=0 - el objeto Position
+    sigue en Portfolio.positions, nunca se remueve, ver Position.
+    position_id) sin Griegas conocidas NO debe contar como "Griegas
+    desconocidas" - no aporta ningun riesgo real estando en cero, sin
+    importar si alguna vez se conocieron sus Griegas. Caso real: una
+    posicion que hace Stop Loss (cierre por PRECIO, nunca necesito Griegas
+    para eso) y queda en 0 el mismo ciclo en que se evalua una entrada
+    nueva de la misma estrategia.
+    """
+    portfolio = Portfolio()
+    closed_option = Position(symbol="GFGC5300O", quantity=0, multiplier=100.0, greeks_per_unit=None)
+    portfolio.add(closed_option)
+    assert closed_option.has_unknown_greeks() is False
+    assert portfolio.has_unknown_greeks() is False
+    assert portfolio.total_greeks() == {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0}
+
+
+def test_risk_manager_fails_closed_when_portfolio_has_unknown_greeks():
+    """A pedido explicito del usuario: "posicion con griegas desconocidas
+    -> la estrategia y la cartera no aceptan entradas nuevas y se alerta".
+    should_halt_new_positions debe devolver True con has_unknown_greeks=True
+    sin importar que tan "sanos" luzcan los totales (acá, todos en 0.0 -
+    dentro de cualquier limite configurado) - lo contrario seria operar a
+    ciegas contra un total que no refleja el riesgo real."""
+    rm = RiskManager(RiskLimits(max_vega_total=5000.0, max_gamma_total=2000.0, max_delta_total=1000.0))
+    healthy_totals = {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0}
+    assert rm.should_halt_new_positions(healthy_totals) is False  # sin el flag, comportamiento de siempre
+    assert rm.should_halt_new_positions(healthy_totals, has_unknown_greeks=True) is True
+    report = rm.breach_report(healthy_totals, has_unknown_greeks=True)
+    assert "griegas_desconocidas" in report
+
+
 ALL_TESTS = [
     test_put_call_parity,
     test_iv_solver_recovers_true_sigma,
@@ -392,6 +479,11 @@ ALL_TESTS = [
     test_delta_hedger_triggers_and_routes_to_contado,
     test_historical_volatility_close_to_close_positive,
     test_portfolio_greeks_aggregation,
+    test_sold_put_without_live_quote_contributes_zero_delta_never_fabricated,
+    test_bought_call_without_live_quote_contributes_zero_delta_never_fabricated,
+    test_underlying_without_greeks_per_unit_still_gets_delta_one_per_share,
+    test_closed_option_position_with_unknown_greeks_does_not_block_entries,
+    test_risk_manager_fails_closed_when_portfolio_has_unknown_greeks,
 ]
 
 

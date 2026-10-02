@@ -135,9 +135,15 @@ ALCANCE EXPLICITO - que NO resuelve este modulo:
      greeks_per_unit nunca se refresca post-creacion en el codigo
      existente). Si la base ya no esta en el universo vigente (vencio,
      rodo fuera de rango) O esta en el universo pero sin punta vigente
-     ahora mismo (iliquida), greeks_per_unit queda en None (tratada por
-     Position.contribution() como delta=1 por unidad) y se reporta en
-     `warnings` - NUNCA se fabrica un valor de griega. `Position.expiry`
+     ahora mismo (iliquida), greeks_per_unit queda en None y se reporta en
+     `warnings` - NUNCA se fabrica un valor de griega. FIX 2026-10-02 (ver
+     docstring de Position.contribution(), hallado en logs de produccion -
+     el kill switch de cartera se disparo por un delta fabricado de signo
+     incorrecto para un put vendido): una posicion de OPCIONES en este
+     estado ya NO se trata como delta=1 por unidad, contribuye 0.0 a las 4
+     Griegas y queda marcada via Position.has_unknown_greeks() - fail-closed
+     (RiskManager.should_halt_new_positions bloquea entradas nuevas de esa
+     estrategia/cartera mientras siga asi, ver run_bot.py). `Position.expiry`
      es INDEPENDIENTE de esto (fix 2026-09-08, ver el bloque `if not
      is_underlying` de abajo): es un dato estatico de la definicion del
      instrumento, se completa apenas la base sigue en el universo activo,
@@ -312,11 +318,13 @@ def reconstruct_positions_from_shadow_log(
                         "el universo activo (expiry recuperado de la definicion del "
                         "instrumento) pero sin punta de dos lados vigente para calcular IV/"
                         "griegas ahora mismo (probable base iliquida/lejos del spot) - "
-                        "greeks_per_unit queda en None (Position.contribution() la trata como "
-                        "delta=1 por unidad hasta que una entrada nueva la reemplace o se "
-                        "cierre); el horizonte/guardia de fin de semana SI se evaluan igual "
-                        "(no dependen de griegas), Stop Loss/Take Profit siguen sin poder "
-                        "evaluarse hasta que haya un precio vigente."
+                        "greeks_per_unit queda en None hasta que una entrada nueva la reemplace "
+                        "o se cierre; FIX 2026-10-02: ya NO se fabrica un delta de reemplazo "
+                        "(contribuye 0.0), y Portfolio.has_unknown_greeks() bloquea entradas "
+                        "nuevas de esta estrategia/cartera mientras siga asi (fail-closed, ver "
+                        "RiskManager.should_halt_new_positions) - el horizonte/guardia de fin de "
+                        "semana SI se evaluan igual (no dependen de griegas), Stop Loss/Take "
+                        "Profit siguen sin poder evaluarse hasta que haya un precio vigente."
                     )
 
         entry_time = row.entry_time
@@ -559,8 +567,10 @@ def reconstruct_positions_from_event_journal(
                         f"(qty={remaining['quantity']:g}) - esta en el universo activo (expiry "
                         "recuperado de la definicion del instrumento) pero sin punta de dos "
                         "lados vigente para calcular IV/griegas ahora mismo - greeks_per_unit "
-                        "queda en None (Position.contribution() la trata como delta=1 por "
-                        "unidad hasta que una entrada nueva la reemplace o se cierre)."
+                        "queda en None hasta que una entrada nueva la reemplace o se cierre; "
+                        "FIX 2026-10-02: ya NO se fabrica un delta de reemplazo (contribuye "
+                        "0.0), y Portfolio.has_unknown_greeks() bloquea entradas nuevas de esta "
+                        "estrategia/cartera mientras siga asi (fail-closed)."
                     )
 
         entry_time = remaining["entry_time"]

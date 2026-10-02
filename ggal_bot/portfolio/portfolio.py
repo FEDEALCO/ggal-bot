@@ -114,10 +114,67 @@ class Position:
     # sin fabricar el dato; quedan fuera de este chequeo, nunca se adivina).
     financed_by_symbol: Optional[str] = None
 
+    def has_unknown_greeks(self) -> bool:
+        """
+        True si esta Position es una OPCION (multiplier != 1 - ver la
+        convencion ya establecida en run_bot.py:_maybe_hedge, comentario
+        junto a la creacion de la Position de delta-hedge: "multiplier=1.0:
+        el subyacente cotiza por ACCION... greeks_per_unit=None es la marca
+        de 'esto es el subyacente, delta=1 por unidad' - nunca se confunde
+        con una opcion") cuyo greeks_per_unit es None ahora mismo - es
+        decir, no hay dato REAL de Griegas con el que calcular su
+        contribucion (ver contribution() de abajo, BUG CORREGIDO
+        2026-10-02).
+
+        `quantity != 0` es deliberado: una posicion ya CERRADA (qty=0, el
+        objeto sigue en Portfolio.positions por diseño - ver
+        Position.position_id) no aporta ningun riesgo real sin importar si
+        sus Griegas son conocidas o no, asi que nunca debe bloquear entradas
+        nuevas por este motivo (verificado con el caso real de
+        test_strategy_selector.py::test_weekly_asymmetric_cycle_reconciles_exit_before_sizing_new_entry:
+        una posicion que hace Stop Loss y queda en 0 el mismo ciclo en que
+        se dimensiona una entrada nueva).
+        """
+        return self.quantity != 0 and self.multiplier != 1 and self.greeks_per_unit is None
+
     def contribution(self) -> Dict[str, float]:
+        """
+        BUG REAL CORREGIDO 2026-10-02 (hallado via logs de produccion
+        pegados por el usuario: el kill switch de cartera se disparo con un
+        delta total de -5.300, que resulto ser EXACTAMENTE la suma de 4
+        posiciones reconciliadas sin cotizacion viva, cada una aproximada
+        con el viejo "delta=1 por unidad" de aca abajo - incluida
+        GFGV5000OC, un PUT VENDIDO (qty=-75), para el que esa aproximacion
+        da signo INCORRECTO: un put vendido tiene delta POSITIVO, no
+        negativo, asi que "qty_mult" (negativo, por estar vendido) como
+        sustituto de delta queda invertido respecto de la realidad).
+
+        Antes, CUALQUIER Position con greeks_per_unit=None devolvia
+        delta=qty_mult (quantity*multiplier) como sustituto - correcto
+        UNICAMENTE para el subyacente (ver has_unknown_greeks() de arriba:
+        ahi es la marca DELIBERADA de "delta=1 por accion", nunca un dato
+        faltante), pero fabricado y de signo potencialmente incorrecto para
+        una OPCION sin cotizacion viva. A pedido explicito del usuario:
+        "cambialo a fail-closed... nunca un delta de reemplazo" - una
+        opcion con Griegas desconocidas ahora contribuye 0.0 a las 4
+        Griegas (nunca un numero inventado que aparente ser un dato real),
+        y la AUSENCIA de dato se señaliza por separado via
+        has_unknown_greeks()/Portfolio.has_unknown_greeks() - quien agrega
+        las Griegas (RiskManager.should_halt_new_positions, ver
+        risk_manager.py) es responsable de bloquear entradas nuevas y
+        alertar cuando hay alguna posicion en este estado, en vez de operar
+        a ciegas contra un total que silenciosamente ignora el riesgo real
+        de esa posicion.
+        """
         qty_mult = self.quantity * self.multiplier
         if self.greeks_per_unit is None:
-            return {"delta": qty_mult, "gamma": 0.0, "vega": 0.0, "theta": 0.0}
+            if self.multiplier == 1:
+                # Subyacente (ver has_unknown_greeks arriba): delta=1 por
+                # accion es la semantica REAL y deliberada, no un sustituto.
+                return {"delta": qty_mult, "gamma": 0.0, "vega": 0.0, "theta": 0.0}
+            # Opcion sin Griegas conocidas: fail-closed, nunca se fabrica un
+            # delta (ver docstring de arriba).
+            return {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0}
         g = self.greeks_per_unit
         return {
             "delta": qty_mult * g.get("delta", 0.0),
@@ -153,6 +210,30 @@ class Portfolio:
             for k in bucket:
                 bucket[k] += c[k]
         return out
+
+    def positions_with_unknown_greeks(self, strategy_tag: Optional[str] = None) -> List["Position"]:
+        """
+        Posiciones de OPCIONES sin Griegas conocidas ahora mismo (ver
+        Position.has_unknown_greeks, BUG CORREGIDO 2026-10-02) -
+        `strategy_tag=None` (default) mira TODA la cartera; con un valor
+        explicito, solo las posiciones de esa estrategia (misma convencion
+        que greeks_for_strategy_tag: sin marca cuenta como
+        "weekly_asymmetric"). Como contribution() ya NO fabrica un delta de
+        reemplazo para estas posiciones, esta lista es lo que le permite al
+        llamador (RiskManager/run_bot.py) decidir bloquear entradas nuevas
+        y alertar en vez de operar contra un total que silenciosamente
+        subestima el riesgo real.
+        """
+        return [
+            p for p in self.positions
+            if p.has_unknown_greeks()
+            and (strategy_tag is None or (p.strategy_tag or "weekly_asymmetric") == strategy_tag)
+        ]
+
+    def has_unknown_greeks(self, strategy_tag: Optional[str] = None) -> bool:
+        """True si existe al menos una Position de opciones sin Griegas
+        conocidas (ver positions_with_unknown_greeks)."""
+        return bool(self.positions_with_unknown_greeks(strategy_tag))
 
     def greeks_for_strategy_tag(self, strategy_tag: str) -> Dict[str, float]:
         """
