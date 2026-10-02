@@ -38,6 +38,18 @@ import atexit
 import tempfile
 from pathlib import Path
 
+# Debe importarse ANTES que `from ggal_bot import paths` de abajo (aunque
+# paths.py no lee nada de os.environ hoy, esto fija el orden correcto de
+# forma robusta a futuro) y, sobre todo, antes de que CUALQUIER test llegue
+# a importar ggal_bot.config - ver el docstring de _env_isolation.py para
+# el por que (SETTINGS congela sus defaults de .env/entorno real en el
+# primer import del proceso, no en cada test). Como todo archivo de test de
+# este proyecto que toca OrderGateway/GgalOptionsBot en modo shadow ya
+# importa este modulo como primera linea (convencion obligatoria desde la
+# auditoria 2026-08-27), importar _env_isolation aca alcanza para blindar
+# toda la suite sin tener que tocar cada archivo de test individualmente
+# (a pedido explicito del usuario, sesion 2026-10-02).
+from ggal_bot.validation import _env_isolation  # noqa: F401
 from ggal_bot import paths as _paths
 
 _ISOLATED_LOG_DIR = tempfile.TemporaryDirectory(prefix="ggal_bot_test_shadow_logs_")
