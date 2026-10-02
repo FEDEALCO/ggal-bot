@@ -321,6 +321,27 @@ def test_risk_manager_halts_on_vega_breach():
     assert risk_mgr.should_halt_new_positions(totals_ok) is False
 
 
+def test_risk_manager_halts_on_delta_breach_when_configured():
+    """
+    Tarea #27/#28 item 4 (2026-10-02, a pedido explicito del usuario):
+    max_delta_total es Optional y, sin configurarlo explicitamente (default
+    de RiskLimits), el chequeo de delta NO se evalua - mismo comportamiento
+    exacto que antes de este campo (backward-compatible con cualquier
+    caller que construya RiskLimits() sin este parametro).
+    """
+    limits_without_delta_cap = RiskLimits(max_vega_total=1e9, max_gamma_total=1e9)
+    risk_mgr_lenient = RiskManager(limits_without_delta_cap)
+    totals_huge_delta = {"delta": 5800.0, "gamma": 1.0, "vega": 1.0, "theta": 0.0}
+    assert risk_mgr_lenient.should_halt_new_positions(totals_huge_delta) is False
+
+    limits_with_delta_cap = RiskLimits(max_vega_total=1e9, max_gamma_total=1e9, max_delta_total=1000.0)
+    risk_mgr_strict = RiskManager(limits_with_delta_cap)
+    assert risk_mgr_strict.should_halt_new_positions(totals_huge_delta) is True
+
+    totals_ok = {"delta": 500.0, "gamma": 1.0, "vega": 1.0, "theta": 0.0}
+    assert risk_mgr_strict.should_halt_new_positions(totals_ok) is False
+
+
 def test_delta_hedger_triggers_and_routes_to_contado():
     hedger = DeltaHedgingEngine(delta_band=150.0)
     assert hedger.needs_hedge(-500.0) is True
@@ -367,6 +388,7 @@ ALL_TESTS = [
     test_order_book_snapshot_staleness_helpers,
     test_recompute_all_excludes_stale_quotes_from_iv_refresh,
     test_risk_manager_halts_on_vega_breach,
+    test_risk_manager_halts_on_delta_breach_when_configured,
     test_delta_hedger_triggers_and_routes_to_contado,
     test_historical_volatility_close_to_close_positive,
     test_portfolio_greeks_aggregation,

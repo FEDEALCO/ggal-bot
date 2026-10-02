@@ -23,8 +23,10 @@ if __package__ in (None, ""):
 from ggal_bot.risk.risk_manager import RiskLimits, RiskManager
 
 
-def _manager(max_vega_total=5000.0, max_gamma_total=2000.0) -> RiskManager:
-    return RiskManager(RiskLimits(max_vega_total=max_vega_total, max_gamma_total=max_gamma_total))
+def _manager(max_vega_total=5000.0, max_gamma_total=2000.0, max_delta_total=None) -> RiskManager:
+    return RiskManager(RiskLimits(
+        max_vega_total=max_vega_total, max_gamma_total=max_gamma_total, max_delta_total=max_delta_total,
+    ))
 
 
 def test_projected_greeks_breach_none_within_budget():
@@ -121,6 +123,36 @@ def test_projected_greeks_breach_is_additive_to_hard_limit_check():
     assert breach is not None
 
 
+def test_projected_greeks_breach_on_delta_when_configured():
+    """Tarea #27/#28 item 4 (2026-10-02): el presupuesto preventivo tambien proyecta delta,
+    pero SOLO si max_delta_total esta configurado (Optional, ver RiskLimits.max_delta_total)."""
+    rm_without_delta_cap = _manager(max_vega_total=5000.0, max_gamma_total=2000.0, max_delta_total=None)
+    breach = rm_without_delta_cap.projected_greeks_breach(
+        current_totals={"vega": 100.0, "gamma": 100.0, "delta": 4000.0},
+        added_greeks={"vega": 10.0, "gamma": 10.0, "delta": 2000.0},
+        budget_fraction=0.85,
+    )
+    assert breach is None  # sin limite de delta configurado, un delta proyectado de 6000 no es relevante
+
+    rm_with_delta_cap = _manager(max_vega_total=5000.0, max_gamma_total=2000.0, max_delta_total=1000.0)
+    # proyectado delta=800, budget_fraction=0.85 -> limite efectivo=850: OK.
+    breach_ok = rm_with_delta_cap.projected_greeks_breach(
+        current_totals={"vega": 100.0, "gamma": 100.0, "delta": 500.0},
+        added_greeks={"vega": 10.0, "gamma": 10.0, "delta": 300.0},
+        budget_fraction=0.85,
+    )
+    assert breach_ok is None
+
+    # proyectado delta=900, budget_fraction=0.85 -> limite efectivo=850: excede.
+    breach_exceeded = rm_with_delta_cap.projected_greeks_breach(
+        current_totals={"vega": 100.0, "gamma": 100.0, "delta": 600.0},
+        added_greeks={"vega": 10.0, "gamma": 10.0, "delta": 300.0},
+        budget_fraction=0.85,
+    )
+    assert breach_exceeded is not None
+    assert "delta" in breach_exceeded
+
+
 ALL_TESTS = [
     test_projected_greeks_breach_none_within_budget,
     test_projected_greeks_breach_on_vega,
@@ -130,6 +162,7 @@ ALL_TESTS = [
     test_projected_greeks_breach_handles_missing_keys_as_zero,
     test_projected_greeks_breach_is_sign_agnostic,
     test_projected_greeks_breach_is_additive_to_hard_limit_check,
+    test_projected_greeks_breach_on_delta_when_configured,
 ]
 
 

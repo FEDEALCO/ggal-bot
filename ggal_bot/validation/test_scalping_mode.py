@@ -836,6 +836,48 @@ def test_bot_act_on_entry_signal_weekly_asymmetric_not_blocked_by_scalping_vega_
         SETTINGS.shadow.enabled = original_shadow
 
 
+def test_bot_act_on_entry_signal_weekly_asymmetric_blocked_by_its_own_delta_breach():
+    """
+    Tarea #27/#28 item 4 (2026-10-02, a pedido explicito del usuario:
+    "Limites duros de delta por estrategia y de cartera, default ON... la
+    weekly_asymmetric llego a ~5.800 sin limite"). Mismo patron que los
+    tests de vega de arriba, pero para RiskConfig.max_delta_total (default
+    ON, 1000.0) - vega/gamma del book deliberadamente lejos de sus propios
+    techos para aislar especificamente el chequeo nuevo.
+    """
+    original_shadow = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True
+    try:
+        bot = GgalOptionsBot()
+
+        # delta = 30 * 100 * 0.4 = 1200 > RiskConfig.max_delta_total=1000
+        # default; vega = 30*100*0.05 = 150 << 5000, gamma = 30*100*0.0005 =
+        # 1.5 << 2000 - vega/gamma por si solos NO bloquearian esta entrada.
+        bot.portfolio.add(Position(
+            symbol="WEEKLY_DELTA_HEAVY", quantity=30, multiplier=100,
+            entry_price=100.0, entry_time=datetime.now(timezone.utc) - timedelta(days=1),
+            greeks_per_unit={"delta": 0.4, "gamma": 0.0005, "vega": 0.05, "theta": -1.0},
+            expiry=date(2026, 9, 4), strategy_tag="weekly_asymmetric",
+        ))
+        totals = bot.portfolio.greeks_for_strategy_tag("weekly_asymmetric")
+        assert abs(totals["vega"]) < SETTINGS.risk.max_vega_total
+        assert abs(totals["gamma"]) < SETTINGS.risk.max_gamma_total
+        assert abs(totals["delta"]) > SETTINGS.risk.max_delta_total
+        assert bot.risk_manager.should_halt_new_positions(totals) is True
+
+        new_quote = _quote("GFWEEKLY2", 6600.0, 0.30, 6600.0, 5, bid=95.0, ask=105.0,
+                            greeks={"delta": 0.4, "gamma": 0.0005, "vega": 0.05, "theta": -1.0})
+        bot.option_chain.upsert_quote(new_quote)
+        signal = EntrySignal(
+            symbol="GFWEEKLY2", option_type=OptionType.CALL, premium_reference=new_quote.book.mid,
+        )
+        bot._act_on_entry_signal(signal, spot=6600.0, strategy_tag="weekly_asymmetric")
+
+        assert bot._position_quantity("GFWEEKLY2") == 0
+    finally:
+        SETTINGS.shadow.enabled = original_shadow
+
+
 def test_bot_act_on_entry_signal_scalping_still_blocked_by_its_own_vega_breach():
     original_enabled = SETTINGS.scalping.enabled
     SETTINGS.scalping.enabled = True
@@ -866,6 +908,50 @@ def test_bot_act_on_entry_signal_scalping_still_blocked_by_its_own_vega_breach()
         )
 
         assert bot._position_quantity("GFSCALP2") == 0
+    finally:
+        SETTINGS.scalping.enabled = original_enabled
+
+
+def test_bot_act_on_entry_signal_scalping_blocked_by_its_own_delta_breach():
+    """
+    Tarea #27/#28 item 4 (2026-10-02, a pedido explicito del usuario:
+    "Limites duros de delta por estrategia y de cartera, default ON").
+    Mismo patron que test_bot_act_on_entry_signal_scalping_still_blocked_by_
+    its_own_vega_breach, pero aislando ESPECIFICAMENTE el nuevo chequeo de
+    delta (vega/gamma del book deliberadamente lejos de sus propios techos).
+    """
+    original_enabled = SETTINGS.scalping.enabled
+    SETTINGS.scalping.enabled = True
+    try:
+        bot = GgalOptionsBot()
+
+        # delta = 20 * 100 * 0.5 = 1000 > ScalpingConfig.max_delta_total=600
+        # default; vega = 20*100*0.1 = 200 << 3000, gamma = 20*100*0.001 = 2
+        # << 1500 - vega/gamma por si solos NO bloquearian esta entrada.
+        bot.portfolio.add(Position(
+            symbol="SCALP_DELTA_HEAVY", quantity=20, multiplier=100,
+            entry_price=100.0, entry_time=datetime.now(timezone.utc) - timedelta(minutes=5),
+            greeks_per_unit={"delta": 0.5, "gamma": 0.001, "vega": 0.1, "theta": -1.0},
+            expiry=date(2026, 9, 4), strategy_tag="scalping",
+        ))
+        totals = bot.portfolio.greeks_for_strategy_tag("scalping")
+        assert abs(totals["vega"]) < SETTINGS.scalping.max_vega_total
+        assert abs(totals["gamma"]) < SETTINGS.scalping.max_gamma_total
+        assert abs(totals["delta"]) > SETTINGS.scalping.max_delta_total
+        assert bot.scalping_risk_manager.should_halt_new_positions(totals) is True
+
+        new_quote = _quote("GFSCALP3", 6600.0, 0.30, 6600.0, 1, bid=95.0, ask=105.0,
+                            greeks={"delta": 0.5, "gamma": 0.001, "vega": 0.1, "theta": -1.0})
+        bot.option_chain.upsert_quote(new_quote)
+        signal = EntrySignal(
+            symbol="GFSCALP3", option_type=OptionType.CALL, premium_reference=new_quote.book.mid,
+        )
+        bot._act_on_entry_signal(
+            signal, spot=6600.0, strategy_tag="scalping",
+            position_sizer=bot.scalping_position_sizer, risk_manager=bot.scalping_risk_manager,
+        )
+
+        assert bot._position_quantity("GFSCALP3") == 0
     finally:
         SETTINGS.scalping.enabled = original_enabled
 
@@ -918,7 +1004,9 @@ ALL_TESTS = [
     test_bot_scalping_has_own_risk_manager_isolated_from_primary,
     test_bot_act_on_entry_signal_scalping_not_blocked_by_weekly_asymmetric_vega_breach,
     test_bot_act_on_entry_signal_weekly_asymmetric_not_blocked_by_scalping_vega_breach,
+    test_bot_act_on_entry_signal_weekly_asymmetric_blocked_by_its_own_delta_breach,
     test_bot_act_on_entry_signal_scalping_still_blocked_by_its_own_vega_breach,
+    test_bot_act_on_entry_signal_scalping_blocked_by_its_own_delta_breach,
 ]
 
 

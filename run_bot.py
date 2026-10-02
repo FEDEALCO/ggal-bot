@@ -128,6 +128,10 @@ class GgalOptionsBot:
         self.risk_manager = RiskManager(RiskLimits(
             max_vega_total=SETTINGS.risk.max_vega_total,
             max_gamma_total=SETTINGS.risk.max_gamma_total,
+            # Tarea #27/#28 item 4 (2026-10-02, a pedido explicito del
+            # usuario) - ver RiskConfig.max_delta_total para la
+            # justificacion completa del valor y la unidad.
+            max_delta_total=SETTINGS.risk.max_delta_total,
             max_spread_relative=SETTINGS.risk.max_spread_relative,
             min_book_size=SETTINGS.risk.min_book_size,
             min_daily_volume=SETTINGS.risk.min_daily_volume,
@@ -343,6 +347,9 @@ class GgalOptionsBot:
             self.scalping_risk_manager = RiskManager(RiskLimits(
                 max_vega_total=SETTINGS.scalping.max_vega_total,
                 max_gamma_total=SETTINGS.scalping.max_gamma_total,
+                # Tarea #27/#28 item 4 (2026-10-02, a pedido explicito del
+                # usuario) - ver ScalpingConfig.max_delta_total.
+                max_delta_total=SETTINGS.scalping.max_delta_total,
                 # El piso de liquidez de punta (spread/tamaño de libro/
                 # volumen diario) SI se comparte: mide calidad de mercado
                 # de la cotizacion en si, no presupuesto de cartera de una

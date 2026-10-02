@@ -144,6 +144,46 @@ def test_evaluate_trips_on_correlated_delta_across_different_symbols(tmp_path):
     assert ks.is_tripped() is True
 
 
+def test_risk_limits_config_default_has_portfolio_delta_cap_on():
+    """
+    Tarea #27/#28 item 4 (2026-10-02, a pedido explicito del usuario):
+    "Limites duros de delta... de cartera, default ON" - a diferencia de
+    max_daily_loss_ars/max_open_contracts_total (que siguen default None,
+    sin cambios), max_portfolio_delta_ars ahora trae un valor concreto sin
+    necesidad de configurar nada explicitamente.
+    """
+    limits = RiskLimitsConfig()
+    assert limits.max_portfolio_delta_ars == 12_000_000.0
+    assert limits.max_daily_loss_ars is None  # sin cambios: sigue off por defecto
+    assert limits.max_open_contracts_total is None  # sin cambios: sigue off por defecto
+
+
+def test_default_portfolio_delta_cap_trips_on_the_real_observed_blowup_magnitude(tmp_path):
+    """
+    Verifica, contra el default de produccion SIN overrides, que el nuevo
+    limite de cartera (ON por defecto) efectivamente habria cortado el caso
+    real que motivo este pedido (weekly_asymmetric ~5.800 delta sin ningun
+    limite) - no solo que el mecanismo funciona con un limite de test
+    arbitrario (eso ya lo cubren los tests de arriba).
+    """
+    ks = KillSwitch(path=tmp_path / "ks.json")
+    limits = RiskLimitsConfig()  # default de produccion, sin overrides
+
+    portfolio = Portfolio()
+    portfolio.add(Position(
+        symbol="GFGC7000OC", quantity=116, multiplier=100.0,
+        greeks_per_unit={"delta": 0.5, "gamma": 0.0009, "vega": 3.2, "theta": -1.4},
+        strategy_tag="weekly_asymmetric",
+    ))
+    # delta total = 116*100*0.5 = 5800 acciones equiv. (la magnitud real
+    # observada sin limite), spot de referencia = 7000 ARS (mismo supuesto
+    # que RiskConfig.max_delta_total) -> notional = 5800*7000 = 40.600.000,
+    # muy por encima del default de 12.000.000.
+    reason = ks.evaluate(portfolio, limits, spot=7000.0)
+    assert reason is not None and "direccional agregada" in reason
+    assert ks.is_tripped() is True
+
+
 def test_evaluate_skips_delta_check_when_spot_not_provided(tmp_path):
     """
     Simetrico a como max_daily_loss_ars se omite sin realized_pnl_today_ars:

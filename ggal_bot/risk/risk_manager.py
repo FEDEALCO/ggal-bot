@@ -46,6 +46,25 @@ class RiskLimits:
     max_spread_relative: float = 0.05   # spread relativo maximo para considerar operable
     min_book_size: float = 20.0         # tamaño minimo en punta (contratos)
     min_daily_volume: float = 50.0      # volumen minimo operado reciente
+    # Tarea #27/#28 item 4 (a pedido explicito del usuario, 2026-10-02:
+    # "Limites duros de delta por estrategia y de cartera, default ON" -
+    # contexto real que lo motiva: weekly_asymmetric llego a ~5.800 delta
+    # (acciones equivalentes de GGAL) sin ningun limite). Mismo mecanismo
+    # EXACTO que max_vega_total/max_gamma_total de arriba (bloquea entradas
+    # NUEVAS via should_halt_new_positions/check_greeks_limits, evaluado
+    # por estrategia via Portfolio.greeks_for_strategy_tag - ver
+    # run_bot.py:_act_on_entry_signal) - unidad identica a totals["delta"]
+    # (Portfolio.total_greeks()/greeks_for_strategy_tag): acciones
+    # equivalentes de GGAL, multiplicador de 100 ya aplicado por contrato.
+    #
+    # Optional/default None AQUI (a nivel de dataclass): cualquier caller
+    # que construya RiskLimits() sin pasarlo explicitamente (tests
+    # existentes, usos puntuales fuera de run_bot.py) preserva el
+    # comportamiento exacto de antes de este campo - el valor REAL "default
+    # ON" que pide el usuario vive en config.RiskConfig.max_delta_total/
+    # config.ScalpingConfig.max_delta_total (ver run_bot.py.__init__, que
+    # los pasa explicitamente a cada RiskLimits de produccion).
+    max_delta_total: Optional[float] = None
 
 
 class RiskManager:
@@ -58,10 +77,16 @@ class RiskManager:
         return book.is_tradeable(self.limits.max_spread_relative, self.limits.min_book_size)
 
     def check_greeks_limits(self, totals: Dict[str, float]) -> Dict[str, bool]:
-        return {
+        checks = {
             "vega_ok": abs(totals.get("vega", 0.0)) <= self.limits.max_vega_total,
             "gamma_ok": abs(totals.get("gamma", 0.0)) <= self.limits.max_gamma_total,
         }
+        # max_delta_total es Optional (ver RiskLimits.max_delta_total): None
+        # preserva el comportamiento de antes de este campo (sin chequeo de
+        # delta) para cualquier caller que no lo configure explicitamente.
+        if self.limits.max_delta_total is not None:
+            checks["delta_ok"] = abs(totals.get("delta", 0.0)) <= self.limits.max_delta_total
+        return checks
 
     def should_halt_new_positions(self, totals: Dict[str, float]) -> bool:
         checks = self.check_greeks_limits(totals)
@@ -98,11 +123,14 @@ class RiskManager:
         """
         projected_vega = current_totals.get("vega", 0.0) + added_greeks.get("vega", 0.0)
         projected_gamma = current_totals.get("gamma", 0.0) + added_greeks.get("gamma", 0.0)
+        projected_delta = current_totals.get("delta", 0.0) + added_greeks.get("delta", 0.0)
         breaches = []
         if abs(projected_vega) > self.limits.max_vega_total * budget_fraction:
             breaches.append(f"vega proyectado={projected_vega:.2f}")
         if abs(projected_gamma) > self.limits.max_gamma_total * budget_fraction:
             breaches.append(f"gamma proyectado={projected_gamma:.2f}")
+        if self.limits.max_delta_total is not None and abs(projected_delta) > self.limits.max_delta_total * budget_fraction:
+            breaches.append(f"delta proyectado={projected_delta:.2f}")
         if not breaches:
             return None
         return (

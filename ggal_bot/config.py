@@ -338,6 +338,44 @@ class RiskConfig:
     enable_delta_hedge: bool = _env_bool("GGAL_BOT_ENABLE_DELTA_HEDGE", True)
     max_vega_total: float = 5000.0       # $ por punto de vol (1 vol point = 0.01 de IV)
     max_gamma_total: float = 2000.0      # $ por (punto de movimiento de GGAL)^2
+    # Tarea #27/#28 item 4 (a pedido explicito del usuario, 2026-10-02:
+    # "Limites duros de delta por estrategia y de cartera, default ON, con
+    # un valor que me propongas y justifiques - weekly_asymmetric llego a
+    # ~5.800 sin limite"). Mismo mecanismo que max_vega_total/max_gamma_total
+    # de arriba (RiskManager.should_halt_new_positions/check_greeks_limits,
+    # evaluado SOLO contra las Griegas de weekly_asymmetric+vol_arbitrage -
+    # ver Portfolio.greeks_for_strategy_tag y run_bot.py:
+    # _act_on_entry_signal). Unidad: acciones equivalentes de GGAL (mismo
+    # "totals['delta']" que delta_band arriba, NO notional en ARS).
+    #
+    # VALOR PROPUESTO: 1000 acciones equiv. Justificacion (orden de
+    # magnitud, con un spot de referencia de ARS 7.000 - SUPUESTO explicito
+    # no verificado, mismo criterio de honestidad que market_hours.py;
+    # recalibrar si GGAL cotiza lejos de esta zona):
+    #   - ~6.7x delta_band (150): delta_band es el umbral al que el
+    #     rehedge automatico YA deberia estar actuando (cuando
+    #     enable_delta_hedge=True) - este limite duro de ENTRADA necesita
+    #     quedar bien por encima de ese umbral para no bloquear entradas en
+    #     operacion normal mientras el hedge hace su trabajo, pero sin
+    #     dejar que la exposicion crezca sin ningun techo si el hedge
+    #     fallara o estuviera apagado.
+    #   - Notional aproximado a ese spot: ARS 7.000.000 - unas 7x el
+    #     capital propio de la estrategia (LongFirstConfig.max_capital_ars
+    #     = ARS 1.000.000), un techo de apalancamiento direccional generoso
+    #     pero finito.
+    #   - Representa una reduccion de ~83% del peor caso real observado SIN
+    #     limite (~5.800 acciones equiv. ~= ARS 40.600.000 notional al
+    #     mismo spot de referencia) - lo suficientemente bajo para haber
+    #     cortado esa acumulacion mucho antes de llegar ahi, lo
+    #     suficientemente alto para no interferir con el sizing normal de
+    #     multiples posiciones simultaneas de weekly_asymmetric/
+    #     vol_arbitrage.
+    # Ver tambien RiskLimitsConfig.max_portfolio_delta_ars (limite DURO
+    # agregado de TODA la cuenta, en ARS, via KillSwitch - cubre el riesgo
+    # CORRELACIONADO entre estrategias distintas que este limite, por
+    # construccion, no puede ver) y ScalpingConfig.max_delta_total (mismo
+    # mecanismo, techo propio y mas chico para scalping).
+    max_delta_total: float = _env_float("GGAL_BOT_MAX_DELTA_TOTAL", 1000.0)
     max_spread_relative: float = 0.05    # spread relativo maximo para considerar operable
     min_book_size: float = 20.0          # tamaño minimo en punta (contratos)
     min_daily_volume: float = 50.0       # volumen minimo operado reciente
@@ -537,13 +575,41 @@ class RiskLimitsConfig:
     # exactamente el patron de riesgo correlacionado que el mega-prompt pide
     # cubrir. Se agrava porque delta-hedging esta deshabilitado por pedido
     # explicito previo del usuario (ver comentario en risk_manager.py: "sin
-    # ningun tope de reemplazo"). None (default) = sin limite (comportamiento
-    # actual sin cambios hasta que se configure explicitamente). Unidad: ARS
-    # nocionales = |delta total del portfolio (en acciones subyacentes
-    # equivalentes)| * spot - por eso KillSwitch.evaluate() ahora acepta un
-    # `spot` opcional (ver su docstring/firma). Sin `spot` este chequeo no se
-    # evalua (no se fabrica un spot ficticio).
-    max_portfolio_delta_ars: Optional[float] = _env_float("GGAL_BOT_MAX_PORTFOLIO_DELTA_ARS", 0.0) or None
+    # ningun tope de reemplazo"). Unidad: ARS nocionales = |delta total del
+    # portfolio (en acciones subyacentes equivalentes)| * spot - por eso
+    # KillSwitch.evaluate() acepta un `spot` opcional (ver su docstring/
+    # firma). Sin `spot` este chequeo no se evalua (no se fabrica un spot
+    # ficticio).
+    #
+    # MEJORA 2026-10-02 (Tarea #27/#28 item 4, a pedido explicito del
+    # usuario: "Limites duros de delta por estrategia y de cartera, default
+    # ON"): default cambiado de None (sin limite) a un valor concreto - este
+    # es el limite DURO de TODA LA CUENTA combinada (dispara el KillSwitch,
+    # HALT total hasta reset manual, el remedio mas severo de este modulo),
+    # distinto y complementario a RiskConfig.max_delta_total/
+    # ScalpingConfig.max_delta_total (limites por-estrategia, mas chicos,
+    # que solo saltean la entrada de ESE ciclo - ver sus docstrings).
+    #
+    # VALOR PROPUESTO: ARS 12.000.000. Justificacion (mismo spot de
+    # referencia ARS 7.000 que RiskConfig.max_delta_total - SUPUESTO
+    # explicito no verificado, recalibrar si GGAL cotiza lejos de esta
+    # zona): el limite por-estrategia de weekly_asymmetric/vol_arbitrage
+    # (1000 acciones equiv.) ya representa, solo, un notional aproximado de
+    # ARS 7.000.000 a ese spot - el limite de CUENTA ENTERA tiene que
+    # superar comodamente ese numero (si no, el kill switch de cuenta
+    # dispararia ANTES de que una sola estrategia llegue a su propio techo,
+    # dejando ese limite por-estrategia sin efecto practico). ARS
+    # 12.000.000 deja margen para que weekly_asymmetric/vol_arbitrage (hasta
+    # ~1000 acciones equiv. propias) y scalping (modo aditivo, hasta ~600
+    # propias) acumulen exposicion en la MISMA direccion sin disparar el
+    # corte de cuenta por casi llegar cada una a su propio techo individual
+    # (exactamente el escenario de riesgo correlacionado que este chequeo
+    # existe para cubrir - ver test_evaluate_trips_on_correlated_delta_
+    # across_weekly_asymmetric_and_scalping), mientras sigue representando
+    # una reduccion de ~70% del peor caso real observado SIN ningun limite
+    # (~5.800 acciones equiv. de weekly_asymmetric sola ~= ARS 40.600.000
+    # notional al mismo spot de referencia).
+    max_portfolio_delta_ars: Optional[float] = _env_float("GGAL_BOT_MAX_PORTFOLIO_DELTA_ARS", 12_000_000.0) or None
 
 
 # ---------------------------------------------------------------------------
@@ -1632,6 +1698,14 @@ class ScalpingConfig:
     # mercado de la punta, no presupuesto de cartera.
     max_vega_total: float = _env_float("GGAL_BOT_SCALPING_MAX_VEGA_TOTAL", 3000.0)
     max_gamma_total: float = _env_float("GGAL_BOT_SCALPING_MAX_GAMMA_TOTAL", 1500.0)
+    # Tarea #27/#28 item 4 (2026-10-02, a pedido explicito del usuario) -
+    # ver RiskConfig.max_delta_total para la justificacion completa del
+    # mecanismo y la unidad. Mismo criterio de proporcion que max_vega_total/
+    # max_gamma_total de arriba (60%/75% de los de weekly_asymmetric,
+    # reflejando el capital/sizing por trade deliberadamente mas chico de
+    # scalping - ver max_risk_pct_per_trade): 600 = 60% de 1000, misma
+    # proporcion que max_vega_total (3000/5000 = 60%).
+    max_delta_total: float = _env_float("GGAL_BOT_SCALPING_MAX_DELTA_TOTAL", 600.0)
 
 
 # ---------------------------------------------------------------------------
