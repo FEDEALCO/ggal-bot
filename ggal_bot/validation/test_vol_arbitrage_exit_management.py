@@ -53,7 +53,39 @@ from ggal_bot.data.option_chain import OptionQuote, OrderBookSnapshot
 from ggal_bot.models.black_scholes import OptionType
 from ggal_bot.portfolio.portfolio import Position
 from ggal_bot.strategy.vol_arbitrage import TradeSignal
+import run_bot as run_bot_module
 from run_bot import GgalOptionsBot
+
+
+class _FixedNowDatetime(datetime):
+    """
+    Congela run_bot.datetime.now() a un miercoles fijo (ver
+    test_check_vol_arbitrage_exits_leaves_healthy_position_untouched) -
+    NO toca production code, solo reemplaza la referencia `datetime` en el
+    namespace de run_bot.py durante un test puntual.
+
+    BUG DE AISLAMIENTO REAL (hallado 2026-10-02, primer viernes calendario
+    en que corrio esta suite - no relacionado con ningun item de Tarea #27):
+    _check_vol_arbitrage_exits() usa `datetime.now(timezone.utc)` real (sin
+    forma de inyectar "now" desde afuera, a diferencia de
+    RiskManager.evaluate_position_exit(), que SI recibe `now` como
+    parametro explicito). RiskManager.evaluate_position_exit() fuerza un
+    cierre via "weekend_theta_guard" cualquier viernes (now.weekday()==4,
+    ver risk_manager.py) sin importar el precio - comportamiento real,
+    intencional y documentado del bot (protege contra decay de fin de
+    semana sin rueda para reaccionar). Este test en particular espera "la
+    posicion sana queda intacta" evaluando SOLO movimiento de precio
+    (+2.8%, no dispara stop/take profit) - una premisa que dejo de
+    cumplirse automaticamente el primer viernes real en que se ejecuto,
+    sin que nada del codigo ni de Tarea #27 haya cambiado. Se fija "now" a
+    un miercoles para que el resultado sea deterministico el 365/366 dias
+    del año, no solo de lunes a jueves.
+    """
+    _FIXED = datetime(2026, 9, 16, 15, 0, 0, tzinfo=timezone.utc)  # miercoles
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls._FIXED.astimezone(tz) if tz is not None else cls._FIXED
 
 
 def _make_vol_arbitrage_bot() -> GgalOptionsBot:
@@ -131,13 +163,15 @@ def test_check_vol_arbitrage_exits_closes_position_on_stop_loss():
 def test_check_vol_arbitrage_exits_leaves_healthy_position_untouched():
     original_strategy = SETTINGS.strategy.active
     original_shadow = SETTINGS.shadow.enabled
+    original_datetime = run_bot_module.datetime
+    run_bot_module.datetime = _FixedNowDatetime  # ver docstring de _FixedNowDatetime
     try:
         bot = _make_vol_arbitrage_bot()
         bot.portfolio.add(Position(
             symbol="GFGC7000OC", quantity=3, multiplier=100.0,
             greeks_per_unit={"delta": 0.4, "gamma": 0.001, "vega": 2.0, "theta": -1.0},
             expiry=date(2026, 12, 18),
-            entry_price=180.0, entry_time=datetime.now(timezone.utc) - timedelta(days=1),
+            entry_price=180.0, entry_time=_FixedNowDatetime.now() - timedelta(days=1),
             strategy_tag="vol_arbitrage",
         ))
         _upsert_quote(bot, "GFGC7000OC", mid=185.0)  # +2.8%, no dispara nada
@@ -149,6 +183,7 @@ def test_check_vol_arbitrage_exits_leaves_healthy_position_untouched():
     finally:
         SETTINGS.strategy.active = original_strategy
         SETTINGS.shadow.enabled = original_shadow
+        run_bot_module.datetime = original_datetime
 
 
 def test_check_vol_arbitrage_exits_noop_when_disabled():
