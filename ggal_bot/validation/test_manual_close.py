@@ -15,7 +15,13 @@ import pytest
 from ggal_bot.validation import _shadow_audit_isolation  # noqa: F401
 
 from ggal_bot.execution.order_gateway import OrderSide, ShadowAuditLogger
-from ggal_bot.ops.manual_close import close_position_manually, determine_close_order
+from ggal_bot.ops.manual_close import (
+    close_position_manually,
+    close_position_manually_from_journal,
+    determine_close_order,
+    determine_close_order_from_journal,
+)
+from ggal_bot.portfolio.event_journal import PositionEventJournal
 
 pytest.importorskip("pandas")
 
@@ -168,10 +174,171 @@ def test_close_position_manually_rejects_sell_when_symbol_already_flat(tmp_path)
         )
 
 
+def _write_journal_event(path, journal=None, **kwargs):
+    j = journal if journal is not None else PositionEventJournal(path=path)
+    j.log_event(**kwargs)
+    return j
+
+
+def test_determine_close_order_from_journal_detects_sell_needed_for_a_long_option_position(tmp_path):
+    """
+    ACTUALIZACION 2026-10-02: caso real de produccion (GFGC6800OC qty=7,
+    weekly_asymmetric) que determine_close_order() (shadow_trades.csv) ya
+    NO podia encontrar porque ese archivo dejo de recibir todos los fills
+    desde que la reconciliacion de arranque paso a usar el Event Journal -
+    ver docstring de determine_close_order_from_journal().
+    """
+    journal_path = tmp_path / "position_events.csv"
+    _write_journal_event(
+        journal_path, event_type="ENTRY", position_id="pos-1", symbol="GFGC6800OC",
+        strategy_tag="weekly_asymmetric", side="buy", quantity_delta=7, quantity_after=7,
+        price=38.0, reason="entry_signal",
+    )
+
+    result = determine_close_order_from_journal("GFGC6800OC", journal_path=journal_path)
+    assert result is not None
+    side, qty, position_id, contract_key = result
+    assert side == OrderSide.SELL
+    assert qty == 7.0
+    assert position_id == "pos-1"
+
+
+def test_determine_close_order_from_journal_detects_buy_needed_for_a_short_option_position(tmp_path):
+    """Caso real: GFGV5000OC qty=-75 (put vendido), weekly_asymmetric."""
+    journal_path = tmp_path / "position_events.csv"
+    _write_journal_event(
+        journal_path, event_type="ENTRY", position_id="pos-2", symbol="GFGV5000OC",
+        strategy_tag="weekly_asymmetric", side="sell", quantity_delta=-75, quantity_after=-75,
+        price=20.0, reason="entry_signal",
+    )
+
+    result = determine_close_order_from_journal("GFGV5000OC", journal_path=journal_path)
+    assert result is not None
+    side, qty, position_id, contract_key = result
+    assert side == OrderSide.BUY
+    assert qty == 75.0
+
+
+def test_determine_close_order_from_journal_returns_none_when_already_closed(tmp_path):
+    journal_path = tmp_path / "position_events.csv"
+    journal = _write_journal_event(
+        journal_path, event_type="ENTRY", position_id="pos-3", symbol="GFGC7000OC",
+        strategy_tag="weekly_asymmetric", side="buy", quantity_delta=9, quantity_after=9,
+        price=480.0, reason="entry_signal",
+    )
+    journal.log_event(
+        "CLOSE", position_id="pos-3", symbol="GFGC7000OC", strategy_tag="weekly_asymmetric",
+        side="sell", quantity_delta=-9, quantity_after=0.0, price=490.0, reason="exit_signal",
+    )
+
+    assert determine_close_order_from_journal("GFGC7000OC", journal_path=journal_path) is None
+
+
+def test_determine_close_order_from_journal_raises_when_symbol_open_in_more_than_one_strategy(tmp_path):
+    journal_path = tmp_path / "position_events.csv"
+    journal = _write_journal_event(
+        journal_path, event_type="ENTRY", position_id="pos-4a", symbol="GFGC6600OC",
+        strategy_tag="weekly_asymmetric", side="buy", quantity_delta=2, quantity_after=2,
+        price=56.0, reason="entry_signal",
+    )
+    journal.log_event(
+        "ENTRY", position_id="pos-4b", symbol="GFGC6600OC", strategy_tag="scalping",
+        side="buy", quantity_delta=8, quantity_after=8, price=57.0, reason="entry_signal",
+    )
+
+    with pytest.raises(ValueError, match="mas de una estrategia"):
+        determine_close_order_from_journal("GFGC6600OC", journal_path=journal_path)
+
+    # Con --strategy-tag explicito, desambigua sin problema.
+    result = determine_close_order_from_journal(
+        "GFGC6600OC", strategy_tag="scalping", journal_path=journal_path,
+    )
+    assert result is not None
+    assert result[1] == 8.0
+
+
+def test_close_position_manually_from_journal_rejects_missing_or_zero_price(tmp_path):
+    journal_path = tmp_path / "position_events.csv"
+    _write_journal_event(
+        journal_path, event_type="ENTRY", position_id="pos-5", symbol="GFGC6800OC",
+        strategy_tag="weekly_asymmetric", side="buy", quantity_delta=7, quantity_after=7,
+        price=38.0, reason="entry_signal",
+    )
+
+    with pytest.raises(ValueError, match="precio de mercado real"):
+        close_position_manually_from_journal("GFGC6800OC", 0.0, journal_path=journal_path)
+
+
+def test_close_position_manually_from_journal_rejects_symbol_with_no_open_position(tmp_path):
+    journal_path = tmp_path / "position_events.csv"
+
+    with pytest.raises(ValueError, match="no se encontro una posicion abierta"):
+        close_position_manually_from_journal("GFGC6800OC", 39.08, journal_path=journal_path)
+
+
+def test_close_position_manually_from_journal_writes_close_event_and_shadow_fill_and_leaves_position_at_zero(tmp_path):
+    """
+    Caso real de produccion: GFGC6800OC qty=7 (weekly_asymmetric), sin
+    cotizacion operable en la fuente del bot (ver logs/ggal_bot.log,
+    7 intentos fallidos de _perform_shadow_reset()) pero con cotizacion
+    real vigente confirmada via IOL (bid=38.15/ask=40, 2026-10-02).
+    """
+    journal_path = tmp_path / "position_events.csv"
+    shadow_path = tmp_path / "shadow_trades.csv"
+    _write_journal_event(
+        journal_path, event_type="ENTRY", position_id="pos-6", contract_key="GGAL|GFGC6800OC|2026-10-16",
+        symbol="GFGC6800OC", strategy_tag="weekly_asymmetric", side="buy", quantity_delta=7,
+        quantity_after=7, price=38.0, reason="entry_signal",
+    )
+
+    side, qty = close_position_manually_from_journal(
+        "GFGC6800OC", 39.08, journal_path=journal_path, shadow_csv_path=shadow_path,
+    )
+    assert side == OrderSide.SELL
+    assert qty == 7.0
+
+    # El Event Journal (la fuente que reconcilia el proximo arranque) ya
+    # no ve ninguna posicion abierta para este symbol.
+    assert determine_close_order_from_journal("GFGC6800OC", journal_path=journal_path) is None
+
+    # Y tambien quedo un fill en shadow_trades.csv (compatibilidad hacia
+    # atras con cualquier consumidor que siga leyendo ese archivo).
+    from dashboard.pnl_engine import load_fills
+
+    fills = load_fills(shadow_path)
+    assert len(fills) == 1
+    assert fills.iloc[0]["side"] == "sell"
+    assert fills.iloc[0]["quantity"] == 7.0
+    assert fills.iloc[0]["fill_price"] == 39.08
+    assert str(fills.iloc[0]["client_order_id"]).startswith("manual-close-")
+
+
+def test_close_position_manually_from_journal_rejects_explicit_quantity_that_would_go_net_short(tmp_path):
+    journal_path = tmp_path / "position_events.csv"
+    _write_journal_event(
+        journal_path, event_type="ENTRY", position_id="pos-7", symbol="GFGC6800OC",
+        strategy_tag="weekly_asymmetric", side="buy", quantity_delta=7, quantity_after=7,
+        price=38.0, reason="entry_signal",
+    )
+
+    with pytest.raises(ValueError, match="posicion NETA CORTA"):
+        close_position_manually_from_journal(
+            "GFGC6800OC", 39.08, quantity=25.0, side=OrderSide.SELL, journal_path=journal_path,
+        )
+
+
 ALL_TESTS = [
     test_determine_close_order_detects_sell_needed_for_a_long_option_position,
     test_determine_close_order_detects_buy_needed_for_a_short_underlying_position,
     test_determine_close_order_returns_none_when_symbol_already_flat,
+    test_determine_close_order_from_journal_detects_sell_needed_for_a_long_option_position,
+    test_determine_close_order_from_journal_detects_buy_needed_for_a_short_option_position,
+    test_determine_close_order_from_journal_returns_none_when_already_closed,
+    test_determine_close_order_from_journal_raises_when_symbol_open_in_more_than_one_strategy,
+    test_close_position_manually_from_journal_rejects_missing_or_zero_price,
+    test_close_position_manually_from_journal_rejects_symbol_with_no_open_position,
+    test_close_position_manually_from_journal_writes_close_event_and_shadow_fill_and_leaves_position_at_zero,
+    test_close_position_manually_from_journal_rejects_explicit_quantity_that_would_go_net_short,
 ]
 
 
