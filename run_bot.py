@@ -567,6 +567,14 @@ class GgalOptionsBot:
         # Idem, para el gate de horario de rueda (MEJORA 2026-10-01, ver
         # RiskConfig.enforce_market_hours_gate / recompute_cycle()).
         self._market_hours_gate_logged = False
+        # Dedupe de alertas de invariantes de posicion: sin esto, una
+        # violacion persistente (p.ej. posicion neta corta sin
+        # financed_by_symbol) se re-logueaba en CADA ciclo (~2-4s), llenando
+        # el log en produccion. Guardamos el TEXTO exacto de cada violacion
+        # vigente (no solo un booleano) para poder re-alertar si el texto
+        # cambia (otra posicion, otro motivo) o si la violacion se resuelve
+        # y luego reaparece.
+        self._position_invariant_violations_alerted: set = set()
 
     # -- Callbacks de mercado ---------------------------------------------
 
@@ -1210,12 +1218,23 @@ class GgalOptionsBot:
         consumada (ej. remanente de un bug anterior a este fix, o una
         ventana breve entre dos pasos del mismo ciclo) incluso si ningun
         guard la bloqueo a tiempo.
+
+        Dedupe (ver comentario en __init__): se loguea solo el texto de
+        violacion que sea NUEVO o distinto del vigente en el ciclo anterior,
+        para no inundar el log en produccion con la misma alerta cada
+        ~2-4s mientras la violacion persiste sin cambios. Si la violacion
+        se resuelve y mas tarde reaparece (identica o no), se vuelve a
+        alertar, porque _position_invariant_violations_alerted siempre
+        refleja el estado VIGENTE, no un historial acumulado.
         """
         if not SETTINGS.risk.enforce_position_invariants:
             return
         violations = invariants.check_portfolio_invariants(self.portfolio)
-        for v in violations:
+        current = set(violations)
+        new_or_changed = current - self._position_invariant_violations_alerted
+        for v in new_or_changed:
             logger.error("INVARIANTE DE RIESGO VIOLADA (estado actual del portfolio): %s", v)
+        self._position_invariant_violations_alerted = current
 
     def _warn_positions_without_valid_quote(self, now: Optional[float] = None) -> None:
         """

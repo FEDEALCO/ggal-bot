@@ -247,3 +247,96 @@ def test_warn_position_invariant_violations_logs_but_does_not_raise(caplog):
     finally:
         SETTINGS.shadow.enabled = original_enabled
         SETTINGS.risk.enforce_position_invariants = original_invariants
+
+
+def test_warn_position_invariant_violations_dedupes_identical_violation_across_cycles(caplog):
+    """
+    FIX 2026-10-02 (a pedido explicito del usuario, hallado en logs de
+    produccion: el mismo ERROR de GFGV5000OC se repitio cientos de veces en
+    una hora, un ciclo cada ~4s, mientras la violacion seguia sin
+    resolverse): una violacion con el MISMO texto exacto no debe volver a
+    alertarse en el ciclo siguiente si nada cambio - solo la PRIMERA vez.
+    """
+    original_enabled = SETTINGS.shadow.enabled
+    original_invariants = SETTINGS.risk.enforce_position_invariants
+    SETTINGS.shadow.enabled = True
+    SETTINGS.risk.enforce_position_invariants = True
+    try:
+        bot = GgalOptionsBot()
+        bot.portfolio.add(Position(symbol="GFGC9999OC", quantity=-3.0, multiplier=100.0, strategy_tag="weekly_asymmetric"))
+
+        # caplog.clear() justo antes del bloque: GgalOptionsBot() ya emitio
+        # sus propios WARNING de arranque (SHADOW MODE, etc.) que caplog
+        # captura independientemente del nivel pedido en at_level() -
+        # limpiarlo aca es lo que permite contar SOLO las alertas de esta
+        # funcion (mismo criterio que el resto de este archivo, que filtra
+        # por contenido del mensaje en vez de por cantidad cruda).
+        caplog.clear()
+        with caplog.at_level("ERROR"):
+            bot._warn_position_invariant_violations()  # ciclo 1: primera vez, debe alertar
+            first_cycle_alerts = [r for r in caplog.records if "INVARIANTE DE RIESGO VIOLADA" in r.message]
+            first_cycle_count = len(first_cycle_alerts)
+            bot._warn_position_invariant_violations()  # ciclo 2: identica, NO debe repetir
+            bot._warn_position_invariant_violations()  # ciclo 3: identica, NO debe repetir
+
+        all_alerts = [r for r in caplog.records if "INVARIANTE DE RIESGO VIOLADA" in r.message]
+        assert first_cycle_count == 1
+        assert len(all_alerts) == 1, "la violacion identica se repitio en vez de deduplicarse"
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+        SETTINGS.risk.enforce_position_invariants = original_invariants
+
+
+def test_warn_position_invariant_violations_realerts_when_the_violation_text_changes(caplog):
+    """Complementa el test de dedupe de arriba: si la violacion CAMBIA (ej.
+    la cantidad descubierta cambia porque la posicion se movio), es un
+    estado NUEVO y debe alertar de nuevo - el dedupe es por texto exacto,
+    nunca por simbolo solo."""
+    original_enabled = SETTINGS.shadow.enabled
+    original_invariants = SETTINGS.risk.enforce_position_invariants
+    SETTINGS.shadow.enabled = True
+    SETTINGS.risk.enforce_position_invariants = True
+    try:
+        bot = GgalOptionsBot()
+        pos = Position(symbol="GFGC9999OC", quantity=-3.0, multiplier=100.0, strategy_tag="weekly_asymmetric")
+        bot.portfolio.add(pos)
+
+        caplog.clear()  # ver comentario en el test de dedupe de arriba
+        with caplog.at_level("ERROR"):
+            bot._warn_position_invariant_violations()  # ciclo 1
+            pos.quantity = -5.0  # el estado de la violacion cambio (nueva cantidad descubierta)
+            bot._warn_position_invariant_violations()  # ciclo 2: texto distinto, debe alertar de nuevo
+
+        all_alerts = [r for r in caplog.records if "INVARIANTE DE RIESGO VIOLADA" in r.message]
+        assert len(all_alerts) == 2
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+        SETTINGS.risk.enforce_position_invariants = original_invariants
+
+
+def test_warn_position_invariant_violations_realerts_after_violation_is_resolved_and_recurs(caplog):
+    """Si la violacion desaparece (se resuelve) y despues VUELVE a aparecer
+    con el MISMO texto, debe alertar de nuevo - el set de deduplicacion
+    representa el estado ACTUAL, no un historico acumulado para siempre."""
+    original_enabled = SETTINGS.shadow.enabled
+    original_invariants = SETTINGS.risk.enforce_position_invariants
+    SETTINGS.shadow.enabled = True
+    SETTINGS.risk.enforce_position_invariants = True
+    try:
+        bot = GgalOptionsBot()
+        pos = Position(symbol="GFGC9999OC", quantity=-3.0, multiplier=100.0, strategy_tag="weekly_asymmetric")
+        bot.portfolio.add(pos)
+
+        caplog.clear()  # ver comentario en el test de dedupe de arriba
+        with caplog.at_level("ERROR"):
+            bot._warn_position_invariant_violations()  # ciclo 1: alerta
+            pos.quantity = 0.0  # se resolvio (ya no es neta corta)
+            bot._warn_position_invariant_violations()  # ciclo 2: sin violacion, nada que alertar
+            pos.quantity = -3.0  # reaparece, mismo texto exacto que el ciclo 1
+            bot._warn_position_invariant_violations()  # ciclo 3: debe alertar de nuevo
+
+        all_alerts = [r for r in caplog.records if "INVARIANTE DE RIESGO VIOLADA" in r.message]
+        assert len(all_alerts) == 2
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+        SETTINGS.risk.enforce_position_invariants = original_invariants
