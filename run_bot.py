@@ -43,6 +43,7 @@ from ggal_bot.models.implied_vol import ImpliedVolatilityCalculator
 from ggal_bot.models.volatility_surface import VolatilitySurface
 from ggal_bot.portfolio.portfolio import Portfolio, Position
 from ggal_bot.portfolio.event_journal import PositionEventJournal
+from ggal_bot.portfolio.portfolio_greeks_log import PortfolioGreeksLogger
 from ggal_bot.data.market_snapshot_log import MarketSnapshotLogger
 from ggal_bot.data.signal_funnel_log import SignalFunnelLogger
 from ggal_bot.data.ccl_bond_quote_log import CclBondQuoteLogger
@@ -450,6 +451,12 @@ class GgalOptionsBot:
         # arriba y _warn_positions_without_valid_quote): es la base para
         # poder backtestear offline cualquier mejora futura.
         self.market_snapshot_log = MarketSnapshotLogger()
+
+        # -- Logger periodico de Griegas de cartera y por estrategia (Tarea
+        # #27/#28 item 5, 2026-10-02, a pedido explicito del usuario) - ver
+        # ggal_bot/portfolio/portfolio_greeks_log.py. Instanciado SIEMPRE
+        # (igual que market_snapshot_log arriba): default ON, sin flag.
+        self.portfolio_greeks_log = PortfolioGreeksLogger()
 
         # -- Cotizaciones de bonos para CCL implicito (MEJORA 2026-09-30,
         # ver ggal_bot/data/ccl_bond_quote_log.py y REPORT.md) - instanciado
@@ -1082,6 +1089,22 @@ class GgalOptionsBot:
         totals = self.portfolio.total_greeks()
         if self.risk_manager.should_halt_new_positions(totals):
             logger.warning(self.risk_manager.breach_report(totals))
+
+        # Tarea #27/#28 item 5 (2026-10-02, a pedido explicito del
+        # usuario): registro periodico de Griegas de cartera + por
+        # estrategia, un archivo HISTORICO (nunca se sobreescribe) a
+        # diferencia del snapshot vivo que ya publica self.state_writer.
+        # Reusa `totals` (ya calculado arriba) para el scope "portfolio";
+        # VALID_STRATEGIES cubre las 3 estrategias posibles sin importar
+        # cual este activa como principal (scalping puede tener posiciones
+        # propias en modo aditivo aunque no sea la activa - ver
+        # Portfolio.greeks_for_strategy_tag). Un fallo de disco aca nunca
+        # debe tumbar el ciclo de trading real (ver
+        # PortfolioGreeksLogger._write_rows).
+        self.portfolio_greeks_log.log_greeks(
+            portfolio_totals=totals,
+            per_strategy_totals={tag: self.portfolio.greeks_for_strategy_tag(tag) for tag in VALID_STRATEGIES},
+        )
 
         if self._market_data_is_reliable_for_trading():
             self._maybe_hedge(totals, spot)

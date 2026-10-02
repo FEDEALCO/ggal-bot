@@ -90,5 +90,16 @@ CCL_BOND_QUOTES_LOG = LOGS_DIR / "ccl_bond_quotes.csv"
 # ggal_bot/data/market_data_source_log.py.
 MARKET_DATA_SOURCE_LOG = LOGS_DIR / "market_data_source_log.csv"
 
+# Tarea #27/#28 item 5 (a pedido explicito del usuario, 2026-10-02):
+# "Logger periodico de griegas de cartera y por estrategia, default ON".
+# StateWriter (ggal_bot/state_writer.py) ya publica portfolio_greeks_total/
+# portfolio_greeks_by_expiry en bot_state.json, pero ES UN SNAPSHOT VIVO
+# (se SOBREESCRIBE cada ciclo, escritura atomica) - no queda NINGUN
+# historial de como evolucionaron las griegas en el tiempo, y tampoco
+# desagrega por estrategia (strategy_tag). Archivo NUEVO, append-only,
+# mismo criterio que MARKET_SNAPSHOT_LOG/SIGNAL_FUNNEL_LOG de arriba - ver
+# ggal_bot/portfolio/portfolio_greeks_log.py.
+PORTFOLIO_GREEKS_LOG = LOGS_DIR / "portfolio_greeks_log.csv"
+
 for _dir in (LOGS_DIR, STATE_DIR, DATA_DIR):
     _dir.mkdir(parents=True, exist_ok=True)
