@@ -650,6 +650,35 @@ class ShadowConfig:
     # modulo no se auto-apaga, ver docstring de _perform_shadow_reset).
     reset_on_start: bool = _env_bool("GGAL_BOT_SHADOW_RESET_ON_START", False)
 
+    # Tarea #27/#28 item 3 (a pedido explicito del usuario, 2026-10-02):
+    # "quiero que mock directamente no se pueda instanciar fuera de
+    # tests/dev (flag explicito)". Contexto real que lo motiva: el
+    # market-hours gate (MEJORA 2026-10-01, RiskConfig.
+    # enforce_market_hours_gate) ya BLOQUEA el despacho de entradas/
+    # salidas/hedges cuando la fuente activa es MockReplaySource, pero eso
+    # no evita que el failover automatico de LiveShadowFeed
+    # (_instantiate_first_available/_advance_to_next_source, "nunca falla")
+    # instancie Mock en silencio y seguir alimentando el resto del
+    # pipeline (dashboard, mark-to-market de posiciones abiertas, snapshot
+    # de la cadena de opciones) con datos 100% sinteticos sin que el
+    # operador lo haya habilitado a proposito - exactamente la clase de
+    # incidente que origino el caso GFGC6600OC (ver
+    # dashboard/data/market_hours_quality.py).
+    #
+    # Default False (guarda reductora de riesgo, consistente con
+    # enforce_market_hours_gate/enforce_position_invariants de este mismo
+    # archivo): fuera de un proceso de tests, construir MockReplaySource()
+    # sin este flag en True levanta RuntimeError (ver su __init__) - tanto
+    # si "mock" aparece explicito en source_priority como si es el ultimo
+    # recurso incondicional del failover (ver LiveShadowFeed, que atrapa
+    # ese RuntimeError y degrada a _NoDataSource en vez de crashear el
+    # proceso o fabricar datos). La suite de tests (ggal_bot/validation/
+    # _env_isolation.py) lo fuerza a True automaticamente para toda
+    # corrida de pytest - "tests" es, literalmente, la excepcion que el
+    # usuario pidio. Para desarrollo local fuera de tests, setear
+    # GGAL_BOT_ALLOW_MOCK_SOURCE=true a mano en el .env local.
+    allow_mock_source: bool = _env_bool("GGAL_BOT_ALLOW_MOCK_SOURCE", False)
+
     def source_priority(self) -> Tuple[str, ...]:
         """
         Devuelve la lista de fuentes candidatas, en orden de preferencia,

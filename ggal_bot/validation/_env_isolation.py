@@ -57,6 +57,20 @@ Ver tambien el fixture `_assert_no_real_credentials_leaked` en conftest.py:
 defensa adicional, por-test, contra el caso (distinto del que resuelve este
 modulo) de que un test individual setee una variable real a mano con
 os.environ[...] = ... y se olvide de restaurarla.
+
+EXCEPCION DELIBERADA - GGAL_BOT_ALLOW_MOCK_SOURCE (2026-10-02, a pedido
+explicito del usuario, item 3 de su instruccion): ShadowConfig.allow_mock_source
+(ver ggal_bot/config.py) ahora bloquea la construccion de MockReplaySource
+fuera de "tests/dev" - exactamente las palabras del usuario. Este modulo ES
+el punto de verdad de "estamos en la suite de tests" (se importa a nivel de
+import, antes de que config.py congele sus defaults), asi que es el lugar
+correcto para otorgar esa unica excepcion explicita: fuerza
+GGAL_BOT_ALLOW_MOCK_SOURCE=true para toda corrida de tests, DESPUES de la
+purga de variables peligrosas de arriba (si el usuario tuviera esa variable
+en su .env/entorno real, igual queda purgada primero y resetada a "true" aca
+de forma deliberada y explicita - no es una fuga, es la excepcion pedida).
+Sin esto, toda la suite existente que construye MockReplaySource/LiveShadowFeed
+con mock en su source_priority empezaria a fallar con el RuntimeError nuevo.
 """
 from __future__ import annotations
 
@@ -98,3 +112,7 @@ except ImportError:
 for _name in list(os.environ.keys()):
     if _is_dangerous(_name):
         os.environ.pop(_name, None)
+
+# 3) Excepcion deliberada "tests/dev" para MockReplaySource (ver docstring
+# de arriba): se fuerza DESPUES de la purga de (2), nunca antes.
+os.environ["GGAL_BOT_ALLOW_MOCK_SOURCE"] = "true"

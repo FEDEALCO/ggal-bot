@@ -35,6 +35,7 @@ from ggal_bot.data.live_shadow_feed import (
     PrimaryMarketDataSource,
     RawQuote,
     ShadowDataSource,
+    _NoDataSource,
     _parse_data912_option_symbol,
 )
 from ggal_bot.models.black_scholes import OptionType
@@ -140,6 +141,93 @@ def test_mock_replay_source_is_deterministic_with_fixed_seed():
         assert abs(spot_a.last_price - spot_b.last_price) < 1e-9
     finally:
         SETTINGS.shadow.mock_random_seed = original_seed
+
+
+# ---------------------------------------------------------------------------
+# ShadowConfig.allow_mock_source: MockReplaySource no debe poder
+# instanciarse fuera de tests/dev sin el flag explicito (Tarea #27/#28 item
+# 3, 2026-10-02, a pedido explicito del usuario). La suite entera corre con
+# GGAL_BOT_ALLOW_MOCK_SOURCE=true forzado por
+# ggal_bot/validation/_env_isolation.py (ver su docstring: es la unica
+# excepcion deliberada a la purga de variables de entorno), asi que estos
+# tests simulan el caso "flag deshabilitado" seteando SETTINGS.shadow.
+# allow_mock_source = False puntualmente, nunca tocando la variable de
+# entorno real.
+# ---------------------------------------------------------------------------
+
+def test_mock_replay_source_raises_when_not_explicitly_allowed():
+    """Fuera de tests/dev (flag en False), MockReplaySource() debe lanzar RuntimeError, nunca fabricar datos en silencio."""
+    original = SETTINGS.shadow.allow_mock_source
+    SETTINGS.shadow.allow_mock_source = False
+    try:
+        try:
+            MockReplaySource()
+            assert False, "se esperaba RuntimeError con allow_mock_source=False"
+        except RuntimeError:
+            pass
+    finally:
+        SETTINGS.shadow.allow_mock_source = original
+
+
+def test_mock_replay_source_constructs_normally_when_explicitly_allowed():
+    """Con el flag explicito en True (el caso de tests/dev), MockReplaySource sigue funcionando como siempre."""
+    original = SETTINGS.shadow.allow_mock_source
+    SETTINGS.shadow.allow_mock_source = True
+    try:
+        source = MockReplaySource()
+        assert len(source.bootstrap()) > 0
+    finally:
+        SETTINGS.shadow.allow_mock_source = original
+
+
+def test_live_shadow_feed_degrades_to_no_data_source_when_all_sources_fail_and_mock_disallowed():
+    """
+    BUG REAL EVITADO (Tarea #27/#28 item 3): sin esta mejora, si todas las
+    fuentes reales fallan, LiveShadowFeed caia SIEMPRE a MockReplaySource de
+    forma incondicional, sin que el operador lo supiera. Con
+    allow_mock_source=False, ese ultimo recurso debe degradar a
+    _NoDataSource (sin dato, nunca fabricado sin autorizacion) en vez de
+    lanzar o fabricar datos sinteticos igual.
+    """
+    original_allow = SETTINGS.shadow.allow_mock_source
+    SETTINGS.shadow.allow_mock_source = False
+    try:
+        feed = LiveShadowFeed(on_book_update=lambda *_: None)
+        feed._priority = ("failing",)  # 'mock' deliberadamente ausente de esta prioridad
+        feed._source = _AlwaysFailingSource()
+        feed._source_index = 0
+
+        advanced = feed._advance_to_next_source()
+        assert advanced is True
+        assert isinstance(feed._source, _NoDataSource)
+
+        spot, options = feed._source.fetch_snapshot()
+        assert spot is None and options == {}
+        assert feed._source.is_available() is False
+
+        # Ya en _NoDataSource, no hay nada mas conservador a donde avanzar.
+        assert feed._advance_to_next_source() is False
+    finally:
+        SETTINGS.shadow.allow_mock_source = original_allow
+
+
+def test_probe_returns_none_without_crashing_when_mock_explicit_in_priority_but_disallowed():
+    """
+    Misconfiguracion real: el operador puso 'mock' a proposito en
+    source_priority sin setear GGAL_BOT_ALLOW_MOCK_SOURCE=true. _probe()
+    debe devolver None (se loguea a ERROR, mas visible que un WARNING de
+    'no disponible') en vez de propagar el RuntimeError y tirar el proceso.
+    """
+    original_allow = SETTINGS.shadow.allow_mock_source
+    SETTINGS.shadow.allow_mock_source = False
+    try:
+        feed = LiveShadowFeed(on_book_update=lambda *_: None)
+        feed._priority = ("mock",)
+        feed._source_index = 0
+        result = feed._probe("mock")
+        assert result is None
+    finally:
+        SETTINGS.shadow.allow_mock_source = original_allow
 
 
 def test_live_shadow_feed_forces_mock_source_via_config():
@@ -1222,6 +1310,10 @@ ALL_TESTS = [
     test_mock_replay_source_bootstrap_generates_calls_and_puts_both_expiries,
     test_mock_replay_source_fetch_snapshot_produces_valid_books,
     test_mock_replay_source_is_deterministic_with_fixed_seed,
+    test_mock_replay_source_raises_when_not_explicitly_allowed,
+    test_mock_replay_source_constructs_normally_when_explicitly_allowed,
+    test_live_shadow_feed_degrades_to_no_data_source_when_all_sources_fail_and_mock_disallowed,
+    test_probe_returns_none_without_crashing_when_mock_explicit_in_priority_but_disallowed,
     test_live_shadow_feed_forces_mock_source_via_config,
     test_live_shadow_feed_auto_falls_back_to_mock_without_network,
     test_shadow_config_source_priority_explicit_list,

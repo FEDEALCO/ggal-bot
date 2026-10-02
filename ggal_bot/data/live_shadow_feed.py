@@ -328,6 +328,25 @@ class MockReplaySource(ShadowDataSource):
     """
 
     def __init__(self):
+        # Tarea #27/#28 item 3 (a pedido explicito del usuario, 2026-10-02):
+        # "que mock directamente no se pueda instanciar fuera de tests/dev
+        # (flag explicito)" - ver ShadowConfig.allow_mock_source. Se
+        # verifica ACA, en el constructor mismo, para que sea imposible
+        # obtener una instancia funcional de MockReplaySource por NINGUN
+        # camino (explicito en source_priority, o el failover incondicional
+        # de LiveShadowFeed) sin el flag en True. LiveShadowFeed atrapa este
+        # RuntimeError especificamente y degrada a _NoDataSource en vez de
+        # crashear el proceso o, peor, fabricar datos sin que el operador
+        # lo haya habilitado a proposito.
+        if not SETTINGS.shadow.allow_mock_source:
+            raise RuntimeError(
+                "MockReplaySource esta deshabilitado fuera de tests/dev "
+                "(ShadowConfig.allow_mock_source=False). Si esto es una corrida de "
+                "desarrollo local intencional, setea GGAL_BOT_ALLOW_MOCK_SOURCE=true "
+                "en tu .env. Si esto ocurrio en produccion/shadow real, es el failover "
+                "automatico de LiveShadowFeed intentando caer a datos sinteticos - "
+                "revisar por que todas las fuentes reales configuradas fallaron."
+            )
         cfg = SETTINGS.shadow
         self._cfg = cfg
         self._rng = random.Random(cfg.mock_random_seed) if cfg.mock_random_seed else random.Random()
@@ -1177,6 +1196,33 @@ class BrokerRestSource(ShadowDataSource):
         return spot_quote, option_quotes
 
 
+class _NoDataSource(ShadowDataSource):
+    """
+    Fuente nula: nunca falla al construirse, nunca devuelve ningun dato.
+    UNICO uso (Tarea #27/#28 item 3, 2026-10-02): cuando TODAS las fuentes
+    reales configuradas en source_priority() fallaron Y el fallback
+    incondicional a MockReplaySource esta deshabilitado (ShadowConfig.
+    allow_mock_source=False, el default fuera de tests/dev - ver
+    MockReplaySource.__init__). Antes de esta mejora, ese caso extremo
+    caia SIEMPRE a datos 100% sinteticos sin que el operador lo supiera;
+    ahora el bot se queda sin ninguna cotizacion en vez de fabricar una -
+    las guardas YA EXISTENTES de staleness/horario (RiskConfig.
+    max_market_data_staleness_seconds, enforce_market_hours_gate) se
+    encargan de que el bot deje de operar sobre datos ausentes, en vez de
+    crashear el proceso (mismo principio que _safe_call: ninguna fuente
+    debe poder tirar el loop principal).
+    """
+
+    def bootstrap(self) -> List[Tuple[str, OptionType, float, date]]:
+        return []
+
+    def fetch_snapshot(self) -> Tuple[Optional[RawQuote], Dict[str, RawQuote]]:
+        return None, {}
+
+    def is_available(self) -> bool:
+        return False
+
+
 # Factoria de fuentes por nombre, usada por LiveShadowFeed para resolver
 # ShadowConfig.source_priority() (ej. "primary_ws,data912,mock") en
 # instancias concretas. Agregar aca cualquier fuente nueva que se sume en el
@@ -1277,9 +1323,42 @@ class LiveShadowFeed:
         if factory is None:
             logger.warning("Shadow feed: nombre de fuente desconocido '%s' en source_priority; se ignora.", name)
             return None
-        source = factory()
+        try:
+            source = factory()
+        except RuntimeError as exc:
+            # Tarea #27/#28 item 3 (2026-10-02): "mock" aparece EXPLICITO en
+            # source_priority pero ShadowConfig.allow_mock_source=False (ver
+            # MockReplaySource.__init__). Esto es una MISCONFIGURACION real
+            # (el operador pidio mock a proposito sin habilitar el flag) -
+            # se loguea a ERROR (mas visible que el WARNING de "no
+            # disponible" de abajo) pero NUNCA se crashea el proceso -
+            # mismo principio que _safe_call.
+            logger.error("Shadow feed: fuente '%s' no se pudo instanciar (%s).", name, exc)
+            return None
         available = self._safe_call(source.is_available, default=False, label=f"{name}.is_available()")
         return source if available else None
+
+    @staticmethod
+    def _construct_mock_or_fallback(reason: str) -> ShadowDataSource:
+        """
+        Unico punto donde LiveShadowFeed construye el "ultimo recurso"
+        incondicional. Intenta MockReplaySource(); si ShadowConfig.
+        allow_mock_source=False (el default fuera de tests/dev - Tarea
+        #27/#28 item 3, 2026-10-02), MockReplaySource.__init__ levanta
+        RuntimeError - se atrapa aca y se degrada a _NoDataSource en vez de
+        crashear el proceso o fabricar datos sin que el operador lo haya
+        habilitado a proposito.
+        """
+        try:
+            return MockReplaySource()
+        except RuntimeError as exc:
+            logger.error(
+                "Shadow feed: %s y el fallback a Mock/Replay esta deshabilitado (%s) - "
+                "el bot se queda SIN NINGUNA cotizacion (no se fabrica un dato sintetico sin "
+                "autorizacion explicita). Las guardas de staleness/horario de rueda deben "
+                "impedir que se opere sobre datos ausentes.", reason, exc,
+            )
+            return _NoDataSource()
 
     def _instantiate_first_available(self) -> ShadowDataSource:
         """
@@ -1287,7 +1366,9 @@ class LiveShadowFeed:
         primera fuente cuyo is_available() de True. Si ninguna responde
         (caso extremo: sin red saliente Y pyRofex no instalado/sin
         credenciales), cae a MockReplaySource incondicionalmente - la unica
-        fuente 100 por ciento local, que nunca falla.
+        fuente 100 por ciento local que nunca falla POR SI MISMA (salvo que
+        ShadowConfig.allow_mock_source=False la deshabilite - ver
+        _construct_mock_or_fallback).
         """
         for i, name in enumerate(self._priority):
             source = self._probe(name)
@@ -1298,21 +1379,22 @@ class LiveShadowFeed:
             logger.warning("Shadow feed: fuente '%s' no disponible, se prueba la siguiente en la prioridad.", name)
 
         logger.warning(
-            "Shadow feed: ninguna fuente de la prioridad %s respondio; se usa Mock/Replay incondicionalmente "
-            "como ultimo recurso (100 por ciento local, nunca falla).", self._priority,
+            "Shadow feed: ninguna fuente de la prioridad %s respondio; se intenta Mock/Replay "
+            "como ultimo recurso.", self._priority,
         )
         self._source_index = len(self._priority)
-        return MockReplaySource()
+        return self._construct_mock_or_fallback(f"ninguna fuente de la prioridad {self._priority} respondio")
 
     def _advance_to_next_source(self) -> bool:
         """
         Avanza a la siguiente fuente disponible en la prioridad configurada
-        (o a Mock/Replay si ya se agoto la lista). Devuelve False si no hay
-        a donde avanzar (ya se esta en Mock/Replay - no hay nada mas
+        (o a Mock/Replay, o a _NoDataSource si Mock esta deshabilitado, si
+        ya se agoto la lista). Devuelve False si no hay a donde avanzar (ya
+        se esta en Mock/Replay o en _NoDataSource - no hay nada mas
         conservador a donde caer). Reinicia el conteo de fallas
         consecutivas: cada fuente nueva empieza su propio conteo desde cero.
         """
-        if isinstance(self._source, MockReplaySource):
+        if isinstance(self._source, (MockReplaySource, _NoDataSource)):
             return False
 
         for i in range(self._source_index + 1, len(self._priority)):
@@ -1330,9 +1412,11 @@ class LiveShadowFeed:
 
         logger.warning(
             "Shadow feed: se agotaron todas las fuentes configuradas en source_priority (%s); "
-            "failover final a Mock/Replay (100 por ciento local, nunca falla).", self._priority,
+            "se intenta failover final a Mock/Replay.", self._priority,
         )
-        self._source = MockReplaySource()
+        self._source = self._construct_mock_or_fallback(
+            f"se agotaron todas las fuentes configuradas en source_priority ({self._priority})"
+        )
         self._source_index = len(self._priority)
         self._consecutive_failures = 0
         return True
