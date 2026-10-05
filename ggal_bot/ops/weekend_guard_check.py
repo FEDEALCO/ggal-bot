@@ -70,6 +70,25 @@ run_bot.py::_act_on_entry_signal) y el estado ACTUAL del kill switch
 (ultimo trip conocido, NO un historial completo - ver
 ggal_bot/risk/kill_switch.py, que solo persiste el ULTIMO trip) para
 avisar explicitamente cuando un OK no es una prueba real.
+
+ACTUALIZACION 2026-10-05 (bug real de severidad del aviso, a pedido
+explicito del usuario - episodio REAL del viernes 2026-10-02: el kill
+switch disparo ese mismo dia y quedo activo durante gran parte de la
+jornada, con 49 REJECT por kill_switch_tripped en el Event Journal real,
+repartidos entre weekly_asymmetric Y scalping): el aviso de REJECTs de
+ACTUALIZACION 2026-10-02 (parrafo anterior) solo mira REJECTs de
+weekly_asymmetric especificamente, y los reporta como una nota al pie
+despues del RESULTADO OK/FALLO - una lectura rapida del reporte podia
+quedarse solo con el "RESULTADO: OK" y no leer la nota de mas abajo. Con
+el caso real del 2026-10-02, eso significa que un chequeo de ese dia
+podria leerse como "el guard funciono" cuando en realidad el kill switch
+bloqueaba TODO, con o sin el guard - la "prueba" nunca llego a ocurrir.
+Fix: find_kill_switch_rejects_on_day_any_strategy() mira TODO REJECT por
+kill_switch_tripped ese dia (de CUALQUIER estrategia, no solo
+weekly_asymmetric) y, si encuentra al menos uno,
+kill_switch_invalidates_day_note() genera un aviso EXPLICITO que
+format_report() imprime PRIMERO, antes del RESULTADO OK/FALLO - no una
+nota al pie mas.
 """
 from __future__ import annotations
 
@@ -239,6 +258,67 @@ def find_entry_rejects_on_day(
     return candidates[candidates["timestamp_utc"].apply(_to_art_date) == day]
 
 
+def find_kill_switch_rejects_on_day_any_strategy(position_events_df, day: date):
+    """
+    MEJORA 2026-10-05 (a pedido explicito del usuario, tras el episodio
+    REAL del 2026-10-02: el kill switch disparo ese mismo viernes y se
+    mantuvo activo durante gran parte del dia - 49 REJECT por
+    kill_switch_tripped en el Event Journal real de ese dia, repartidos
+    entre weekly_asymmetric Y scalping, no solo weekly_asymmetric).
+
+    A diferencia de find_entry_rejects_on_day() (que mira SOLO entradas de
+    `strategy_tag` especifico, tipicamente "weekly_asymmetric" - el unico
+    que interesa para evaluar si el weekend guard hizo falta), esto mira
+    TODO REJECT de motivo kill_switch_tripped ese dia, sin filtrar por
+    estrategia ni por side - porque lo que importa aca es una pregunta
+    distinta: "¿hubo evidencia, en cualquier parte del Event Journal de
+    ese dia, de que el kill switch estuvo activo?" - si la respuesta es
+    si, NINGUN resultado de este chequeo (ni OK ni FALLO) es una prueba
+    valida sobre el weekend guard en particular: el kill switch bloqueaba
+    TODO, con o sin el guard. Ver run_check()/format_report() para como
+    esto se convierte en un aviso explicito de "este dia no es una prueba
+    valida", no solo una nota al pie.
+    """
+    if position_events_df.empty:
+        return position_events_df
+    df = position_events_df
+    reason_str = df["reason"].fillna("").astype(str)
+    mask = (df["event_type"] == "REJECT") & reason_str.str.startswith("kill_switch_tripped")
+    candidates = df[mask]
+    if candidates.empty:
+        return candidates
+    return candidates[candidates["timestamp_utc"].apply(_to_art_date) == day]
+
+
+def kill_switch_invalidates_day_note(kill_switch_rejects_df) -> Optional[str]:
+    """
+    None si no hubo ningun REJECT por kill_switch_tripped ese dia (ver
+    find_kill_switch_rejects_on_day_any_strategy) - en ese caso no hay
+    evidencia de que el kill switch haya invalidado el dia, y no se
+    fabrica una advertencia sin base. Si hubo al menos uno, devuelve un
+    texto EXPLICITO (no una nota al pie mas) marcando que el resultado de
+    ESTE chequeo, para ESTE dia, no prueba nada sobre el weekend guard -
+    con la primera y ultima marca de tiempo confirmadas como evidencia
+    concreta de la ventana de tiempo cubierta (nunca se afirma "todo el
+    dia" sin evidencia - solo se reporta la ventana REAL observada en el
+    Event Journal, que puede ser un subconjunto del dia si el kill switch
+    se reseteo y volvio a disparar).
+    """
+    if kill_switch_rejects_df.empty:
+        return None
+    first_ts = kill_switch_rejects_df["timestamp_utc"].min()
+    last_ts = kill_switch_rejects_df["timestamp_utc"].max()
+    n = len(kill_switch_rejects_df)
+    return (
+        f"⚠️ ESTE DIA NO ES UNA PRUEBA VALIDA DEL WEEKEND GUARD: el Event Journal registra "
+        f"{n} señal(es) rechazada(s) por kill_switch_tripped ese mismo dia (de cualquier "
+        f"estrategia), entre {first_ts} y {last_ts} UTC. Mientras el kill switch estuvo "
+        "disparado, TODA entrada nueva se bloqueaba de todos modos, con o sin el weekend "
+        "guard - el resultado de arriba (OK o FALLO) no distingue cual de los dos fue la "
+        "causa real de la ausencia (o presencia) de entradas en esa ventana."
+    )
+
+
 def _reject_reason_bucket(reason: str) -> str:
     prefix = reason.split(":", 1)[0].strip() if reason else ""
     return _ENTRY_REJECT_REASON_BUCKETS.get(prefix, "other")
@@ -292,9 +372,19 @@ def format_report(
     reject_counts: Optional[Dict[str, int]] = None,
     kill_switch_note: Optional[str] = None,
     kill_switch_state_available: bool = True,
+    kill_switch_invalidates_note: Optional[str] = None,
 ) -> str:
     reject_counts = reject_counts or {}
     lines = [f"Chequeo weekend guard - viernes {friday.isoformat()} (ART)"]
+
+    # NUEVO 2026-10-05 (a pedido explicito del usuario, ver
+    # kill_switch_invalidates_day_note): esto va PRIMERO, antes incluso del
+    # RESULTADO OK/FALLO - si el kill switch estuvo activo ese dia, quien
+    # lea el reporte tiene que verlo antes de leer cualquier otra cosa, no
+    # como una nota al pie que se puede pasar por alto.
+    if kill_switch_invalidates_note:
+        lines.append(kill_switch_invalidates_note)
+        lines.append("")
     if not violations:
         lines.append(
             "RESULTADO: OK - no se encontro ninguna entrada nueva de weekly_asymmetric "
@@ -410,11 +500,14 @@ def run_check(
     reject_counts = summarize_entry_rejects(reject_df)
     ks_state = _load_kill_switch_state(ks_path)
     ks_note = kill_switch_status_note(target_friday, ks_state) if ks_state is not None else None
+    ks_rejects_any_strategy = find_kill_switch_rejects_on_day_any_strategy(position_events_df, target_friday)
+    ks_invalidates_note = kill_switch_invalidates_day_note(ks_rejects_any_strategy)
 
     print(format_report(
         violations, target_friday, len(unknown),
         reject_counts=reject_counts, kill_switch_note=ks_note,
         kill_switch_state_available=ks_state is not None,
+        kill_switch_invalidates_note=ks_invalidates_note,
     ))
     return 1 if violations else 0
 

@@ -249,6 +249,79 @@ def test_format_report_flags_when_kill_switch_state_unavailable():
     assert "no se encontro el archivo de estado del kill switch" in report.lower()
 
 
+def test_find_kill_switch_rejects_on_day_any_strategy_matches_across_strategies():
+    """
+    A diferencia de find_entry_rejects_on_day (filtra por strategy_tag Y
+    side="buy"), esto debe matchear kill_switch_tripped de CUALQUIER
+    estrategia y CUALQUIER side ese dia - el caso real del 2026-10-02 tuvo
+    rechazos de weekly_asymmetric Y scalping.
+    """
+    df = pd.DataFrame([
+        _row("REJECT", "weekly_asymmetric", "2026-10-02T14:05:00+00:00", side="buy", reason="kill_switch_tripped: x"),
+        _row("REJECT", "scalping", "2026-10-02T15:30:00+00:00", side="buy", reason="kill_switch_tripped: y"),
+        # otro dia: no cuenta
+        _row("REJECT", "weekly_asymmetric", "2026-10-01T14:05:00+00:00", side="buy", reason="kill_switch_tripped: z"),
+        # mismo dia, pero otro motivo: no cuenta
+        _row("REJECT", "scalping", "2026-10-02T16:00:00+00:00", side="buy", reason="greeks_limit_exceeded: w"),
+    ])
+    rejects = wgc.find_kill_switch_rejects_on_day_any_strategy(df, _FRIDAY)
+    assert len(rejects) == 2
+    assert set(rejects["strategy_tag"]) == {"weekly_asymmetric", "scalping"}
+
+
+def test_find_kill_switch_rejects_on_day_any_strategy_empty_dataframe():
+    assert wgc.find_kill_switch_rejects_on_day_any_strategy(pd.DataFrame(), _FRIDAY).empty
+
+
+def test_kill_switch_invalidates_day_note_none_when_no_rejects():
+    assert wgc.kill_switch_invalidates_day_note(pd.DataFrame()) is None
+
+
+def test_kill_switch_invalidates_day_note_explicit_when_rejects_exist():
+    df = pd.DataFrame([
+        _row("REJECT", "weekly_asymmetric", "2026-10-02T10:51:00+00:00", side="buy", reason="kill_switch_tripped: x"),
+        _row("REJECT", "scalping", "2026-10-02T18:20:00+00:00", side="buy", reason="kill_switch_tripped: y"),
+    ])
+    rejects = wgc.find_kill_switch_rejects_on_day_any_strategy(df, _FRIDAY)
+    note = wgc.kill_switch_invalidates_day_note(rejects)
+    assert note is not None
+    assert "NO ES UNA PRUEBA VALIDA" in note
+    assert "2" in note  # cantidad de rejects
+
+
+def test_format_report_puts_kill_switch_invalidation_before_resultado_ok():
+    """
+    BUG REAL CORREGIDO (2026-10-05, a pedido explicito del usuario): el
+    aviso de invalidacion debe aparecer ANTES del RESULTADO OK/FALLO en el
+    texto del reporte, no como una nota al pie que una lectura rapida
+    puede pasar por alto.
+    """
+    note = "⚠️ ESTE DIA NO ES UNA PRUEBA VALIDA DEL WEEKEND GUARD: ..."
+    report = wgc.format_report([], _FRIDAY, unknown_count=0, kill_switch_invalidates_note=note)
+    assert report.index(note) < report.index("RESULTADO: OK")
+
+
+def test_run_check_reports_kill_switch_invalidation_across_strategies(capsys):
+    """
+    Integracion end-to-end: un REJECT de kill_switch_tripped de SCALPING
+    (no weekly_asymmetric) ese viernes debe disparar el aviso de
+    invalidacion del dia - el caso real del 2026-10-02 tuvo rechazos en
+    ambas estrategias.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        events_path = Path(tmp_dir) / "position_events.csv"
+        pd.DataFrame([
+            _row("REJECT", "scalping", "2026-10-02T13:30:00+00:00", side="buy", reason="kill_switch_tripped: x"),
+        ]).to_csv(events_path, index=False)
+        missing_ks_path = Path(tmp_dir) / "no_existe.json"
+
+        exit_code = wgc.run_check(events_path, _FRIDAY, kill_switch_state_path=missing_ks_path)
+        out = capsys.readouterr().out
+        assert exit_code == 0
+        assert "NO ES UNA PRUEBA VALIDA" in out
+        assert out.index("NO ES UNA PRUEBA VALIDA") < out.index("RESULTADO: OK")
+
+
 def test_run_check_reports_reject_counts_and_kill_switch_from_real_files(capsys):
     """Integracion end-to-end de run_check(): escribe un position_events.csv
     y un kill_switch.json reales a disco y confirma que el reporte impreso
@@ -312,11 +385,17 @@ ALL_TESTS = [
     test_format_report_ok_case_without_rejects_states_ok_is_real_evidence,
     test_format_report_includes_kill_switch_note_when_given,
     test_format_report_flags_when_kill_switch_state_unavailable,
-    # test_run_check_reports_reject_counts_and_kill_switch_from_real_files y
-    # test_run_check_flags_kill_switch_state_unavailable_when_file_missing
-    # usan el fixture `capsys` de pytest - no se agregan aca (mismo criterio
-    # que el resto del repo: un test que necesita un fixture de pytest no
-    # entra a ALL_TESTS, correrlo standalone rompería con un TypeError de
+    test_find_kill_switch_rejects_on_day_any_strategy_matches_across_strategies,
+    test_find_kill_switch_rejects_on_day_any_strategy_empty_dataframe,
+    test_kill_switch_invalidates_day_note_none_when_no_rejects,
+    test_kill_switch_invalidates_day_note_explicit_when_rejects_exist,
+    test_format_report_puts_kill_switch_invalidation_before_resultado_ok,
+    # test_run_check_reports_reject_counts_and_kill_switch_from_real_files,
+    # test_run_check_flags_kill_switch_state_unavailable_when_file_missing y
+    # test_run_check_reports_kill_switch_invalidation_across_strategies usan
+    # el fixture `capsys` de pytest - no se agregan aca (mismo criterio que
+    # el resto del repo: un test que necesita un fixture de pytest no entra
+    # a ALL_TESTS, correrlo standalone rompería con un TypeError de
     # argumento faltante).
 ]
 
