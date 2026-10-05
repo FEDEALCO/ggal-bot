@@ -43,6 +43,7 @@ from ggal_bot.config import SETTINGS  # noqa: E402
 from ggal_bot.paths import POSITION_EVENTS_LOG, SHADOW_TRADES_LOG, STATE_FILE  # noqa: E402
 from ggal_bot.risk.kill_switch import KillSwitch  # noqa: E402
 from dashboard import pnl_engine as pe  # noqa: E402
+from dashboard.data import load_errors  # noqa: E402
 from dashboard.data import journal as dj  # noqa: E402
 from dashboard.data import reconciliation as rc  # noqa: E402
 from dashboard.data import bot_config as bc  # noqa: E402
@@ -54,6 +55,27 @@ from dashboard.data import market_hours_quality as mhq  # noqa: E402
 from dashboard.data import shadow_reset as dsr  # noqa: E402
 
 st.set_page_config(page_title="GGAL BOT — Dashboard", layout="wide", page_icon="📈")
+
+# ---------------------------------------------------------------------------
+# BUG REAL CORREGIDO (2026-10-05, a pedido explicito del usuario - caso
+# real: shadow_trades.csv con un header desactualizado rompia
+# pd.read_csv() con ParserError sobre el archivo COMPLETO, y
+# pe.load_fills() lo atrapaba en silencio devolviendo 0 filas -> esta
+# pagina mostraba "Todavia no hay operaciones registradas" con 1200+
+# fills reales en el disco, sin ningun aviso de que algo habia fallado).
+#
+# load_errors.clear() arranca cada corrida/rerun de Streamlit sin el
+# historial de la corrida anterior. _load_error_banner reserva un lugar
+# BIEN ARRIBA en la pagina (antes de cualquier panel) para el aviso, pero
+# recien se completa al final del script (ver el bloque final de este
+# archivo) - para esa altura TODOS los loaders de TODA la pagina (fills,
+# eventos, snapshots de mercado, funnel, bonos CCL, etc.) ya corrieron en
+# esta misma ejecucion y ya registraron cualquier error real que hayan
+# tenido. st.empty() mantiene la posicion reservada aunque el contenido se
+# fije despues - no hace falta mover este bloque al final del archivo.
+# ---------------------------------------------------------------------------
+load_errors.clear()
+_load_error_banner = st.empty()
 
 
 # ---------------------------------------------------------------------------
@@ -129,21 +151,52 @@ for _raw_path in (SHADOW_TRADES_LOG, POSITION_EVENTS_LOG):
 # Carga de datos
 # ---------------------------------------------------------------------------
 
+def _render_load_error_banner() -> None:
+    """
+    Completa el placeholder reservado al principio del script (ver
+    _load_error_banner mas arriba) con un banner VISIBLE por cada error de
+    carga real registrado hasta este punto (dashboard.data.load_errors) -
+    nunca silencioso. Se llama mas de una vez a lo largo del script (antes
+    del st.stop() temprano de "sin fills", y de nuevo al final) porque
+    cada llamada vuelve a leer get_all() completo - la ultima llamada
+    siempre muestra el acumulado total de esa corrida, nunca pierde un
+    error registrado por una llamada anterior.
+    """
+    errors = load_errors.get_all()
+    if not errors:
+        return
+    lines = "\n".join(f"- `{e.source}`: {e.reason}" for e in errors)
+    _load_error_banner.error(
+        f"⚠️ {len(errors)} archivo(s) con error real de carga (no es 'sin datos todavia' - "
+        "revisar el archivo, puede estar mostrando numeros incompletos mientras tanto):\n\n"
+        f"{lines}"
+    )
+
+
 fills = pe.load_fills()
 bot_state = pe.load_bot_state()
+_render_load_error_banner()
 
 if fills.empty:
     st.title("📈 GGAL BOT — Dashboard")
-    st.info(
-        "Todavia no hay operaciones registradas en "
-        f"`{SHADOW_TRADES_LOG}`.\n\n"
-        "Corre el bot (`python run_bot.py` o `run_bot.bat`) con "
-        "`GGAL_BOT_SHADOW_MODE=true` para generar fills simulados, o esperá "
-        "a que el bot en modo real registre operaciones."
-    )
+    if not load_errors.get_all():
+        st.info(
+            "Todavia no hay operaciones registradas en "
+            f"`{SHADOW_TRADES_LOG}`.\n\n"
+            "Corre el bot (`python run_bot.py` o `run_bot.bat`) con "
+            "`GGAL_BOT_SHADOW_MODE=true` para generar fills simulados, o esperá "
+            "a que el bot en modo real registre operaciones."
+        )
+    else:
+        st.error(
+            f"`{SHADOW_TRADES_LOG}` no se pudo leer (ver el detalle arriba) - esto NO es "
+            "'todavia no hay datos', es un error real de carga. El panel no puede continuar "
+            "sin fills."
+        )
     st.stop()
 
 position_events_df_raw = pe.load_position_events()
+_render_load_error_banner()
 
 fills = fills.copy()
 # CORREGIDO 2026-09-29 (ver REPORT.md SS12.0 y pnl_engine.py, docstring
@@ -929,6 +982,11 @@ st.caption(
     "dashboard/pnl_engine.py, docstring, para el alcance y las limitaciones). "
     "No reemplaza una conciliacion contra el estado de cuenta real del ALYC."
 )
+
+# Ultimo chequeo: cualquier loader llamado MAS ABAJO del primero (market
+# snapshots, funnel, bonos CCL, etc.) ya tuvo su oportunidad de correr -
+# esta llamada final siempre refleja el acumulado completo de la corrida.
+_render_load_error_banner()
 
 
 # ---------------------------------------------------------------------------

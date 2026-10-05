@@ -25,6 +25,7 @@ from typing import Optional
 import pandas as pd
 
 from ggal_bot import paths
+from dashboard.data import load_errors
 
 # Mismo header que MarketSnapshotLogger._HEADER (ggal_bot/data/market_snapshot_log.py)
 MARKET_SNAPSHOT_COLUMNS = [
@@ -42,7 +43,14 @@ def load_market_snapshots(csv_path: Optional[Path] = None) -> pd.DataFrame:
 
     try:
         df = pd.read_csv(path)
-    except (pd.errors.EmptyDataError, pd.errors.ParserError):
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(columns=MARKET_SNAPSHOT_COLUMNS)
+    except pd.errors.ParserError as exc:
+        # BUG REAL CORREGIDO (2026-10-05, a pedido explicito del usuario -
+        # auditoria completa de loaders tras encontrar el caso real en
+        # dashboard/pnl_engine.py::load_fills): antes, esto se atrapaba y
+        # devolvia vacio en silencio, indistinguible de "sin datos todavia".
+        load_errors.register(str(path), f"ParserError: {exc}")
         return pd.DataFrame(columns=MARKET_SNAPSHOT_COLUMNS)
 
     if df.empty:

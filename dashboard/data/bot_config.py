@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from ggal_bot import paths
+from dashboard.data import load_errors
 
 
 def load_bot_state(json_path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
@@ -48,7 +49,15 @@ def load_bot_state(json_path: Optional[Path] = None) -> Optional[Dict[str, Any]]
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError) as exc:
+        # BUG REAL CORREGIDO (2026-10-05, a pedido explicito del usuario -
+        # auditoria completa de loaders): antes, silencioso - indistinguible
+        # de "el bot nunca escribio nada". Ver la ventana de carrera
+        # benigna descrita en el docstring de esta funcion (escritura
+        # atomica tmp+replace) - si este error aparece UNA vez y se
+        # autocorrige en el proximo refresh, es eso; si se repite, es una
+        # señal real de bot_state.json corrupto/inaccesible.
+        load_errors.register(str(path), f"{type(exc).__name__}: {exc}")
         return None
     if not isinstance(data, dict):
         return None

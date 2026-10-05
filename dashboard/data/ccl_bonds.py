@@ -21,6 +21,7 @@ from typing import Optional, Tuple
 import pandas as pd
 
 from ggal_bot import paths
+from dashboard.data import load_errors
 
 CCL_BOND_QUOTE_COLUMNS = ["timestamp_utc", "symbol", "bid", "ask", "last", "bid_size", "ask_size"]
 
@@ -36,7 +37,12 @@ def load_ccl_bond_quotes(csv_path: Optional[Path] = None) -> pd.DataFrame:
         return pd.DataFrame(columns=CCL_BOND_QUOTE_COLUMNS)
     try:
         df = pd.read_csv(path)
-    except (pd.errors.EmptyDataError, pd.errors.ParserError):
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(columns=CCL_BOND_QUOTE_COLUMNS)
+    except pd.errors.ParserError as exc:
+        # BUG REAL CORREGIDO (2026-10-05, a pedido explicito del usuario -
+        # auditoria completa de loaders): antes, silencioso.
+        load_errors.register(str(path), f"ParserError: {exc}")
         return pd.DataFrame(columns=CCL_BOND_QUOTE_COLUMNS)
     if df.empty:
         return pd.DataFrame(columns=CCL_BOND_QUOTE_COLUMNS)
