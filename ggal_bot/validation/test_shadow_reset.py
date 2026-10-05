@@ -75,13 +75,20 @@ def test_shadow_reset_closes_open_positions_at_mid_and_zeroes_them(tmp_path):
         import csv
         rows = list(csv.DictReader(journal_path.read_text(encoding="utf-8").splitlines()))
         reset_rows = [r for r in rows if r["event_type"] == "SHADOW_RESET"]
-        assert len(reset_rows) == 1
-        assert reset_rows[0]["symbol"] == "GFGC7000OC"
-        assert reset_rows[0]["side"] == "sell"
-        assert float(reset_rows[0]["quantity_delta"]) == -5.0
-        assert float(reset_rows[0]["quantity_after"]) == 0.0
-        assert float(reset_rows[0]["price"]) == pytest.approx(102.0)  # mid de 100/104
-        assert reset_rows[0]["reason"] == "shadow_reset"
+        # FIX 2026-10-05 (a pedido explicito del usuario): ahora hay SIEMPRE
+        # una fila "checkpoint" ademas de la fila por-posicion de abajo (ver
+        # test_shadow_reset_always_writes_a_checkpoint_event_even_with_
+        # nothing_to_close para la regresion dedicada de esa fila nueva).
+        assert len(reset_rows) == 2
+        position_row = next(r for r in reset_rows if r["symbol"] == "GFGC7000OC")
+        assert position_row["side"] == "sell"
+        assert float(position_row["quantity_delta"]) == -5.0
+        assert float(position_row["quantity_after"]) == 0.0
+        assert float(position_row["price"]) == pytest.approx(102.0)  # mid de 100/104
+        assert position_row["reason"] == "shadow_reset"
+
+        checkpoint_row = next(r for r in reset_rows if r["symbol"] == "")
+        assert checkpoint_row["reason"].startswith("shadow_reset_checkpoint:")
     finally:
         SETTINGS.shadow.enabled = original_enabled
 
@@ -154,8 +161,9 @@ def test_shadow_reset_handles_short_wing_position_with_buy_side():
         import csv
         rows = list(csv.DictReader(journal_path.read_text(encoding="utf-8").splitlines()))
         reset_rows = [r for r in rows if r["event_type"] == "SHADOW_RESET"]
-        assert reset_rows[0]["side"] == "buy"
-        assert float(reset_rows[0]["quantity_delta"]) == 75.0
+        position_row = next(r for r in reset_rows if r["symbol"] == "GFGV5000OC")
+        assert position_row["side"] == "buy"
+        assert float(position_row["quantity_delta"]) == 75.0
     finally:
         SETTINGS.shadow.enabled = original_enabled
 
@@ -210,3 +218,76 @@ def test_shadow_reset_pending_false_by_default():
     finally:
         SETTINGS.shadow.enabled = original_enabled
         SETTINGS.shadow.reset_on_start = original_reset
+
+
+def test_shadow_reset_always_writes_a_checkpoint_event_even_with_nothing_to_close():
+    """
+    BUG REAL CORREGIDO (a pedido explicito del usuario, 2026-10-05):
+    verificado contra produccion que, con el portfolio vacio (el caso mas
+    comun: el bot ya arranca sin ninguna posicion abierta segun el Event
+    Journal), _perform_shadow_reset() no escribia NINGUNA fila en el
+    journal - solo un logger.info(). Con GGAL_BOT_SHADOW_RESET_ON_START=true
+    activo desde el deploy y corriendo en cada restart, esto dejo CERO
+    eventos SHADOW_RESET reales en logs/position_events.csv a pesar de
+    multiples restarts confirmados - exactamente lo que impedia que
+    dashboard/data/shadow_reset.py (most_recent_shadow_reset_timestamp)
+    pudiera trazar nunca el corte de PnL "antes/despues" que el usuario
+    pidio. Ahora: SIEMPRE se escribe un evento checkpoint (symbol/
+    position_id vacios, quantity_delta=quantity_after=0.0), aunque no haya
+    nada que cerrar.
+    """
+    original_enabled = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True
+    try:
+        bot = GgalOptionsBot()
+        journal_path = _isolate_position_event_journal(bot)
+        assert bot.portfolio.positions == []
+
+        bot._perform_shadow_reset()
+
+        import csv
+        rows = list(csv.DictReader(journal_path.read_text(encoding="utf-8").splitlines()))
+        reset_rows = [r for r in rows if r["event_type"] == "SHADOW_RESET"]
+        assert len(reset_rows) == 1, "debe quedar exactamente un evento checkpoint, aunque no se cerro nada"
+        row = reset_rows[0]
+        assert row["symbol"] == ""
+        assert row["position_id"] == ""
+        assert float(row["quantity_delta"]) == 0.0
+        assert float(row["quantity_after"]) == 0.0
+        assert row["reason"] == "shadow_reset_checkpoint: 0 posicion(es) cerradas, 0 omitida(s) por falta de cotizacion operable"
+
+        # most_recent_shadow_reset_timestamp (dashboard/data/shadow_reset.py)
+        # debe poder encontrar este checkpoint - es, de hecho, el motivo real
+        # de este fix.
+        from dashboard.pnl_engine import load_position_events
+        from dashboard.data.shadow_reset import most_recent_shadow_reset_timestamp
+        events_df = load_position_events(journal_path)
+        assert most_recent_shadow_reset_timestamp(events_df) is not None
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+
+
+def test_shadow_reset_checkpoint_event_never_fabricates_a_phantom_position_on_reconciliation():
+    """
+    Companero defensivo del fix de arriba: el evento checkpoint
+    (symbol="", quantity_delta=0.0) jamas debe interpretarse, en un
+    restart posterior, como una posicion real que hay que reconstruir -
+    reconstruct_positions_from_event_journal() debe seguir devolviendo []
+    para un journal que solo tiene este checkpoint.
+    """
+    from ggal_bot.portfolio.reconciliation import reconstruct_positions_from_event_journal
+
+    original_enabled = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True
+    try:
+        bot = GgalOptionsBot()
+        journal_path = _isolate_position_event_journal(bot)
+        assert bot.portfolio.positions == []
+
+        bot._perform_shadow_reset()
+
+        positions, warnings = reconstruct_positions_from_event_journal(csv_path=journal_path, option_multiplier=100.0)
+        assert positions == []
+        assert warnings == []
+    finally:
+        SETTINGS.shadow.enabled = original_enabled

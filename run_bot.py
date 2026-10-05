@@ -912,6 +912,41 @@ class GgalOptionsBot:
         if not closed_summary and not skipped:
             logger.info("SHADOW_RESET: no habia ninguna posicion abierta para cerrar.")
 
+        # FIX REAL (a pedido explicito del usuario, 2026-10-05: "_perform_
+        # shadow_reset() siempre escribe un evento SHADOW_RESET en el
+        # journal, aunque no cierre nada - es el punto de corte para medir
+        # PnL limpio"): ANTES de este fix, cuando closed_summary y skipped
+        # quedaban ambos vacios (el caso mas comun: el bot ya arrancaba sin
+        # ninguna posicion abierta segun el Event Journal), esta funcion NO
+        # escribia NINGUNA fila en logs/position_events.csv - solo el
+        # logger.info() de arriba. Verificado contra produccion (2026-10-05):
+        # SHADOW_RESET_ON_START=true estuvo activo y corrio en cada restart
+        # desde que se desplego, pero 0 eventos SHADOW_RESET aparecen en el
+        # journal real - exactamente esta rama. dashboard/data/shadow_reset.py
+        # (most_recent_shadow_reset_timestamp) depende EXCLUSIVAMENTE de que
+        # exista al menos una fila event_type=="SHADOW_RESET" para poder
+        # trazar el corte de PnL "antes/despues" que el usuario pidio: sin
+        # ninguna fila, el dashboard nunca puede distinguir el historico
+        # contaminado del periodo limpio, sin importar cuantas veces se
+        # dispare el flag. Este evento "checkpoint" se escribe SIEMPRE, una
+        # vez por llamada a esta funcion, sin importar el resultado de arriba
+        # (0, 1 o N posiciones cerradas/omitidas) - symbol/position_id vacios
+        # a proposito (no es el cierre de UNA posicion puntual, ya logueado
+        # arriba fila por fila si corresponde) y quantity_delta/quantity_
+        # after=0.0 (nunca None: 0.0 es el valor real y explicito de "nada
+        # que mover", no un placeholder de dato faltante). `reason` deja
+        # constancia human-readable de cuantas posiciones se cerraron/
+        # omitieron en ESTE reset puntual, para poder leerlo directo del CSV
+        # sin tener que cruzar contra otras filas.
+        self.position_event_journal.log_event(
+            "SHADOW_RESET",
+            quantity_delta=0.0, quantity_after=0.0,
+            reason=(
+                f"shadow_reset_checkpoint: {len(closed_summary)} posicion(es) cerradas, "
+                f"{len(skipped)} omitida(s) por falta de cotizacion operable"
+            ),
+        )
+
     def connect_and_subscribe(self) -> bool:
         if self.shadow_mode:
             # Sin PyRofex, sin websocket: bootstrap_universe() arma el
