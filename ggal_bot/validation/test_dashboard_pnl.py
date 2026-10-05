@@ -588,6 +588,79 @@ def test_match_trades_fifo_pnl_scales_with_real_quantity_not_a_fixed_value():
     assert trade.pnl_ars != (95.0 - 80.0) * 1 * 100.0
 
 
+def test_load_fills_discovers_and_merges_rotated_schema_files():
+    """
+    MEJORA 2026-10-05 (a pedido explicito del usuario, parte del fix de
+    rotacion de schema - ver ggal_bot/execution/order_gateway.py::
+    ShadowAuditLogger._resolve_write_path y test_shadow_trading.py::
+    test_shadow_audit_logger_rotates_to_new_schema_file_when_header_differs).
+    load_fills() debe descubrir el archivo base (schema 1, header viejo de
+    10 columnas) + su sibling rotado (`{stem}.schema2.csv`, header actual
+    de 13) y devolver los fills de AMBOS, concatenados y ordenados
+    cronologicamente - nunca solo el ultimo archivo escrito.
+    """
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        base_path = Path(tmp_dir) / "shadow_trades.csv"
+        base_path.write_text(
+            "timestamp_utc,client_order_id,symbol,side,order_type,quantity,"
+            "requested_price,fill_price,reference_price,event\n"
+            "2026-09-01T10:00:00+00:00,cid1,GFGC7000OC,buy,limit,9.0,480.0,480.0,480.0,shadow_fill\n"
+        )
+        rotated_path = Path(tmp_dir) / "shadow_trades.schema2.csv"
+        rotated_path.write_text(
+            "timestamp_utc,client_order_id,symbol,side,order_type,quantity,"
+            "requested_price,fill_price,reference_price,event,bid_at_fill,ask_at_fill,mid_at_fill\n"
+            "2026-10-02T10:00:00+00:00,cid2,GFGC7000OC,sell,limit,9.0,500.0,500.0,500.0,shadow_fill,499.0,501.0,500.0\n"
+        )
+
+        fills = pe.load_fills(csv_path=base_path)
+        assert len(fills) == 2, "deberia leer el archivo base Y el rotado, no solo uno"
+        assert list(fills["client_order_id"]) == ["cid1", "cid2"]  # orden cronologico
+
+
+def test_load_fills_tolerates_ragged_legacy_file_and_registers_visible_error():
+    """
+    BUG REAL CORREGIDO (2026-10-05, a pedido explicito del usuario - caso
+    real encontrado en produccion): un archivo YA CORROMPIDO desde ANTES
+    del fix de rotacion (header viejo de 10 columnas + al menos una fila
+    de 13, todo en el MISMO archivo, porque se escribio antes de que
+    ShadowAuditLogger supiera rotar) no puede evitarse retroactivamente -
+    load_fills() debe poder leerlo igual (parseo tolerante fila a fila) Y
+    dejar constancia VISIBLE del problema via dashboard.data.load_errors,
+    en vez de lo que hacia antes: atrapar el ParserError y devolver un
+    DataFrame vacio en silencio (ver dashboard/app.py, que mostraba
+    "Todavia no hay operaciones registradas" para un archivo con fills
+    reales).
+    """
+    import tempfile
+    from pathlib import Path
+    from dashboard.data import load_errors
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        csv_path = Path(tmp_dir) / "shadow_trades.csv"
+        csv_path.write_text(
+            "timestamp_utc,client_order_id,symbol,side,order_type,quantity,"
+            "requested_price,fill_price,reference_price,event\n"
+            "2026-09-01T10:00:00+00:00,cid1,GFGC7000OC,buy,limit,9.0,480.0,480.0,480.0,shadow_fill\n"
+            "2026-10-02T10:00:00+00:00,cid2,GFGC7000OC,sell,limit,9.0,500.0,500.0,500.0,shadow_fill,499.0,501.0,500.0\n"
+        )
+        load_errors.clear()
+        try:
+            fills = pe.load_fills(csv_path=csv_path)
+            assert len(fills) == 2, "el parseo tolerante debe recuperar ambas filas, no devolver vacio"
+            assert list(fills["client_order_id"]) == ["cid1", "cid2"]
+
+            errors = load_errors.get_all()
+            assert len(errors) >= 1, "el ParserError real debe quedar registrado, no tragado en silencio"
+            assert str(csv_path) in errors[0].source
+            assert "ParserError" in errors[0].reason
+        finally:
+            load_errors.clear()
+
+
 ALL_TESTS = [
     test_classify_strategy_uses_contado_and_futuro_tickers,
     test_multiplier_for_symbol_is_1_for_underlying_and_option_multiplier_for_options,
@@ -622,6 +695,8 @@ ALL_TESTS = [
     test_resolve_position_ids_from_journal_returns_position_id_or_empty_string,
     test_match_trades_fifo_reproduces_and_fixes_the_verified_cross_strategy_pnl_crossing,
     test_match_trades_fifo_uses_position_id_to_isolate_positions_of_the_same_strategy,
+    test_load_fills_discovers_and_merges_rotated_schema_files,
+    test_load_fills_tolerates_ragged_legacy_file_and_registers_visible_error,
 ]
 
 

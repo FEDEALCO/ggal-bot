@@ -1257,6 +1257,124 @@ def test_order_gateway_shadow_mode_logs_fill_to_audit_csv(tmp_path=None):
         SETTINGS.shadow.enabled = original_enabled
 
 
+def test_shadow_audit_logger_rotates_to_new_schema_file_when_header_differs():
+    """
+    BUG REAL CORREGIDO (2026-10-05, a pedido explicito del usuario): en
+    produccion, shadow_trades.csv ya tenia el header VIEJO de 10 columnas
+    (desde 2026-09-01) cuando se desplego la mejora de
+    bid_at_fill/ask_at_fill/mid_at_fill (2026-10-01) - _ensure_header()
+    solo escribe el header si el archivo no existe o esta vacio, asi que
+    ese archivo preexistente se quedo con el header viejo PARA SIEMPRE
+    mientras las filas nuevas pasaron a tener 13 columnas. Resultado real:
+    pandas.read_csv() rompia con ParserError sobre el archivo COMPLETO
+    (ver dashboard/pnl_engine.py::load_fills).
+
+    Repro de este test: un archivo YA EXISTENTE con el header viejo (de
+    10 columnas, simulando ese shadow_trades.csv real) -> un ShadowAuditLogger
+    nuevo (con el header actual, de 13) NUNCA debe agregarle filas a ese
+    archivo - debe rotar a un sibling `{stem}.schema2{suffix}` con el
+    header actual, dejando el archivo viejo intacto.
+    """
+    import csv
+    import tempfile
+    from pathlib import Path
+    from ggal_bot.execution.order_gateway import ShadowAuditLogger
+
+    old_header = [
+        "timestamp_utc", "client_order_id", "symbol", "side", "order_type",
+        "quantity", "requested_price", "fill_price", "reference_price", "event",
+    ]
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        audit_path = Path(tmp_dir) / "shadow_trades_test.csv"
+        # Simula el archivo real preexistente: header viejo + una fila real
+        # vieja (10 columnas, coherente con su propio header).
+        with open(audit_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(old_header)
+            w.writerow([
+                "2026-09-01T19:47:08.302793+00:00", "7a70701b63ee", "GFGC7600OC",
+                "buy", "limit", "6", "300.0", "297.5", "297.5", "shadow_fill",
+            ])
+        original_mtime_and_size = audit_path.stat().st_size
+
+        logger_ = ShadowAuditLogger(path=audit_path)
+
+        # El archivo viejo no se toco.
+        assert audit_path.stat().st_size == original_mtime_and_size
+        with open(audit_path, newline="", encoding="utf-8") as f:
+            rows_old = list(csv.reader(f))
+        assert rows_old[0] == old_header
+        assert len(rows_old) == 2  # header + la fila vieja, nada mas
+
+        # El logger escribe en un archivo NUEVO, con el header actual completo.
+        rotated_path = Path(tmp_dir) / "shadow_trades_test.schema2.csv"
+        assert logger_.path == rotated_path
+        assert rotated_path.exists()
+        with open(rotated_path, newline="", encoding="utf-8") as f:
+            rows_new = list(csv.reader(f))
+        assert rows_new[0] == ShadowAuditLogger._HEADER
+        assert len(rows_new) == 1  # solo el header todavia (log_fill no se llamo)
+
+        # Un fill nuevo va al archivo rotado, nunca al viejo.
+        logger_.log_fill(
+            request=OrderRequest(
+                symbol="GFGC6200OC", side=OrderSide.BUY, quantity=5, price=100.0,
+                order_type=OrderTypeEnum.LIMIT,
+            ),
+            fill_price=100.0, reference_price=100.0,
+        )
+        with open(rotated_path, newline="", encoding="utf-8") as f:
+            rows_after_fill = list(csv.reader(f))
+        assert len(rows_after_fill) == 2
+        assert audit_path.stat().st_size == original_mtime_and_size  # archivo viejo, intacto
+
+
+def test_shadow_audit_logger_reuses_existing_rotated_file_on_restart():
+    """
+    Si el proceso se reinicia DESPUES de ya haber rotado una vez (el
+    archivo `{stem}.schema2{suffix}` ya existe, con el header actual), un
+    ShadowAuditLogger nuevo debe seguir escribiendo AHI (agregando filas),
+    no rotar de nuevo a schema3 - rotar de mas crearia un archivo nuevo
+    por cada restart sin necesidad, fragmentando el historico sin motivo.
+    """
+    import csv
+    import tempfile
+    from pathlib import Path
+    from ggal_bot.execution.order_gateway import ShadowAuditLogger
+
+    old_header = [
+        "timestamp_utc", "client_order_id", "symbol", "side", "order_type",
+        "quantity", "requested_price", "fill_price", "reference_price", "event",
+    ]
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        audit_path = Path(tmp_dir) / "shadow_trades_test.csv"
+        with open(audit_path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(old_header)
+
+        first = ShadowAuditLogger(path=audit_path)
+        first.log_fill(
+            request=OrderRequest(
+                symbol="GFGC6200OC", side=OrderSide.BUY, quantity=5, price=100.0,
+                order_type=OrderTypeEnum.LIMIT,
+            ),
+            fill_price=100.0, reference_price=100.0,
+        )
+
+        # "Restart": una instancia nueva contra la misma ruta base.
+        second = ShadowAuditLogger(path=audit_path)
+        assert second.path == first.path  # mismo archivo rotado, no schema3
+        second.log_fill(
+            request=OrderRequest(
+                symbol="GFGC6400OC", side=OrderSide.SELL, quantity=3, price=50.0,
+                order_type=OrderTypeEnum.LIMIT,
+            ),
+            fill_price=50.0, reference_price=50.0,
+        )
+        with open(second.path, newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        assert len(rows) == 3  # header + 2 fills (de first y second), mismo archivo
+
+
 def test_shadow_audit_logger_records_active_source_for_fill_and_cancel():
     """
     Tarea #27/#28 item 3(b) (2026-10-02, a pedido explicito del usuario):
@@ -1424,6 +1542,8 @@ ALL_TESTS = [
     test_order_gateway_shadow_mode_falls_back_when_book_has_no_valid_quote,
     test_order_gateway_shadow_mode_logs_bid_ask_mid_at_fill_to_audit_csv,
     test_order_gateway_shadow_mode_logs_fill_to_audit_csv,
+    test_shadow_audit_logger_rotates_to_new_schema_file_when_header_differs,
+    test_shadow_audit_logger_reuses_existing_rotated_file_on_restart,
     test_shadow_audit_logger_records_active_source_for_fill_and_cancel,
     test_shadow_audit_logger_fill_does_not_crash_when_source_provider_raises,
     test_order_gateway_shadow_mode_never_touches_real_send_order,

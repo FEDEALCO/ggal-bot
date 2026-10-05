@@ -76,6 +76,7 @@ IMPORTANTE - alcance y limitaciones (leer antes de confiar en los numeros):
 
 from __future__ import annotations
 
+import csv
 import json
 import math
 from collections import deque
@@ -87,7 +88,9 @@ import numpy as np
 import pandas as pd
 
 from ggal_bot.config import SETTINGS
+from ggal_bot.execution.order_gateway import ShadowAuditLogger
 from ggal_bot.paths import POSITION_EVENTS_LOG, SHADOW_TRADES_LOG, STATE_FILE
+from dashboard.data import load_errors
 
 FILLS_COLUMNS = [
     "timestamp_utc", "client_order_id", "symbol", "side", "order_type",
@@ -107,20 +110,103 @@ UNKNOWN_LEGACY_STRATEGY = "unknown_legacy"
 # Carga de datos crudos
 # ---------------------------------------------------------------------------
 
+def _discover_shadow_trade_files(base_path: Path) -> list:
+    """
+    MEJORA 2026-10-05 (a pedido explicito del usuario, parte del fix de
+    rotacion de schema - ver ggal_bot/execution/order_gateway.py::
+    ShadowAuditLogger._resolve_write_path): desde ese fix, un cambio de
+    schema hace que el logger rote a un archivo sibling nuevo
+    (`{stem}.schemaN{suffix}`) en vez de seguir agregando filas a un header
+    que no las describe - el archivo base NUNCA se reescribe. Esta funcion
+    devuelve [base_path] + todo sibling de schema que exista, en orden de N
+    ascendente (= orden cronologico real de rotacion), para que load_fills()
+    pueda leer el historico COMPLETO sin que el llamador tenga que saber
+    cuantas rotaciones hubo.
+    """
+    found = []
+    if base_path.exists():
+        found.append(base_path)
+    n = 2
+    while True:
+        candidate = base_path.parent / f"{base_path.stem}.schema{n}{base_path.suffix}"
+        if not candidate.exists():
+            break
+        found.append(candidate)
+        n += 1
+    return found
+
+
+def _read_shadow_trades_file(path: Path) -> pd.DataFrame:
+    """
+    Lee UN archivo de shadow_trades (base o rotado) con pandas.read_csv()
+    normal. Si eso falla con ParserError, cae a un parseo tolerante fila a
+    fila - este fallback SOLO es necesario para un archivo escrito ANTES
+    del fix de rotacion de schema (ver _discover_shadow_trade_files), que
+    puede tener filas mas anchas que su propio header (el bug real
+    encontrado en produccion: header viejo de 10 columnas + filas nuevas de
+    13). Un archivo escrito DESPUES del fix nunca llega a este fallback -
+    cada archivo de la familia es internamente consistente desde su
+    primera fila.
+
+    BUG REAL CORREGIDO (2026-10-05): antes, esta excepcion (y EmptyDataError)
+    se atrapaba y la funcion devolvia un DataFrame vacio EN SILENCIO - sin
+    loguear nada, sin avisar en la UI. Ahora se registra con
+    dashboard.data.load_errors.register() antes de devolver el resultado
+    tolerante (o vacio, si ni el fallback puede leerlo), para que
+    dashboard/app.py pueda mostrar un banner visible con el archivo y el
+    motivo exacto en vez de un silencioso "no hay operaciones".
+    """
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(columns=FILLS_COLUMNS)
+    except pd.errors.ParserError as exc:
+        load_errors.register(
+            str(path),
+            f"ParserError: {exc} - probablemente un archivo escrito antes del fix de "
+            "rotacion de schema (header desactualizado + filas de un schema nuevo en el "
+            "mismo archivo). Se intenta un parseo tolerante fila a fila; verificar "
+            "igual, puede haber perdido columnas nuevas (bid_at_fill/ask_at_fill/mid_at_fill) "
+            "para las filas mas viejas.",
+        )
+        canonical_header = ShadowAuditLogger._HEADER
+        rows = []
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            next(reader, None)  # descarta el header del archivo (ya sabemos que esta desactualizado)
+            for row in reader:
+                if len(row) < len(canonical_header):
+                    row = row + [None] * (len(canonical_header) - len(row))
+                elif len(row) > len(canonical_header):
+                    row = row[: len(canonical_header)]
+                rows.append(row)
+        return pd.DataFrame(rows, columns=canonical_header)
+
+
 def load_fills(csv_path: Optional[Path] = None) -> pd.DataFrame:
     """
-    Lee logs/shadow_trades.csv y devuelve solo las filas de fill (event ==
-    'shadow_fill'), ordenadas cronologicamente. Tolerante a que el archivo
-    todavia no exista (el bot nunca corrio) o este vacio.
+    Lee logs/shadow_trades.csv (+ cualquier sibling rotado por cambio de
+    schema, ver _discover_shadow_trade_files) y devuelve solo las filas de
+    fill (event == 'shadow_fill'), ordenadas cronologicamente. Tolerante a
+    que el archivo todavia no exista (el bot nunca corrio) o este vacio -
+    ESO es un caso legitimo y silencioso. Un archivo que existe, tiene
+    contenido, y falla al parsear YA NO es silencioso (ver
+    _read_shadow_trades_file y dashboard.data.load_errors).
     """
-    path = Path(csv_path) if csv_path is not None else SHADOW_TRADES_LOG
-    if not path.exists() or path.stat().st_size == 0:
+    base_path = Path(csv_path) if csv_path is not None else SHADOW_TRADES_LOG
+    files = _discover_shadow_trade_files(base_path)
+    if not files:
         return pd.DataFrame(columns=FILLS_COLUMNS)
 
-    try:
-        df = pd.read_csv(path)
-    except (pd.errors.EmptyDataError, pd.errors.ParserError):
+    frames = []
+    for path in files:
+        if path.stat().st_size == 0:
+            continue
+        frames.append(_read_shadow_trades_file(path))
+
+    if not frames:
         return pd.DataFrame(columns=FILLS_COLUMNS)
+    df = pd.concat(frames, ignore_index=True)
 
     if df.empty or "event" not in df.columns:
         return pd.DataFrame(columns=FILLS_COLUMNS)
@@ -171,7 +257,17 @@ def load_position_events(csv_path: Optional[Path] = None) -> pd.DataFrame:
 
     try:
         df = pd.read_csv(path)
-    except (pd.errors.EmptyDataError, pd.errors.ParserError):
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(columns=POSITION_EVENTS_COLUMNS)
+    except pd.errors.ParserError as exc:
+        # BUG REAL CORREGIDO (2026-10-05, a pedido explicito del usuario -
+        # auditoria completa de loaders tras encontrar el caso real en
+        # load_fills()): antes, esto se atrapaba y devolvia vacio en
+        # silencio. position_events.csv no tiene el bug de schema de
+        # shadow_trades.csv (su header nunca cambio), pero si este archivo
+        # alguna vez se corrompe por otro motivo, que quede visible en vez
+        # de leerse como "no hay eventos".
+        load_errors.register(str(path), f"ParserError: {exc}")
         return pd.DataFrame(columns=POSITION_EVENTS_COLUMNS)
 
     if df.empty:
@@ -337,7 +433,19 @@ def load_bot_state(path: Optional[Path] = None) -> Dict[str, Any]:
     try:
         with open(state_path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError) as exc:
+        # BUG REAL CORREGIDO (2026-10-05, a pedido explicito del usuario):
+        # antes esto era silencioso. La ventana de carrera descrita arriba
+        # (bot escribiendo con tmp+replace) es benigna y se autocorrige en
+        # el proximo refresh - pero si este error se repite en CADA
+        # refresh, es una señal real de un bot_state.json corrupto/
+        # inaccesible, y antes no habia forma de distinguirlo de "el bot
+        # nunca escribio nada" sin mirar los logs del proceso a mano.
+        load_errors.register(
+            str(state_path),
+            f"{type(exc).__name__}: {exc} (si persiste en varios refreshes, no es la "
+            "ventana de carrera esperada de la escritura atomica - revisar el archivo)",
+        )
         return {}
 
 

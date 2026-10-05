@@ -425,9 +425,31 @@ class ShadowAuditLogger:
     momento exacto del fill (antes, el unico precio registrado era
     fill_price == reference_price == mid en el 100% de los fills - ver
     OrderGateway.send() para el fix de que fill_price cruce el spread).
-    Retrocompatible: un shadow_trades.csv viejo sin estas 3 columnas se
-    sigue leyendo bien (pandas las completa con NaN, ver dashboard/
-    pnl_engine.py::load_fills) - no hace falta migrar el archivo historico.
+
+    CORRECCION 2026-10-05 (bug real encontrado en produccion, a pedido
+    explicito del usuario): la afirmacion ORIGINAL de este docstring ("un
+    shadow_trades.csv viejo sin estas 3 columnas se sigue leyendo bien...
+    no hace falta migrar el archivo historico") era FALSA para un archivo
+    YA EXISTENTE al momento del deploy de esta mejora. _ensure_header()
+    solo escribe el header cuando el archivo no existe o esta vacio - un
+    archivo que ya tenia el header VIEJO de 10 columnas (shadow_trades.csv
+    en produccion, con fills desde 2026-09-01) sigue con ese header para
+    siempre, mientras que las filas nuevas (desde 2026-10-01 18:40 UTC)
+    pasaron a tener 13 columnas. El resultado: `pandas.read_csv()` revienta
+    con `ParserError` sobre el archivo COMPLETO al encontrar una fila mas
+    ancha que el header - no "falla silenciosamente para esas filas", falla
+    para TODO el archivo. Confirmado en produccion: dashboard/pnl_engine.py
+    ::load_fills() atrapaba esa excepcion y devolvia un DataFrame vacio sin
+    ningun aviso -> dashboard mostrando "Todavia no hay operaciones
+    registradas" durante dias, con 1200+ fills reales en el disco.
+
+    FIX: _ensure_header() ahora detecta un cambio de schema (ver
+    _resolve_write_path) y ROTA a un archivo sibling nuevo versionado
+    (`{stem}.schemaN{suffix}`) en vez de seguir agregando filas a un header
+    que no las describe. El archivo viejo queda INTACTO (nunca se
+    reescribe ni se migra - seria alterar el historico real) como fuente
+    de solo lectura. Ver dashboard/pnl_engine.py::load_fills(), que ahora
+    descubre y concatena toda la familia de archivos (base + schemaN).
     """
 
     _HEADER = [
@@ -460,6 +482,17 @@ class ShadowAuditLogger:
         self._market_data_source_log = market_data_source_log
         self._ensure_header()
 
+    @property
+    def path(self) -> Path:
+        """
+        Ruta REAL donde este logger esta escribiendo - puede no ser la ruta
+        pedida en el constructor si _ensure_header() roto a un archivo de
+        schema nuevo (ver docstring de _resolve_write_path). Expuesto para
+        que un caller/test pueda confirmar a donde fueron a parar los fills
+        de esta instancia sin adivinar la convencion de nombres.
+        """
+        return self._path
+
     def _log_active_source(self, context: str, correlation_id: str) -> None:
         if self._source_name_provider is None or self._market_data_source_log is None:
             return
@@ -472,11 +505,77 @@ class ShadowAuditLogger:
 
     def _ensure_header(self) -> None:
         with self._lock:
+            self._path = self._resolve_write_path(self._path)
             needs_header = (not self._path.exists()) or self._path.stat().st_size == 0
             if needs_header:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
                 with open(self._path, "a", newline="", encoding="utf-8") as f:
                     csv.writer(f).writerow(self._HEADER)
+
+    def _resolve_write_path(self, base_path: Path) -> Path:
+        """
+        Decide a que archivo escribir REALMENTE. Ver el docstring de la
+        clase (CORRECCION 2026-10-05) para el bug real que esto corrige.
+
+        - `base_path` no existe o esta vacio -> se usa tal cual (primer
+          arranque, o archivo nuevo: no hay historico que proteger).
+        - Existe y su primera fila (header) coincide EXACTAMENTE con
+          `_HEADER` -> se usa tal cual (caso normal: la enorme mayoria de
+          los arranques, header sin cambios desde la ultima escritura).
+        - Existe con un header DISTINTO (cambio de schema desde la ultima
+          vez que se escribio este archivo) -> NUNCA se le agregan filas
+          nuevas (reintroduciria el bug real: filas mas anchas que el
+          header, pandas.read_csv() revienta sobre el archivo COMPLETO) ni
+          se reescribe/migra (alteraria el historico real) - se rota a un
+          archivo sibling nuevo (`_next_schema_path`), logueando el motivo
+          para que quede trazado por que aparecio un archivo nuevo.
+        """
+        if not base_path.exists() or base_path.stat().st_size == 0:
+            return base_path
+        try:
+            with open(base_path, newline="", encoding="utf-8") as f:
+                existing_header = next(csv.reader(f), [])
+        except OSError as exc:
+            logger.warning(
+                "ShadowAuditLogger: no se pudo leer el header de %s para detectar un "
+                "cambio de schema (%s); se sigue usando esa misma ruta.", base_path, exc,
+            )
+            return base_path
+        if existing_header == self._HEADER:
+            return base_path
+        new_path = self._next_schema_path(base_path)
+        logger.warning(
+            "ShadowAuditLogger: %s tiene un header distinto al schema actual "
+            "(existente=%s, actual=%s) - se rota a %s en vez de agregarle filas "
+            "con un ancho que su header no describe. El archivo viejo queda "
+            "intacto como fuente historica de solo lectura.",
+            base_path, existing_header, self._HEADER, new_path,
+        )
+        return new_path
+
+    def _next_schema_path(self, base_path: Path) -> Path:
+        """
+        Primer `{stem}.schemaN{suffix}` libre a partir de N=2 (el archivo
+        base, sin sufijo, es "schema 1" implicito - nunca se le agrega ese
+        sufijo a el para no romper compatibilidad con todo lo que ya
+        asume el nombre fijo `shadow_trades.csv`, ver paths.py). "Libre"
+        quiere decir: no existe, o existe pero con un header que YA
+        coincide con el schema actual (reanudar un proceso que ya habia
+        rotado a esa misma version en una corrida anterior).
+        """
+        n = 2
+        while True:
+            candidate = base_path.parent / f"{base_path.stem}.schema{n}{base_path.suffix}"
+            if not candidate.exists():
+                return candidate
+            try:
+                with open(candidate, newline="", encoding="utf-8") as f:
+                    candidate_header = next(csv.reader(f), [])
+            except OSError:
+                candidate_header = []
+            if not candidate_header or candidate_header == self._HEADER:
+                return candidate
+            n += 1
 
     def log_fill(
         self, request: "OrderRequest", fill_price: float, reference_price: float,
