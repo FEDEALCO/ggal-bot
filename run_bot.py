@@ -2775,6 +2775,25 @@ class GgalOptionsBot:
                     # delta=1 por unidad" - nunca se confunde con una opcion.
                     greeks_per_unit=None,
                     entry_price=state.avg_fill_price, entry_time=datetime.now(timezone.utc),
+                    # strategy_tag="delta_hedge" (BUG REAL CORREGIDO 2026-10-05,
+                    # a pedido explicito del usuario: "las patas de delta_hedge
+                    # se registran en el journal con su strategy_tag" -
+                    # verificado contra el codigo real que esto SOLO estaba
+                    # medio hecho: el log_event() de abajo YA pasaba
+                    # strategy_tag="delta_hedge" desde la MEJORA 2026-09-30,
+                    # pero el objeto Position en memoria (self.portfolio.
+                    # positions) nunca recibia ese mismo valor - quedaba en
+                    # None, que todo el resto del codigo (Position.strategy_tag
+                    # docstring, run_bot.py:_perform_shadow_reset,
+                    # _warn_orphaned_positions_for_active_strategy) trata como
+                    # "weekly_asymmetric" por convencion. Resultado real: la
+                    # pata de hedge quedaba SILENCIOSAMENTE mal etiquetada en
+                    # memoria (aunque el journal, por separado, ya la tuviera
+                    # bien) - ej. un futuro SHADOW_RESET la habria cerrado
+                    # logueando strategy_tag="weekly_asymmetric" en vez de
+                    # "delta_hedge". Fix: una sola fuente de verdad, pasada
+                    # aca igual que al log_event() de mas abajo.
+                    strategy_tag="delta_hedge",
                 )
                 self.portfolio.add(new_hedge)
                 self.position_event_journal.log_event(

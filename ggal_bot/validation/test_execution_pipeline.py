@@ -430,6 +430,66 @@ def test_maybe_hedge_consolidates_repeated_fills_into_a_single_position():
         SETTINGS.shadow.enabled = original_enabled
 
 
+def test_maybe_hedge_tags_the_position_object_itself_as_delta_hedge():
+    """
+    BUG REAL CORREGIDO 2026-10-05 (a pedido explicito del usuario: "las
+    patas de delta_hedge se registran en el journal con su strategy_tag" -
+    verificado contra el codigo real que esto estaba SOLO medio hecho):
+    desde la MEJORA 2026-09-30, el log_event() que escribe en logs/
+    position_events.csv YA pasaba strategy_tag="delta_hedge" (ver
+    test_maybe_hedge_logs_entry_and_add_events_to_position_event_journal),
+    pero el objeto Position en memoria (self.portfolio.positions) NUNCA
+    recibia ese mismo valor - quedaba en None, que Position.strategy_tag
+    documenta como "se trata como weekly_asymmetric en todos los puntos
+    que filtran por esta marca". Esto es real, no cosmetico: run_bot.py::
+    _perform_shadow_reset usa `pos.strategy_tag or "weekly_asymmetric"`
+    para decidir que strategy_tag loguear al cerrar - sin este fix, cerrar
+    una pata de hedge via SHADOW_RESET la habria etiquetado mal en el
+    journal (weekly_asymmetric en vez de delta_hedge), aunque el ENTRY
+    original SI estuviera bien. Este test verifica el objeto Position
+    directamente (no el journal, que test_maybe_hedge_logs_entry_and_add_
+    events_to_position_event_journal ya cubre), para la primera apertura
+    (existing_hedge is None) y para un ajuste posterior (existing_hedge ya
+    existia, la misma Position se reusa/muta - debe conservar la marca).
+    """
+    original_enabled = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True
+    try:
+        bot = GgalOptionsBot()
+        bot.portfolio.add(Position(
+            symbol="GFGC5200O", quantity=10, multiplier=100.0,
+            greeks_per_unit={"delta": 0.5, "gamma": 0.01, "vega": 5.0, "theta": -1.0},
+        ))
+        bot._spot_book = OrderBookSnapshot(
+            SETTINGS.instruments.contado_ticker, bid=5199.0, ask=5201.0, bid_size=5000, ask_size=5000,
+        )
+
+        totals_1 = bot.portfolio.total_greeks()
+        bot._maybe_hedge(totals_1, spot=5200.0)
+        hedge_after_1 = [p for p in bot.portfolio.positions if p.symbol == SETTINGS.instruments.contado_ticker]
+        assert len(hedge_after_1) == 1
+        assert hedge_after_1[0].strategy_tag == "delta_hedge", (
+            "BUG: la Position de hedge recien creada no quedo marcada como "
+            "'delta_hedge' (strategy_tag=%r) - cualquier lector de pos.strategy_tag "
+            "(no del journal) la confundiria con weekly_asymmetric." % hedge_after_1[0].strategy_tag
+        )
+
+        # Un segundo fill que AJUSTA (no recrea) la misma Position - la marca
+        # debe sobrevivir (mismo objeto, nunca se reconstruye desde cero).
+        bot.portfolio.add(Position(
+            symbol="GFGC5300O", quantity=6, multiplier=100.0,
+            greeks_per_unit={"delta": 0.5, "gamma": 0.01, "vega": 5.0, "theta": -1.0},
+        ))
+        totals_2 = bot.portfolio.total_greeks()
+        assert bot.delta_hedger.needs_hedge(totals_2["delta"])
+        bot._maybe_hedge(totals_2, spot=5200.0)
+        hedge_after_2 = [p for p in bot.portfolio.positions if p.symbol == SETTINGS.instruments.contado_ticker]
+        assert len(hedge_after_2) == 1
+        assert hedge_after_2[0].strategy_tag == "delta_hedge"
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+
+
 def test_maybe_hedge_does_nothing_when_delta_hedge_disabled():
     """
     Feature nueva (2026-09-01, a pedido explicito del usuario -
@@ -833,6 +893,7 @@ ALL_TESTS = [
     test_act_on_signal_does_not_reenter_same_symbol_across_cycles_in_shadow_mode,
     test_maybe_hedge_records_fill_so_delta_reflects_the_hedge,
     test_maybe_hedge_consolidates_repeated_fills_into_a_single_position,
+    test_maybe_hedge_tags_the_position_object_itself_as_delta_hedge,
     test_maybe_hedge_does_nothing_when_delta_hedge_disabled,
     test_act_on_signal_logs_entry_to_position_event_journal_with_vol_arbitrage_tag,
     test_maybe_hedge_logs_entry_and_add_events_to_position_event_journal,
