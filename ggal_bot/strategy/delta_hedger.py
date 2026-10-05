@@ -68,7 +68,32 @@ class DeltaHedgingEngine:
         # delta a cero: cubrir hasta cero implicaria rehedgear por cada
         # variacion minima, generando costos de transaccion innecesarios.
         excess = abs(portfolio_delta) - self.delta_band
-        qty_needed = -1 * excess if portfolio_delta > 0 else excess
+
+        # BUG REAL DETECTADO (2026-10-05, a pedido explicito del usuario -
+        # revision de la pata de delta-hedge de -335,85 acciones encontrada
+        # en shadow_trades.csv): `excess` es un float que se propaga tal
+        # cual hasta `execute_hedge()` -> `quantity = abs(instruction.
+        # quantity)` -> `mid_price_engine.submit(..., quantity=quantity,
+        # ...)`, SIN redondear en ningun punto de la cadena. En BYMA (y en
+        # cualquier ALyC real) las acciones/futuro de GGAL se operan en
+        # UNIDADES ENTERAS - no existen fracciones de accion. Una orden con
+        # cantidad fraccionaria (ej. 335.85) nunca podria ejecutarse contra
+        # un libro real; en Shadow Trading el bug queda oculto porque
+        # ShadowAuditLogger.log_fill() escribe la cantidad fraccionaria sin
+        # objetar, pero en modo real esto rompe contra el broker (o, peor,
+        # algunos brokers truncan/redondean por su cuenta de forma no
+        # determinista). Fix: redondear SIEMPRE a entero antes de devolver
+        # la instruccion - redondeo estandar (no truncar hacia 0, que
+        # subcubriria el delta por hasta 0,99 acciones de forma sistematica
+        # cada vez) - y, si el redondeo da 0 pese a que needs_hedge() ya
+        # confirmo que el excedente es real (excess > 0 pero < 0.5), subir
+        # a 1 unidad como minimo: needs_hedge() ya decidio que hace falta
+        # cubrir algo, asi que una orden de 0 acciones equivaldria a
+        # ignorar esa decision en silencio. Ver
+        # test_delta_hedger_rounds_fractional_excess_to_whole_shares y
+        # test_delta_hedger_rounds_up_to_one_share_when_excess_rounds_to_zero.
+        excess_shares = max(1, round(excess)) if excess > 0 else 0
+        qty_needed = -1 * excess_shares if portfolio_delta > 0 else excess_shares
 
         futuro_ok = (
             futuro_book is not None

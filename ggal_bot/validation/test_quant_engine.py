@@ -356,6 +356,42 @@ def test_delta_hedger_triggers_and_routes_to_contado():
     assert instruction.quantity == 350.0
 
 
+def test_delta_hedger_rounds_fractional_excess_to_whole_shares():
+    """
+    BUG REAL CORREGIDO (2026-10-05, a pedido explicito del usuario - ver
+    shadow_trades.csv: una pata de delta-hedge quedo con -335,85 acciones,
+    una cantidad imposible de operar en BYMA, donde las acciones/futuro de
+    GGAL se operan en unidades enteras). Antes del fix, `excess` (float) se
+    propagaba sin redondear hasta HedgeInstruction.quantity.
+    """
+    hedger = DeltaHedgingEngine(delta_band=150.0)
+    contado_book = OrderBookSnapshot("GGAL", bid=5199.0, ask=5201.0, bid_size=500, ask_size=500)
+
+    # delta=-485.85 -> excedente = 485.85 - 150 = 335.85 (el caso real
+    # encontrado en produccion) -> debe redondear a 336 acciones, nunca
+    # quedar en 335.85.
+    instruction = hedger.build_hedge(-485.85, contado_book, futuro_book=None)
+    assert instruction is not None
+    assert instruction.quantity == 336.0
+    assert instruction.quantity == int(instruction.quantity)  # sin parte fraccionaria
+
+
+def test_delta_hedger_rounds_up_to_one_share_when_excess_rounds_to_zero():
+    """
+    Si el excedente real es > 0 pero < 0,5 (ej. 150,3 con banda 150 ->
+    excedente 0,3), un redondeo estandar al entero mas cercano daria 0 -
+    equivalente a ignorar en silencio una decision de hedge que
+    needs_hedge() ya confirmo como necesaria. Fix: pisa a 1 unidad como
+    minimo en ese caso, nunca a 0.
+    """
+    hedger = DeltaHedgingEngine(delta_band=150.0)
+    contado_book = OrderBookSnapshot("GGAL", bid=5199.0, ask=5201.0, bid_size=500, ask_size=500)
+
+    instruction = hedger.build_hedge(-150.3, contado_book, futuro_book=None)
+    assert instruction is not None
+    assert instruction.quantity == 1.0
+
+
 def test_historical_volatility_close_to_close_positive():
     closes = [5000, 5050, 5120, 5080, 5200, 5150, 5210, 5190, 5230, 5200]
     hv = HistoricalVolatility.close_to_close(closes)
@@ -477,6 +513,8 @@ ALL_TESTS = [
     test_risk_manager_halts_on_vega_breach,
     test_risk_manager_halts_on_delta_breach_when_configured,
     test_delta_hedger_triggers_and_routes_to_contado,
+    test_delta_hedger_rounds_fractional_excess_to_whole_shares,
+    test_delta_hedger_rounds_up_to_one_share_when_excess_rounds_to_zero,
     test_historical_volatility_close_to_close_positive,
     test_portfolio_greeks_aggregation,
     test_sold_put_without_live_quote_contributes_zero_delta_never_fabricated,
