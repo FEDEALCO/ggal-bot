@@ -55,6 +55,43 @@ def _isolate_position_event_journal(bot):
     return dedicated_path
 
 
+@pytest.fixture(autouse=True)
+def isolated_shadow_trades_path():
+    """
+    MEJORA 2026-10-05 (necesaria por el fix "que el reset tambien lea
+    shadow_trades.csv ademas del journal"): hasta este fix,
+    _shadow_audit_isolation.py apuntaba paths.SHADOW_TRADES_LOG a UN SOLO
+    archivo compartido para TODA la corrida de pytest, pero era seguro
+    porque nada LEIA ese archivo de vuelta durante un test (solo
+    ShadowAuditLogger.log_fill() lo escribia, append-only, "sin un estado
+    pegajoso que cambie comportamiento entre tests" - ver el docstring de
+    ese modulo). Con _perform_shadow_reset() ahora barriendo TODO el
+    historial de shadow_trades.csv (reconstruct_positions_from_shadow_log),
+    ese ya no es el caso: un test de este archivo que no aisle su propio
+    shadow_trades.csv heredaria los fills de CUALQUIER test anterior en la
+    misma corrida (confirmado de forma real: sin este fixture, GFGC7000OC/
+    GFGV5000OC de otros tests de este mismo archivo aparecian como "patas
+    invisibles" en test_shadow_reset_always_writes_a_checkpoint_event_
+    even_with_nothing_to_close). Mismo criterio exacto que
+    _reset_shared_kill_switch_state en conftest.py para el mismo problema
+    con KillSwitch - aca solo en este archivo (es el unico que ejercita
+    _perform_shadow_reset) en vez de global, para no alterar el
+    comportamiento de aislamiento ya probado del resto de la suite.
+    """
+    import tempfile
+    from pathlib import Path
+    from ggal_bot import paths as _paths
+
+    fd, name = tempfile.mkstemp(suffix=".csv")
+    os.close(fd)
+    fresh_path = Path(name)
+    fresh_path.unlink()
+    original = _paths.SHADOW_TRADES_LOG
+    _paths.SHADOW_TRADES_LOG = fresh_path
+    yield fresh_path
+    _paths.SHADOW_TRADES_LOG = original
+
+
 def test_shadow_reset_closes_open_positions_at_mid_and_zeroes_them(tmp_path):
     original_enabled = SETTINGS.shadow.enabled
     SETTINGS.shadow.enabled = True
@@ -263,6 +300,146 @@ def test_shadow_reset_always_writes_a_checkpoint_event_even_with_nothing_to_clos
         from dashboard.data.shadow_reset import most_recent_shadow_reset_timestamp
         events_df = load_position_events(journal_path)
         assert most_recent_shadow_reset_timestamp(events_df) is not None
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+
+
+def _write_raw_shadow_fill(path, *, symbol: str, side: str, quantity: float, fill_price: float, timestamp_utc: str, client_order_id: str):
+    """
+    Escribe UN fill crudo directo con ShadowAuditLogger - simula un fill
+    "de la era mock" que nunca tuvo correspondencia en el Event Journal
+    (exactamente el patron de la pata real de -335,85 acciones del
+    2026-09-01: logging de delta_hedge al journal recien se agrego el
+    2026-09-30). No pasa por GgalOptionsBot ni por ninguna logica de
+    estrategia - es, deliberadamente, SOLO lo que shadow_trades.csv ve.
+    """
+    from ggal_bot.execution.order_gateway import ShadowAuditLogger, OrderRequest, OrderSide, OrderTypeEnum
+    logger_ = ShadowAuditLogger(path=path)
+    request = OrderRequest(
+        symbol=symbol, side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
+        quantity=quantity, price=fill_price, order_type=OrderTypeEnum.MARKET,
+        client_order_id=client_order_id,
+    )
+    logger_.log_fill(request, fill_price=fill_price, reference_price=fill_price)
+    # Fuerza el timestamp exacto (log_fill usa datetime.now(), no sirve para
+    # fijar una fecha historica especifica tipo "era mock") sobrescribiendo
+    # la fila recien escrita.
+    import csv
+    rows = list(csv.reader(path.read_text(encoding="utf-8").splitlines()))
+    header, data_rows = rows[0], rows[1:]
+    ts_idx = header.index("timestamp_utc")
+    data_rows[-1][ts_idx] = timestamp_utc
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(data_rows)
+
+
+def test_shadow_reset_also_sweeps_shadow_trades_csv_for_legs_invisible_to_the_journal(isolated_shadow_trades_path):
+    """
+    MEJORA 2026-10-05 (a pedido explicito del usuario: "que el reset
+    tambien lea shadow_trades.csv ademas del journal, para que en el
+    futuro no queden patas invisibles sin cerrar"). Reproduce el patron
+    real encontrado el 2026-10-05: un fill de hedge sobre el subyacente
+    que SOLO existe en logs/shadow_trades.csv (nunca llego al Event
+    Journal) - self.portfolio.positions queda vacio (como lo estaria tras
+    _reconcile_portfolio_on_startup, que SOLO lee el journal), pero el
+    reset debe encontrar esta pata igual y cerrarla, dejando constancia
+    explicita en el journal de que vino del barrido, no del journal.
+
+    `isolated_shadow_trades_path` (fixture autouse de este archivo): el
+    MISMO path ya aislado que usa paths.SHADOW_TRADES_LOG para este test -
+    se escribe el fill crudo directo ahi, sin crear un segundo archivo
+    separado.
+    """
+    original_enabled = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True
+    try:
+        bot = GgalOptionsBot()
+        journal_path = _isolate_position_event_journal(bot)
+
+        from ggal_bot.execution.order_gateway import ShadowAuditLogger
+        shadow_path = isolated_shadow_trades_path
+
+        _write_raw_shadow_fill(
+            shadow_path, symbol=SETTINGS.instruments.contado_ticker, side="sell",
+            quantity=335.85, fill_price=5900.0, timestamp_utc="2026-09-01T19:47:00+00:00",
+            client_order_id="mock-era-hedge-abc123",
+        )
+
+        # self.portfolio queda vacio - exactamente como lo dejaria
+        # _reconcile_portfolio_on_startup (solo lee el journal, que no tiene
+        # ningun rastro de este fill).
+        assert bot.portfolio.positions == []
+        bot._spot_book = OrderBookSnapshot(
+            SETTINGS.instruments.contado_ticker, bid=5898.0, ask=5902.0, bid_size=5000, ask_size=5000,
+        )
+        bot.order_gateway._shadow_logger = ShadowAuditLogger(path=shadow_path)
+
+        bot._perform_shadow_reset()
+
+        import csv
+        rows = list(csv.DictReader(journal_path.read_text(encoding="utf-8").splitlines()))
+        reset_rows = [r for r in rows if r["event_type"] == "SHADOW_RESET"]
+        leg_row = next((r for r in reset_rows if r["symbol"] == SETTINGS.instruments.contado_ticker), None)
+        assert leg_row is not None, "la pata invisible deberia haber sido cerrada por el barrido de shadow_trades.csv"
+        assert leg_row["reason"] == "shadow_reset_invisible_leg_from_shadow_trades_csv"
+        assert leg_row["side"] == "buy"  # la pata original era SELL (-335.85) -> se cierra comprando
+        assert float(leg_row["quantity_delta"]) == pytest.approx(335.85)
+
+        checkpoint_row = next(r for r in reset_rows if r["symbol"] == "")
+        assert "1 posicion(es) cerradas" in checkpoint_row["reason"]
+
+        # Y el fill de cierre quedo en shadow_trades.csv, como cualquier otro cierre de reset.
+        from dashboard.pnl_engine import load_fills
+        fills = load_fills(shadow_path)
+        closing_fills = fills[fills["client_order_id"].str.startswith("shadow-reset-")]
+        assert len(closing_fills) == 1
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+
+
+def test_shadow_reset_does_not_double_close_a_symbol_already_covered_by_the_journal(isolated_shadow_trades_path):
+    """
+    Companero defensivo del test de arriba: si el Event Journal YA conoce
+    el simbolo (self.portfolio tiene una Position real para el), el
+    barrido de shadow_trades.csv NO debe volver a cerrarlo por su cuenta -
+    sin esto, un simbolo con fills en ambas fuentes se cerraria DOS veces
+    (una vez por el loop principal, otra por el barrido), duplicando el
+    fill de cierre y el evento de journal.
+    """
+    original_enabled = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True
+    try:
+        bot = GgalOptionsBot()
+        journal_path = _isolate_position_event_journal(bot)
+
+        from ggal_bot.execution.order_gateway import ShadowAuditLogger
+        shadow_path = isolated_shadow_trades_path
+
+        # shadow_trades.csv SI tiene fills para GFGC7000OC (ej. de antes del
+        # deploy del journal), pero el Event Journal (y por lo tanto
+        # self.portfolio, via _reconcile_portfolio_on_startup) tambien lo
+        # conoce HOY - no es una pata invisible, es una posicion normal.
+        _write_raw_shadow_fill(
+            shadow_path, symbol="GFGC7000OC", side="buy", quantity=5.0, fill_price=90.0,
+            timestamp_utc="2026-09-20T14:00:00+00:00", client_order_id="old-entry-xyz",
+        )
+
+        bot.option_chain.upsert_quote(_make_quote("GFGC7000OC", 7000.0, bid=100.0, ask=104.0))
+        bot.portfolio.add(Position(
+            symbol="GFGC7000OC", quantity=5.0, multiplier=100.0, entry_price=90.0,
+            entry_time=datetime(2026, 9, 28, tzinfo=timezone.utc), strategy_tag="weekly_asymmetric",
+        ))
+        bot.order_gateway._shadow_logger = ShadowAuditLogger(path=shadow_path)
+
+        bot._perform_shadow_reset()
+
+        import csv
+        rows = list(csv.DictReader(journal_path.read_text(encoding="utf-8").splitlines()))
+        reset_rows = [r for r in rows if r["event_type"] == "SHADOW_RESET" and r["symbol"] == "GFGC7000OC"]
+        assert len(reset_rows) == 1, "el simbolo ya cubierto por el journal no debe cerrarse una segunda vez via el barrido"
+        assert reset_rows[0]["reason"] == "shadow_reset"  # vino del loop principal, no del barrido
     finally:
         SETTINGS.shadow.enabled = original_enabled
 

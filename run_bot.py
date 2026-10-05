@@ -54,6 +54,7 @@ from ggal_bot.data.dislocation_history import DislocationHistoryTracker
 from ggal_bot.portfolio.reconciliation import (
     ReconciliationUnavailable,
     reconstruct_positions_from_event_journal,
+    reconstruct_positions_from_shadow_log,
 )
 from ggal_bot.risk.risk_manager import RiskLimits, RiskManager
 from ggal_bot.risk.position_sizer import PositionSizer
@@ -851,49 +852,121 @@ class GgalOptionsBot:
         Tras esto, el portfolio en memoria queda en 0 para cada simbolo
         cerrado - el bot sigue el ciclo normal desde ahi, sin ninguna
         posicion heredada.
+
+        MEJORA 2026-10-05 (a pedido explicito del usuario: "que el reset
+        tambien lea shadow_trades.csv ademas del journal, para que en el
+        futuro no queden patas invisibles sin cerrar"): ademas de
+        self.portfolio.positions (reconstruido SOLO desde el Event Journal,
+        ver _reconcile_portfolio_on_startup), este reset ahora barre
+        tambien logs/shadow_trades.csv (via reconstruct_positions_from_
+        shadow_log(), el FIFO ya existente y testeado, independiente del
+        journal) y cierra cualquier simbolo con cantidad neta no nula que
+        NO este ya cubierto por el portfolio en memoria. Contexto real que
+        motiva esto: la pata de -335,85 acciones encontrada el 2026-10-05
+        (fills de hedge del 01-09-2026, sin huella en el journal porque el
+        logging de strategy_tag="delta_hedge" al journal recien se agrego
+        el 30-09) es INVISIBLE para self.portfolio en cualquier restart
+        (_reconcile_portfolio_on_startup solo lee el journal) y por lo
+        tanto tambien lo era para este reset tal como estaba antes de este
+        fix. El usuario decidio explicitamente NO reconciliar esa pata
+        historica en particular (la trata como residuo de la era mock,
+        2026-10-05) - este fix es deliberadamente mas chico y HACIA
+        ADELANTE: no cambia como arranca el portfolio en cada restart
+        normal (eso sigue siendo SOLO el journal, sin cambios), solo hace
+        que el PROXIMO reset administrativo termine de barrer cualquier
+        pata de este tipo en vez de dejarla invisible para siempre.
         """
         closed_summary: List[str] = []
         skipped: List[str] = []
-        for pos in list(self.portfolio.positions):
-            if abs(pos.quantity) < 1e-9:
-                continue
 
-            is_underlying = pos.symbol in (SETTINGS.instruments.contado_ticker, SETTINGS.instruments.futuro_ticker)
+        def _close_at_mid(
+            *, symbol: str, quantity: float, position_id: str, contract_key: Optional[str],
+            strategy_tag: str, reason: str,
+        ) -> bool:
+            is_underlying = symbol in (SETTINGS.instruments.contado_ticker, SETTINGS.instruments.futuro_ticker)
             if is_underlying:
                 book = self._spot_book
             else:
-                quote = self.option_chain.get(pos.symbol)
+                quote = self.option_chain.get(symbol)
                 book = quote.book if quote is not None else None
             mid = book.mid if (book is not None and book.bid > 0 and book.ask > 0) else None
 
             if mid is None:
-                skipped.append(f"{pos.symbol}={pos.quantity:g}")
+                skipped.append(f"{symbol}={quantity:g}")
                 logger.error(
                     "SHADOW_RESET: %s (qty=%.4f) NO se pudo cerrar - sin cotizacion bid/ask operable "
                     "ahora mismo. Queda abierta; nunca se fabrica un precio de cierre. Reintentar "
                     "manualmente (ggal_bot/ops/manual_close.py) o en un proximo arranque con el flag "
                     "todavia activo.",
-                    pos.symbol, pos.quantity,
+                    symbol, quantity,
                 )
-                continue
+                return False
 
-            side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
-            qty = abs(pos.quantity)
+            side = OrderSide.SELL if quantity > 0 else OrderSide.BUY
+            qty = abs(quantity)
             request = OrderRequest(
-                symbol=pos.symbol, side=side, quantity=qty, price=mid,
+                symbol=symbol, side=side, quantity=qty, price=mid,
                 order_type=OrderTypeEnum.MARKET, client_order_id=f"shadow-reset-{uuid.uuid4().hex[:8]}",
             )
             if self.order_gateway._shadow_logger is not None:
                 self.order_gateway._shadow_logger.log_fill(request, fill_price=mid, reference_price=mid)
 
             self.position_event_journal.log_event(
-                "SHADOW_RESET", position_id=pos.position_id, contract_key=pos.contract_key,
-                symbol=pos.symbol, strategy_tag=pos.strategy_tag or "weekly_asymmetric",
-                side=side.value, quantity_delta=-pos.quantity, quantity_after=0.0,
-                price=mid, order_client_id=request.client_order_id, reason="shadow_reset",
+                "SHADOW_RESET", position_id=position_id, contract_key=contract_key,
+                symbol=symbol, strategy_tag=strategy_tag,
+                side=side.value, quantity_delta=-quantity, quantity_after=0.0,
+                price=mid, order_client_id=request.client_order_id, reason=reason,
             )
-            closed_summary.append(f"{pos.symbol}={pos.quantity:g}@{mid:.4f}")
-            pos.quantity = 0.0
+            closed_summary.append(f"{symbol}={quantity:g}@{mid:.4f}")
+            return True
+
+        known_symbols = {pos.symbol for pos in self.portfolio.positions if abs(pos.quantity) >= 1e-9}
+        for pos in list(self.portfolio.positions):
+            if abs(pos.quantity) < 1e-9:
+                continue
+            closed = _close_at_mid(
+                symbol=pos.symbol, quantity=pos.quantity, position_id=pos.position_id,
+                contract_key=pos.contract_key, strategy_tag=pos.strategy_tag or "weekly_asymmetric",
+                reason="shadow_reset",
+            )
+            if closed:
+                pos.quantity = 0.0
+
+        # Barrido de shadow_trades.csv (ver "MEJORA 2026-10-05" arriba):
+        # cualquier simbolo con cantidad neta real que el Event Journal
+        # nunca vio.
+        try:
+            shadow_only_positions, shadow_warnings = reconstruct_positions_from_shadow_log(
+                option_chain=self.option_chain,
+            )
+        except ReconciliationUnavailable as exc:
+            logger.warning(
+                "SHADOW_RESET: no se pudo barrer logs/shadow_trades.csv en busca de patas "
+                "invisibles para el Event Journal (%s) - se continua solo con lo que el "
+                "journal ya conocia.", exc,
+            )
+            shadow_only_positions, shadow_warnings = [], []
+        for w in shadow_warnings:
+            logger.info("SHADOW_RESET (barrido de shadow_trades.csv): %s", w)
+        for spos in shadow_only_positions:
+            if abs(spos.quantity) < 1e-9:
+                continue
+            if spos.symbol in known_symbols:
+                # Ya la tenia el Event Journal (cerrada o, si no se pudo
+                # cerrar por falta de cotizacion, ya en `skipped` arriba) -
+                # no se vuelve a procesar para no duplicar el cierre.
+                continue
+            logger.warning(
+                "SHADOW_RESET: %s (qty=%.4f) tiene cantidad neta en logs/shadow_trades.csv "
+                "pero NINGUNA huella en el Event Journal - pata invisible para la "
+                "reconciliacion normal de arranque, incluida en este reset puntual.",
+                spos.symbol, spos.quantity,
+            )
+            _close_at_mid(
+                symbol=spos.symbol, quantity=spos.quantity, position_id="", contract_key=spos.contract_key,
+                strategy_tag=spos.strategy_tag or "weekly_asymmetric",
+                reason="shadow_reset_invisible_leg_from_shadow_trades_csv",
+            )
 
         if closed_summary:
             logger.warning(
