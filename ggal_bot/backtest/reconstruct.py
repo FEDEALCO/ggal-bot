@@ -261,6 +261,34 @@ def reconstruct_lifecycle_trades(
         if average_entry is None:
             data_insufficient.append("average_entry")
 
+        # "Lado" de la primera pata de ENTRADA real ("buy"/"sell") normalizado
+        # a la misma convencion "long"/"short" que usa el export de cierres
+        # de vol_arbitrage (columna "Direccion") - ver
+        # attribution.attribute_by_option_type_and_direction. None si falta
+        # el dato (nunca se fabrica un lado). Calculado ACA (antes del loop
+        # de salida, no despues) porque FIX 2026-10-06 lo necesita para el
+        # signo del PnL - ver pnl_sign mas abajo.
+        entry_side = str(entry_rows[0].get("side") or "").strip().lower() if entry_rows else ""
+        direction = {"buy": "long", "sell": "short"}.get(entry_side)
+
+        # FIX 2026-10-06 (bug real detectado en produccion via el panel de
+        # reconciliacion del dashboard - posicion ef268fed9a99, GFGV5000OC,
+        # un short real cerrado con perdida de ARS -88.121,25 que esta
+        # funcion reportaba como ganancia de +88.121,25): a diferencia de
+        # dashboard/pnl_engine.py::match_trades_fifo (que SI bifurca por
+        # direccion), esta funcion calculaba el PnL con la formula de un
+        # long sin excepcion ((precio_salida - entrada_promedio) * qty),
+        # aun cuando `direction` ya se calculaba (ver mas abajo, antes de
+        # este fix) y simplemente nunca se usaba para el signo. Para un
+        # short, el PnL correcto es (entrada_promedio - precio_salida) * qty
+        # - exactamente lo que aplica match_trades_fifo y
+        # load_closed_trades_export (sign = 1.0 if direction=="long" else
+        # -1.0). `direction is None` (dato faltante, side vacio/invalido)
+        # se trata como long por retrocompatibilidad: es el comportamiento
+        # ANTERIOR a este fix para ese caso, preservado a proposito (nunca
+        # se fabrica una direccion que no esta en el dato).
+        pnl_sign = -1.0 if direction == "short" else 1.0
+
         exit_legs: List[Leg] = []
         realized_pnl = 0.0
         for r in exit_rows:
@@ -269,7 +297,7 @@ def reconstruct_lifecycle_trades(
                 continue
             qty = abs(qty)
             exit_legs.append(Leg(quantity=qty, price=px, timestamp=_parse_ts(r.get("timestamp_utc"))))
-            realized_pnl += (px - average_entry) * qty * mult
+            realized_pnl += (px - average_entry) * qty * mult * pnl_sign
         if average_entry is None and exit_rows:
             data_insufficient.append("realized_pnl")
 
@@ -282,13 +310,8 @@ def reconstruct_lifecycle_trades(
             _parse_ts(exit_rows[-1]["timestamp_utc"]) if exit_rows else None
         )
         close_reason = close_rows[-1].get("reason") or None if close_rows else None
-        # "Lado" de la primera pata de ENTRADA real ("buy"/"sell") normalizado
-        # a la misma convencion "long"/"short" que usa el export de cierres
-        # de vol_arbitrage (columna "Direccion") - ver
-        # attribution.attribute_by_option_type_and_direction. None si falta
-        # el dato (nunca se fabrica un lado).
-        entry_side = str(entry_rows[0].get("side") or "").strip().lower() if entry_rows else ""
-        direction = {"buy": "long", "sell": "short"}.get(entry_side)
+        # entry_side/direction ya se calcularon arriba (antes del loop de
+        # salida) - ver comentario del FIX 2026-10-06 junto a pnl_sign.
 
         if not entry_legs or not exit_legs:
             if close_rows:

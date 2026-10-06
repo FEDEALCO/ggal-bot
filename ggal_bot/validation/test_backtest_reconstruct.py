@@ -331,6 +331,65 @@ def test_reconstruct_lifecycle_trades_populates_direction_from_entry_side():
         path.unlink(missing_ok=True)
 
 
+def test_reconstruct_lifecycle_trades_applies_direction_sign_for_short_positions():
+    """
+    FIX 2026-10-06: bug real detectado en produccion via el panel de
+    reconciliacion del dashboard (posicion ef268fed9a99, GFGV5000OC, un
+    short real cerrado con PERDIDA de ARS -88.121,25 que esta funcion
+    reportaba como GANANCIA de +88.121,25). ANTES de este fix, el PnL se
+    calculaba siempre con la formula de un long ((precio_salida -
+    entrada_promedio) * qty), sin importar que `direction` ya se calculara
+    como "short" - nunca se usaba para invertir el signo, a diferencia de
+    dashboard/pnl_engine.py::match_trades_fifo (que SI bifurca por
+    direccion).
+
+    Fixture: ENTRY "sell" (abre corto) 10 @ 100, CLOSE "buy" (recompra) 10
+    @ 120 - el precio subio en contra de un corto, asi que es una PERDIDA
+    real. PnL correcto = (entrada_promedio - precio_salida) * qty * mult =
+    (100 - 120) * 10 * 100 = -20,000. Antes del fix, esta funcion devolvia
+    +20,000 (signo invertido, una ganancia fabricada).
+    """
+    path = _write_csv([
+        ["2026-09-01T10:00:00+00:00", "ENTRY", "GFGC5000O", "weekly_asymmetric", "pos_short", "k", "sell", "-10", "-10", "100.0", "entrada_corta", ""],
+        ["2026-09-05T10:00:00+00:00", "CLOSE", "GFGC5000O", "weekly_asymmetric", "pos_short", "k", "buy", "10", "0", "120.0", "recompra", ""],
+    ], _LIFECYCLE_HEADER)
+    try:
+        rows = load_lifecycle_journal_rows(path)
+        trades, still_open, incomplete = reconstruct_lifecycle_trades(rows)
+        assert still_open == 0
+        assert incomplete == 0
+        assert len(trades) == 1
+        t = trades[0]
+        assert t.direction == "short"
+        assert abs(t.pnl_gross_ars - (-20_000.0)) < 1e-6
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_reconstruct_lifecycle_trades_short_position_with_profit_is_still_positive():
+    """
+    Caso complementario al anterior: un short que SI gana dinero (el precio
+    bajo, como se espera de una posicion corta ganadora) debe seguir
+    reportando PnL POSITIVO despues del fix de signo - no es que el fix
+    simplemente invierta todos los shorts, sino que aplica la formula
+    economica correcta. ENTRY "sell" 10 @ 120, CLOSE "buy" 10 @ 100 ->
+    PnL = (120 - 100) * 10 * 100 = +20,000.
+    """
+    path = _write_csv([
+        ["2026-09-01T10:00:00+00:00", "ENTRY", "GFGC5000O", "weekly_asymmetric", "pos_short_win", "k", "sell", "-10", "-10", "120.0", "entrada_corta", ""],
+        ["2026-09-05T10:00:00+00:00", "CLOSE", "GFGC5000O", "weekly_asymmetric", "pos_short_win", "k", "buy", "10", "0", "100.0", "recompra", ""],
+    ], _LIFECYCLE_HEADER)
+    try:
+        rows = load_lifecycle_journal_rows(path)
+        trades, _, _ = reconstruct_lifecycle_trades(rows)
+        assert len(trades) == 1
+        t = trades[0]
+        assert t.direction == "short"
+        assert abs(t.pnl_gross_ars - 20_000.0) < 1e-6
+    finally:
+        path.unlink(missing_ok=True)
+
+
 def test_reconstruct_open_positions_returns_open_position_with_real_strategy_tag():
     """
     MEJORA 2026-09-30 (gap identificado en el pre-analisis del dashboard
@@ -451,6 +510,8 @@ ALL_TESTS = [
     test_load_closed_trades_export_excludes_rows_with_inconsistent_pnl,
     test_load_closed_trades_export_populates_direction_from_column,
     test_reconstruct_lifecycle_trades_populates_direction_from_entry_side,
+    test_reconstruct_lifecycle_trades_applies_direction_sign_for_short_positions,
+    test_reconstruct_lifecycle_trades_short_position_with_profit_is_still_positive,
     test_reconstruct_open_positions_returns_open_position_with_real_strategy_tag,
     test_reconstruct_open_positions_uses_quantity_after_for_partial_exit,
     test_reconstruct_open_positions_excludes_closed_positions,
