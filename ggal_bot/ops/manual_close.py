@@ -339,6 +339,23 @@ def close_position_manually_from_journal(
     quantity_delta = -quantity if side is OrderSide.SELL else quantity
     data_unavailable = [] if contract_key is not None else ["contract_key"]
 
+    # FIX 2026-10-06 (bug real detectado en produccion via el panel de
+    # reconciliacion del dashboard, mismo patron ya conocido de otras partes
+    # del bot - ver run_bot.py::_act_on_entry_signal/_act_on_exit_signal, que
+    # SI comparten un unico client_order_id entre el evento del journal y el
+    # fill shadow): antes de este fix, esta funcion generaba DOS
+    # uuid.uuid4() independientes - uno para order_client_id (evento CLOSE
+    # del journal) y otro para client_order_id (fill de shadow_trades.csv) -
+    # rompiendo el cruce EXACTO que dashboard/pnl_engine.py::
+    # resolve_position_ids_from_journal() necesita para unir ambos archivos
+    # (build_order_client_id_position_map, build_order_client_id_strategy_map:
+    # ambos dependen de que order_client_id == client_order_id sea el MISMO
+    # id). El efecto real: el cierre manual de la posicion ef268fed9a99
+    # (GFGV5000OC, perdida real de ARS -88.121,25) quedo invisible para el
+    # camino FIFO que alimenta el "PnL Total" del dashboard. Un solo id,
+    # generado una vez, usado en ambas escrituras.
+    manual_close_client_order_id = f"manual-close-{uuid.uuid4().hex[:8]}"
+
     journal = PositionEventJournal(path=journal_path)
     journal.log_event(
         "CLOSE",
@@ -350,7 +367,7 @@ def close_position_manually_from_journal(
         quantity_delta=quantity_delta,
         quantity_after=0.0,
         price=price,
-        order_client_id=f"manual-close-{uuid.uuid4().hex[:8]}",
+        order_client_id=manual_close_client_order_id,
         reason=reason,
         data_unavailable_fields=data_unavailable,
     )
@@ -358,7 +375,7 @@ def close_position_manually_from_journal(
     audit_logger = ShadowAuditLogger(path=shadow_csv_path)
     request = OrderRequest(
         symbol=symbol, side=side, quantity=quantity, price=price,
-        order_type=OrderTypeEnum.MARKET, client_order_id=f"manual-close-{uuid.uuid4().hex[:8]}",
+        order_type=OrderTypeEnum.MARKET, client_order_id=manual_close_client_order_id,
     )
     audit_logger.log_fill(request, fill_price=price, reference_price=price)
 

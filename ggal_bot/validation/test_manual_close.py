@@ -313,6 +313,57 @@ def test_close_position_manually_from_journal_writes_close_event_and_shadow_fill
     assert str(fills.iloc[0]["client_order_id"]).startswith("manual-close-")
 
 
+def test_close_position_manually_from_journal_uses_the_same_client_order_id_in_journal_and_shadow_fill(tmp_path):
+    """
+    FIX 2026-10-06: bug real detectado en produccion via el panel de
+    reconciliacion del dashboard (posicion ef268fed9a99, GFGV5000OC,
+    perdida real de ARS -88.121,25 invisible en el "PnL Total" del
+    dashboard). Causa raiz: esta funcion generaba DOS uuid.uuid4()
+    independientes - uno para order_client_id (evento CLOSE del journal) y
+    otro para client_order_id (fill de shadow_trades.csv) - rompiendo el
+    cruce EXACTO que dashboard/pnl_engine.py::resolve_position_ids_from_journal()
+    necesita (build_order_client_id_position_map/build_order_client_id_
+    strategy_map dependen de que ambos valores sean IDENTICOS, ver
+    docstring de pnl_engine.py lineas 48-49). Este test verifica
+    directamente, leyendo ambos archivos de vuelta, que el id usado en el
+    evento CLOSE del journal y el client_order_id del fill de
+    shadow_trades.csv son el MISMO valor.
+    """
+    import csv as csv_module_read
+
+    journal_path = tmp_path / "position_events.csv"
+    shadow_path = tmp_path / "shadow_trades.csv"
+    _write_journal_event(
+        journal_path, event_type="ENTRY", position_id="pos-8", contract_key="GGAL|GFGV5000OC|2026-10-16",
+        symbol="GFGV5000OC", strategy_tag="weekly_asymmetric", side="sell", quantity_delta=-75,
+        quantity_after=-75, price=20.0, reason="entry_signal",
+    )
+
+    close_position_manually_from_journal(
+        "GFGV5000OC", 1200.0, journal_path=journal_path, shadow_csv_path=shadow_path,
+    )
+
+    with open(journal_path, encoding="utf-8") as f:
+        journal_rows = list(csv_module_read.DictReader(f))
+    close_rows = [r for r in journal_rows if r["event_type"] == "CLOSE"]
+    assert len(close_rows) == 1
+    journal_order_client_id = close_rows[0]["order_client_id"]
+    assert journal_order_client_id.startswith("manual-close-")
+
+    from dashboard.pnl_engine import load_fills
+
+    fills = load_fills(shadow_path)
+    assert len(fills) == 1
+    shadow_client_order_id = str(fills.iloc[0]["client_order_id"])
+
+    assert journal_order_client_id == shadow_client_order_id, (
+        "El order_client_id del evento CLOSE del journal debe ser EXACTAMENTE "
+        "el mismo que el client_order_id del fill shadow correspondiente - de "
+        "lo contrario resolve_position_ids_from_journal() no puede cruzarlos "
+        "y el cierre queda invisible para el calculo FIFO del dashboard."
+    )
+
+
 def test_close_position_manually_from_journal_rejects_explicit_quantity_that_would_go_net_short(tmp_path):
     journal_path = tmp_path / "position_events.csv"
     _write_journal_event(
@@ -338,6 +389,7 @@ ALL_TESTS = [
     test_close_position_manually_from_journal_rejects_missing_or_zero_price,
     test_close_position_manually_from_journal_rejects_symbol_with_no_open_position,
     test_close_position_manually_from_journal_writes_close_event_and_shadow_fill_and_leaves_position_at_zero,
+    test_close_position_manually_from_journal_uses_the_same_client_order_id_in_journal_and_shadow_fill,
     test_close_position_manually_from_journal_rejects_explicit_quantity_that_would_go_net_short,
 ]
 
