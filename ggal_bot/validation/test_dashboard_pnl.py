@@ -411,6 +411,132 @@ def test_resolve_position_ids_from_journal_returns_position_id_or_empty_string()
     assert list(result) == ["pos-oc-1", ""]  # oc-legacy no tiene evento en el journal -> "" (nunca se fabrica)
 
 
+def test_manual_close_fallback_resolves_mismatched_manual_close_ids_for_same_symbol_close_in_time():
+    """
+    FIX 2026-10-07: reproduce EXACTAMENTE el caso real de produccion
+    (posicion ef268fed9a99, GFGV5000OC, 2026-10-02) que motivo el fallback
+    - ver docstring de _manual_close_fallback_matches. El evento CLOSE del
+    journal tiene order_client_id="manual-close-b71559e4"; el fill de
+    shadow_trades.csv tiene client_order_id="manual-close-c64e13c1" - dos
+    ids DISTINTOS para el mismo cierre, escritos un instante despues uno
+    del otro. Sin el fallback, classify_strategy_from_journal() devolveria
+    "unknown_legacy" y resolve_position_ids_from_journal() devolveria "" -
+    con el fallback, ambos deben resolver al strategy_tag/position_id real
+    del evento CLOSE.
+    """
+    fills = pd.DataFrame([
+        _fill_row("2026-10-01T10:47:59.676094Z", "eef245b02278", "GFGV5000OC", "sell", 75, 6.1205),
+        _fill_row("2026-10-02T18:01:45.784670Z", "manual-close-c64e13c1", "GFGV5000OC", "buy", 75, 17.87),
+    ])
+    events_df = pd.DataFrame([
+        _event_row("eef245b02278", "weekly_asymmetric", event_type="ENTRY", symbol="GFGV5000OC"),
+        {
+            **_event_row("manual-close-b71559e4", "weekly_asymmetric", event_type="CLOSE", symbol="GFGV5000OC"),
+            "timestamp_utc": pd.Timestamp("2026-10-02T18:01:45.784594Z", tz="UTC"),
+            "position_id": "ef268fed9a99",
+        },
+    ])
+
+    strategy_result = pe.classify_strategy_from_journal(fills, events_df)
+    assert list(strategy_result) == ["weekly_asymmetric", "weekly_asymmetric"]
+
+    position_result = pe.resolve_position_ids_from_journal(fills, events_df)
+    assert list(position_result) == ["pos-eef245b02278", "ef268fed9a99"]
+
+
+def test_manual_close_fallback_never_matches_a_different_symbol():
+    """Un fill "manual-close-*" huerfano de un simbolo nunca debe apearse
+    con un evento CLOSE huerfano de OTRO simbolo, aunque esten cerca en el
+    tiempo - sin evidencia de simbolo compatible, se queda sin resolver."""
+    fills = pd.DataFrame([
+        _fill_row("2026-10-02T18:01:45.784670Z", "manual-close-c64e13c1", "GFGC6800OC", "buy", 7, 39.08),
+    ])
+    events_df = pd.DataFrame([
+        {
+            **_event_row("manual-close-b71559e4", "weekly_asymmetric", event_type="CLOSE", symbol="GFGV5000OC"),
+            "timestamp_utc": pd.Timestamp("2026-10-02T18:01:45.784594Z", tz="UTC"),
+        },
+    ])
+
+    strategy_result = pe.classify_strategy_from_journal(fills, events_df)
+    assert list(strategy_result) == [pe.UNKNOWN_LEGACY_STRATEGY]
+    position_result = pe.resolve_position_ids_from_journal(fills, events_df)
+    assert list(position_result) == [""]
+
+
+def test_manual_close_fallback_never_matches_outside_the_time_tolerance():
+    """Mismo simbolo, pero el evento CLOSE y el fill quedan separados por
+    mas de _MANUAL_CLOSE_FALLBACK_TOLERANCE_SECONDS - no hay evidencia
+    suficiente de que sean la misma operacion, se queda sin resolver."""
+    fills = pd.DataFrame([
+        _fill_row("2026-10-02T18:10:00Z", "manual-close-c64e13c1", "GFGV5000OC", "buy", 75, 17.87),
+    ])
+    events_df = pd.DataFrame([
+        {
+            **_event_row("manual-close-b71559e4", "weekly_asymmetric", event_type="CLOSE", symbol="GFGV5000OC"),
+            "timestamp_utc": pd.Timestamp("2026-10-02T18:01:45Z", tz="UTC"),  # ~8 minutos antes
+        },
+    ])
+
+    strategy_result = pe.classify_strategy_from_journal(fills, events_df)
+    assert list(strategy_result) == [pe.UNKNOWN_LEGACY_STRATEGY]
+    position_result = pe.resolve_position_ids_from_journal(fills, events_df)
+    assert list(position_result) == [""]
+
+
+def test_manual_close_fallback_never_steals_an_event_with_a_legitimate_exact_match():
+    """
+    Si el order_client_id de un evento CLOSE YA coincide EXACTO con el
+    client_order_id de algun fill (match legitimo), ese evento nunca debe
+    "prestarse" como fallback a un fill DISTINTO del mismo simbolo, aunque
+    este cerca en el tiempo - evita robarle su propio match real a otro
+    fill.
+    """
+    fills = pd.DataFrame([
+        # Este fill tiene match EXACTO con el evento CLOSE de abajo.
+        _fill_row("2026-10-02T18:01:45.784670Z", "manual-close-b71559e4", "GFGV5000OC", "buy", 75, 17.87),
+        # Este fill es huerfano, mismo simbolo, muy cerca en el tiempo -
+        # pero el unico candidato ya "pertenece" al fill de arriba.
+        _fill_row("2026-10-02T18:01:45.784680Z", "manual-close-c64e13c1", "GFGV5000OC", "buy", 75, 17.87),
+    ])
+    events_df = pd.DataFrame([
+        {
+            **_event_row("manual-close-b71559e4", "weekly_asymmetric", event_type="CLOSE", symbol="GFGV5000OC"),
+            "timestamp_utc": pd.Timestamp("2026-10-02T18:01:45.784594Z", tz="UTC"),
+        },
+    ])
+
+    strategy_result = pe.classify_strategy_from_journal(fills, events_df)
+    assert list(strategy_result) == ["weekly_asymmetric", pe.UNKNOWN_LEGACY_STRATEGY]
+
+
+def test_manual_close_fallback_assigns_nearest_candidate_when_several_are_available():
+    """Dos cierres manuales huerfanos del MISMO simbolo en dos momentos
+    distintos: cada fill debe aparearse con el candidato mas cercano en el
+    tiempo, sin reusar el mismo evento del journal para ambos."""
+    fills = pd.DataFrame([
+        _fill_row("2026-10-01T10:00:00.100Z", "manual-close-fill-early", "GFGC6800OC", "sell", 5, 50.0),
+        _fill_row("2026-10-05T15:00:00.100Z", "manual-close-fill-late", "GFGC6800OC", "sell", 3, 60.0),
+    ])
+    events_df = pd.DataFrame([
+        {
+            **_event_row("manual-close-ev-early", "weekly_asymmetric", event_type="CLOSE", symbol="GFGC6800OC"),
+            "timestamp_utc": pd.Timestamp("2026-10-01T10:00:00.000Z", tz="UTC"),
+            "position_id": "pos-early",
+        },
+        {
+            **_event_row("manual-close-ev-late", "scalping", event_type="CLOSE", symbol="GFGC6800OC"),
+            "timestamp_utc": pd.Timestamp("2026-10-05T15:00:00.000Z", tz="UTC"),
+            "position_id": "pos-late",
+        },
+    ])
+
+    strategy_result = pe.classify_strategy_from_journal(fills, events_df)
+    assert list(strategy_result) == ["weekly_asymmetric", "scalping"]
+    position_result = pe.resolve_position_ids_from_journal(fills, events_df)
+    assert list(position_result) == ["pos-early", "pos-late"]
+
+
 def test_match_trades_fifo_reproduces_and_fixes_the_verified_cross_strategy_pnl_crossing():
     """
     Regresion DIRECTA de un bug real, VERIFICADO contra datos de produccion
@@ -693,6 +819,11 @@ ALL_TESTS = [
     test_build_order_client_id_position_map_uses_first_valid_row_per_order,
     test_build_order_client_id_position_map_empty_when_no_events,
     test_resolve_position_ids_from_journal_returns_position_id_or_empty_string,
+    test_manual_close_fallback_resolves_mismatched_manual_close_ids_for_same_symbol_close_in_time,
+    test_manual_close_fallback_never_matches_a_different_symbol,
+    test_manual_close_fallback_never_matches_outside_the_time_tolerance,
+    test_manual_close_fallback_never_steals_an_event_with_a_legitimate_exact_match,
+    test_manual_close_fallback_assigns_nearest_candidate_when_several_are_available,
     test_match_trades_fifo_reproduces_and_fixes_the_verified_cross_strategy_pnl_crossing,
     test_match_trades_fifo_uses_position_id_to_isolate_positions_of_the_same_strategy,
     test_load_fills_discovers_and_merges_rotated_schema_files,

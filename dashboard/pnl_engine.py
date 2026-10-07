@@ -342,6 +342,135 @@ def build_order_client_id_position_map(events_df: pd.DataFrame) -> Dict[str, str
     return mapping
 
 
+_MANUAL_CLOSE_PREFIX = "manual-close-"
+_MANUAL_CLOSE_FALLBACK_TOLERANCE_SECONDS = 5.0
+
+
+def _manual_close_fallback_matches(
+    fills: pd.DataFrame, events_df: pd.DataFrame,
+) -> Dict[Any, Tuple[str, str]]:
+    """
+    FIX 2026-10-07 (a pedido explicito del usuario, "matching de respaldo
+    para manual-close-*" - ver tambien el fix de
+    ggal_bot/ops/manual_close.py del 2026-10-06): cubre el caso de un fill
+    con `client_order_id="manual-close-XXXXXXXX"` que NO tiene match
+    EXACTO en el event journal porque fue escrito ANTES de ese fix, cuando
+    `close_position_manually_from_journal()` generaba DOS uuid.uuid4()
+    independientes - uno para el evento CLOSE del journal
+    (`order_client_id`) y otro para el fill de shadow_trades.csv
+    (`client_order_id`) - en vez de uno solo compartido.
+
+    Caso real de produccion que motiva esto (posicion `ef268fed9a99`,
+    GFGV5000OC, 2026-10-02): evento CLOSE con
+    `order_client_id=manual-close-b71559e4`, fill con
+    `client_order_id=manual-close-c64e13c1` - dos ids DISTINTOS para la
+    MISMA operacion de cierre, verificado leyendo ambos archivos. Sin este
+    fallback, esa pata queda invisible para el lado FIFO de la
+    reconciliacion del dashboard para siempre (el fix de manual_close.py
+    evita que esto le pase a un cierre manual FUTURO, pero no puede
+    reescribir un id que YA quedo grabado en el historial - esto NUNCA
+    reescribe ningun CSV, solo resuelve la clasificacion/agrupacion en
+    memoria para el calculo de PnL).
+
+    Estrategia (sin fabricar nada - solo evidencia circunstancial fuerte,
+    nunca una garantia absoluta, por eso es un FALLBACK, no el camino
+    principal): para cada fill cuyo `client_order_id` empieza con
+    "manual-close-" y NO tiene match exacto en ningun evento del journal
+    (huerfano real: su id no aparece como `order_client_id` de NINGUNA
+    fila), busca un evento CLOSE del journal que TAMBIEN tenga
+    `order_client_id` con ese prefijo y TAMBIEN sea huerfano (su id no
+    aparece como `client_order_id` de NINGUN fill - si apareciera, ese
+    evento ya tiene su propio match exacto legitimo en otro fill y nunca
+    se le "presta" a este), del MISMO simbolo, dentro de una ventana de
+    tiempo chica (`_MANUAL_CLOSE_FALLBACK_TOLERANCE_SECONDS` segundos) - el
+    evento del journal y el fill del mismo cierre manual se escriben a
+    milisegundos de diferencia en la MISMA llamada de funcion (dos
+    escrituras consecutivas, ver close_position_manually_from_journal),
+    nunca minutos. Si hay mas de un candidato del mismo simbolo dentro de
+    la ventana (mas de un cierre manual historico del mismo simbolo), cada
+    fill (en orden cronologico) se aparea con el candidato MAS CERCANO en
+    el tiempo todavia disponible - matching greedy, un evento del journal
+    nunca se reusa para mas de un fill.
+
+    Devuelve {indice_de_fills: (strategy_tag, position_id)} SOLO para los
+    fills que encontraron un candidato dentro de la ventana - un fill sin
+    candidato compatible queda sin entrada (el llamador sigue tratandolo
+    como "unknown_legacy"/"" igual que antes de este fallback, nunca se
+    fabrica un match sin evidencia).
+    """
+    matches: Dict[Any, Tuple[str, str]] = {}
+    if fills.empty or events_df.empty:
+        return matches
+    if "order_client_id" not in events_df.columns or "client_order_id" not in fills.columns:
+        return matches
+
+    all_fill_client_ids = {
+        str(v).strip() for v in fills["client_order_id"] if str(v).strip()
+    }
+    all_event_client_ids = {
+        str(getattr(row, "order_client_id", "") or "").strip()
+        for row in events_df.itertuples(index=False)
+    }
+    all_event_client_ids.discard("")
+
+    candidates: List[Dict[str, Any]] = []
+    for row in events_df.itertuples(index=False):
+        if str(getattr(row, "event_type", "") or "") != "CLOSE":
+            continue
+        order_client_id = str(getattr(row, "order_client_id", "") or "").strip()
+        if not order_client_id.startswith(_MANUAL_CLOSE_PREFIX):
+            continue
+        if order_client_id in all_fill_client_ids:
+            continue  # tiene match exacto en algun fill - no es huerfano, no se toca
+        ts = getattr(row, "timestamp_utc", None)
+        if ts is None or pd.isna(ts):
+            continue
+        candidates.append({
+            "symbol": str(getattr(row, "symbol", "") or ""),
+            "timestamp": ts,
+            "strategy_tag": str(getattr(row, "strategy_tag", "") or ""),
+            "position_id": str(getattr(row, "position_id", "") or ""),
+        })
+    if not candidates:
+        return matches
+
+    unmatched_fills: List[Tuple[Any, str, Any]] = []
+    for idx, row in zip(fills.index, fills.itertuples(index=False)):
+        client_id = str(getattr(row, "client_order_id", "") or "").strip()
+        if not client_id.startswith(_MANUAL_CLOSE_PREFIX):
+            continue
+        if client_id in all_event_client_ids:
+            continue  # tiene match exacto en el journal - no necesita fallback
+        ts = getattr(row, "timestamp_utc", None)
+        if ts is None or pd.isna(ts):
+            continue
+        unmatched_fills.append((idx, str(getattr(row, "symbol", "") or ""), ts))
+    if not unmatched_fills:
+        return matches
+
+    unmatched_fills.sort(key=lambda t: t[2])
+    tolerance = pd.Timedelta(seconds=_MANUAL_CLOSE_FALLBACK_TOLERANCE_SECONDS)
+    used_candidates: set = set()
+
+    for fill_idx, symbol, ts in unmatched_fills:
+        best_ci = None
+        best_diff = None
+        for ci, cand in enumerate(candidates):
+            if ci in used_candidates or cand["symbol"] != symbol:
+                continue
+            diff = abs(cand["timestamp"] - ts)
+            if diff > tolerance:
+                continue
+            if best_diff is None or diff < best_diff:
+                best_ci, best_diff = ci, diff
+        if best_ci is not None:
+            used_candidates.add(best_ci)
+            cand = candidates[best_ci]
+            matches[fill_idx] = (cand["strategy_tag"], cand["position_id"])
+
+    return matches
+
+
 def resolve_position_ids_from_journal(
     fills: pd.DataFrame, events_df: Optional[pd.DataFrame] = None,
 ) -> pd.Series:
@@ -350,7 +479,9 @@ def resolve_position_ids_from_journal(
     (desde el event journal, cruzado por client_order_id) para cada fill, o
     "" si no hay match (fill anterior al deploy del journal, o de una
     estrategia que todavia no loguea sus ENTRY - ver Prioridad 2 en curso
-    para vol_arbitrage/delta_hedge).
+    para vol_arbitrage/delta_hedge). Para un fill "manual-close-*" sin
+    match exacto, intenta primero el fallback por cercania (ver
+    _manual_close_fallback_matches) antes de rendirse con "".
 
     match_trades_fifo() usa esto (cuando el llamador lo agrega como columna
     "position_id" de `fills`, mismo patron que fills["strategy"] via
@@ -360,16 +491,22 @@ def resolve_position_ids_from_journal(
     """
     if events_df is None:
         events_df = load_position_events()
-    position_map = build_order_client_id_position_map(events_df)
-
-    def _resolve_row(row) -> str:
-        client_id = str(getattr(row, "client_order_id", "") or "").strip()
-        return position_map.get(client_id, "")
-
     if fills.empty:
         return pd.Series([], dtype=object, index=fills.index)
+    position_map = build_order_client_id_position_map(events_df)
+    fallback_matches = _manual_close_fallback_matches(fills, events_df)
+
+    def _resolve_row(idx, row) -> str:
+        client_id = str(getattr(row, "client_order_id", "") or "").strip()
+        if client_id in position_map:
+            return position_map[client_id]
+        fallback = fallback_matches.get(idx)
+        if fallback and fallback[1]:
+            return fallback[1]
+        return ""
+
     return pd.Series(
-        [_resolve_row(row) for row in fills.itertuples(index=False)],
+        [_resolve_row(idx, row) for idx, row in zip(fills.index, fills.itertuples(index=False))],
         index=fills.index,
     )
 
@@ -390,10 +527,14 @@ def classify_strategy_from_journal(
       2. Opcion CON match de client_order_id en el event journal -> el
          strategy_tag REAL de ese match (weekly_asymmetric/scalping/
          vol_arbitrage/lo que sea).
-      3. Opcion SIN match (tipicamente anterior al deploy del journal) ->
-         "unknown_legacy", NUNCA "vol_arbitrage" por default - no hay
-         evidencia para adivinar cual estrategia la abrio, y adivinar mal
-         es exactamente el bug que esto corrige.
+      3. Opcion "manual-close-*" SIN match exacto -> intenta el fallback
+         por cercania de simbolo+tiempo (ver _manual_close_fallback_matches,
+         FIX 2026-10-07) antes de rendirse.
+      4. Opcion SIN match (tipicamente anterior al deploy del journal, o
+         sin candidato de fallback compatible) -> "unknown_legacy", NUNCA
+         "vol_arbitrage" por default - no hay evidencia para adivinar cual
+         estrategia la abrio, y adivinar mal es exactamente el bug que esto
+         corrige.
 
     Si `events_df` es None, se carga con load_position_events() (comodo
     para el llamador tipico de dashboard/app.py); pasarlo explicitamente
@@ -402,19 +543,25 @@ def classify_strategy_from_journal(
     """
     if events_df is None:
         events_df = load_position_events()
+    if fills.empty:
+        return pd.Series([], dtype=object, index=fills.index)
     strategy_map = build_order_client_id_strategy_map(events_df)
+    fallback_matches = _manual_close_fallback_matches(fills, events_df)
 
-    def _classify_row(row) -> str:
+    def _classify_row(idx, row) -> str:
         symbol = getattr(row, "symbol", "")
         if _is_underlying_symbol(symbol):
             return "delta_hedge"
         client_id = str(getattr(row, "client_order_id", "") or "").strip()
-        return strategy_map.get(client_id, UNKNOWN_LEGACY_STRATEGY)
+        if client_id in strategy_map:
+            return strategy_map[client_id]
+        fallback = fallback_matches.get(idx)
+        if fallback and fallback[0]:
+            return fallback[0]
+        return UNKNOWN_LEGACY_STRATEGY
 
-    if fills.empty:
-        return pd.Series([], dtype=object, index=fills.index)
     return pd.Series(
-        [_classify_row(row) for row in fills.itertuples(index=False)],
+        [_classify_row(idx, row) for idx, row in zip(fills.index, fills.itertuples(index=False))],
         index=fills.index,
     )
 
