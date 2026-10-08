@@ -529,6 +529,28 @@ class RiskConfig:
     # explicitamente (ej. debugging local).
     enforce_entry_spread_gate: bool = _env_bool("GGAL_BOT_ENFORCE_ENTRY_SPREAD_GATE", True)
 
+    # --- Rotacion diaria + compresion de market_snapshots.csv (hallazgo de ---
+    # --- auditoria, 2026-10-08, a pedido explicito del usuario) ----------------
+    # market_snapshots.csv (ver ggal_bot/data/market_snapshot_log.py) se
+    # diseño deliberadamente append-only/sin rotacion (ver docstring de ese
+    # modulo) "hasta que el tamaño de archivo se vuelva un problema real".
+    # Confirmado que ya lo es: medido en produccion (2026-10-08) a
+    # ~236.9 MB/dia de crecimiento, con solo ~3.5GB libres en el volumen de
+    # logs - al ritmo actual, se llena en ~15 dias. MarketSnapshotLogger
+    # ahora archiva comprimido (gzip) el archivo del dia anterior apenas
+    # detecta el cambio de fecha UTC, antes de la primera escritura del dia
+    # nuevo - el archivo "vivo" (market_snapshots.csv) sigue siendo siempre
+    # el del dia en curso, asi que dashboard/data/market_data.py no necesita
+    # ningun cambio (sigue leyendo el mismo path de siempre).
+    #
+    # Default True: guarda de riesgo/disco (misma categoria que
+    # enforce_market_hours_gate/enforce_position_invariants/
+    # enforce_entry_spread_gate arriba - evita que el bot se quede sin poder
+    # loguear por disco lleno), no una estrategia nueva. Configurable igual,
+    # para poder desactivarla explicitamente (ej. debugging local donde se
+    # prefiere un solo archivo acumulado).
+    market_snapshot_rotate_daily: bool = _env_bool("GGAL_BOT_MARKET_SNAPSHOT_ROTATE_DAILY", True)
+
     # --- Presupuesto PREVENTIVO de Griegas por entrada (MEJORA 2026-09-28) ---
     # A pedido explicito del usuario ("mejor trader quant... presupuesto de
     # riesgo agregado en vez de esperar al muro duro"): hasta esta mejora, el
