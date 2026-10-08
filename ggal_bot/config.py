@@ -503,6 +503,32 @@ class RiskConfig:
     # explicitamente (ej. debugging local).
     enforce_position_invariants: bool = _env_bool("GGAL_BOT_ENFORCE_POSITION_INVARIANTS", True)
 
+    # --- Gate de spread/liquidez en ENTRADAS nuevas (hallazgo de auditoria, ---
+    # --- 2026-10-08, a pedido explicito del usuario) ---------------------------
+    # Hasta esta mejora, max_spread_relative/min_book_size (arriba) solo se
+    # chequeaban para el hedge delta-neutral (ver delta_hedger.py,
+    # RiskManager.check_liquidity) - ninguna ENTRADA ni SALIDA de
+    # weekly_asymmetric/scalping los chequeaba antes de operar. Caso real que
+    # motiva esto: GFGC6800OC, salida del 2026-10-07T13:30:21 UTC, ejecutada
+    # contra bid=15/ask=35 (80% de spread relativo, 16x el limite de 5%) sin
+    # que nada la bloqueara ni alertara con prioridad.
+    #
+    # Para ENTRADAS (a diferencia de las salidas, ver _act_on_exit_signal): se
+    # BLOQUEA la señal si la punta no es operable (mismo criterio que
+    # OrderBookSnapshot.is_tradeable ya usa para el hedge) - abrir una
+    # posicion nueva contra un libro asi es puro riesgo evitable, no hay
+    # ninguna posicion ya tomada que gestionar. Decision explicita del
+    # usuario: las SALIDAS nunca se bloquean por esto (una estrategia siempre
+    # debe poder cerrar), solo se escala a WARNING el log ya existente de
+    # calidad de ejecucion - ver ese metodo para el porque.
+    #
+    # Default True: guarda de riesgo (misma categoria que
+    # enforce_market_hours_gate/enforce_position_invariants arriba), no una
+    # estrategia nueva - dejarla apagada por defecto dejaria sin corregir el
+    # gap real que la motiva. Configurable igual, para poder desactivarla
+    # explicitamente (ej. debugging local).
+    enforce_entry_spread_gate: bool = _env_bool("GGAL_BOT_ENFORCE_ENTRY_SPREAD_GATE", True)
+
     # --- Presupuesto PREVENTIVO de Griegas por entrada (MEJORA 2026-09-28) ---
     # A pedido explicito del usuario ("mejor trader quant... presupuesto de
     # riesgo agregado en vez de esperar al muro duro"): hasta esta mejora, el

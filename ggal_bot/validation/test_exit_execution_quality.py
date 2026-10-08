@@ -106,8 +106,60 @@ def test_exit_with_stale_quote_logs_warning_but_still_closes_the_position():
         SETTINGS.shadow.enabled = original_enabled
 
 
+def test_exit_with_wide_spread_logs_warning_but_still_closes_the_position():
+    """
+    MEJORA 2026-10-08 (hallazgo de auditoria, a pedido explicito del
+    usuario): ademas de STALE, un spread por encima de
+    RiskConfig.max_spread_relative tambien debe escalar a WARNING - caso
+    real: GFGC6800OC, 2026-10-07T13:30:21 UTC, spread_rel=0.80 (80%, 16x el
+    limite de 5%), que con el codigo previo a esta mejora quedaba en INFO
+    sin ninguna señal de alerta. La salida NUNCA se bloquea por esto (ver
+    docstring de KillSwitch) - solo debe quedar visible en el log.
+    """
+    original_enabled = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True
+    try:
+        bot = GgalOptionsBot()
+        wide_spread_book = OrderBookSnapshot(
+            "GFGC6800OC", bid=15.0, ask=35.0, bid_size=50, ask_size=50, as_of=time.time(),
+        )
+        wide_spread_quote = OptionQuote(
+            symbol="GFGC6800OC", strike=6800.0, expiry=date(2026, 10, 16),
+            option_type=OptionType.CALL, book=wide_spread_book, days_calendar=8, days_business=6,
+        )
+        wide_spread_quote.greeks = {"delta": 0.55, "gamma": 0.0009, "vega": 3.2, "theta": -1.4, "rho": 0.2, "price": 25.0}
+        wide_spread_quote.iv = 0.55
+        bot.option_chain.upsert_quote(wide_spread_quote)
+        bot.portfolio.add(Position(
+            symbol="GFGC6800OC", quantity=31.0, multiplier=100.0,
+            entry_price=64.39, entry_time=None, strategy_tag="weekly_asymmetric",
+        ))
+        signal = _FakeExitSignal(symbol="GFGC6800OC", reason="stop_loss", quantity=31.0)
+
+        import logging as _logging
+        caplog_logger = _logging.getLogger("ggal_bot.run_bot")
+        records = []
+        handler = _logging.Handler()
+        handler.emit = lambda record: records.append(record)  # noqa: E731
+        caplog_logger.addHandler(handler)
+        caplog_logger.setLevel(_logging.INFO)
+        try:
+            bot._act_on_exit_signal(signal, spot=6800.0)
+        finally:
+            caplog_logger.removeHandler(handler)
+
+        # La salida SIGUE ejecutandose (nunca se bloquea por spread ancho).
+        assert bot._position_quantity("GFGC6800OC") == 0.0
+        warning_records = [r for r in records if r.levelno == _logging.WARNING and "decision_price" in r.getMessage()]
+        assert len(warning_records) == 1
+        assert "SPREAD ANCHO" in warning_records[0].getMessage()
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+
+
 ALL_TESTS = [
     test_exit_with_fresh_quote_logs_info_not_warning_and_still_closes,
+    test_exit_with_wide_spread_logs_warning_but_still_closes_the_position,
 ]
 
 

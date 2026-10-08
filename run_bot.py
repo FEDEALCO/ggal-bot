@@ -2356,14 +2356,35 @@ class GgalOptionsBot:
         book = quote.book
         quote_age = book.age_seconds()
         stale_threshold = SETTINGS.risk.max_option_quote_staleness_seconds
-        log_fn = logger.warning if quote_age > stale_threshold else logger.info
+        spread_limit = SETTINGS.risk.max_spread_relative
+        is_stale = quote_age > stale_threshold
+        # MEJORA 2026-10-08 (hallazgo de auditoria, a pedido explicito del
+        # usuario): ademas de STALE (ya existia), ahora tambien se escala a
+        # WARNING cuando el spread de la punta supera
+        # RiskConfig.max_spread_relative - caso real que lo motiva:
+        # GFGC6800OC, 2026-10-07T13:30:21 UTC, spread_rel=0.80 (80%, 16x el
+        # limite de 5%) quedo logueado en INFO, sin ninguna señal de alerta,
+        # porque antes de esto solo STALE promovia a WARNING. Deliberado
+        # (decision explicita del usuario): esto NUNCA bloquea la salida -
+        # una estrategia siempre debe poder cerrar una posicion ya tomada,
+        # ver docstring de KillSwitch - solo hace visible el riesgo de
+        # ejecucion para que quede trazable en el log/dashboard.
+        is_wide_spread = book.spread_relative > spread_limit
+        log_fn = logger.warning if (is_stale or is_wide_spread) else logger.info
+        notes = []
+        if is_stale:
+            notes.append("STALE - el mid puede no ser fielmente ejecutable")
+        if is_wide_spread:
+            notes.append(
+                f"SPREAD ANCHO ({book.spread_relative:.1%} > limite {spread_limit:.1%}) - "
+                "decision_price(mid) puede no ser fielmente ejecutable, salida NUNCA se bloquea por esto"
+            )
         log_fn(
             "Salida %s [reason=%s]: decision_price(mid)=%.2f bid=%.2f ask=%.2f "
-            "spread_rel=%.4f quote_age=%.1fs (umbral=%.0fs, %s) requested_qty=%.2f",
+            "spread_rel=%.4f quote_age=%.1fs (umbral=%.0fs) requested_qty=%.2f - %s",
             signal.symbol, getattr(signal, "reason", ""), book.mid, book.bid, book.ask,
-            book.spread_relative, quote_age, stale_threshold,
-            "STALE - el mid puede no ser fielmente ejecutable" if quote_age > stale_threshold else "OK",
-            signal.quantity,
+            book.spread_relative, quote_age, stale_threshold, signal.quantity,
+            "; ".join(notes) if notes else "OK",
         )
 
         state = self.mid_price_exec.submit(
@@ -2554,6 +2575,31 @@ class GgalOptionsBot:
         quote = self.option_chain.get(signal.symbol)
         if quote is None or quote.book.bid <= 0 or quote.book.ask <= 0:
             return
+
+        # Gate de spread/liquidez en ENTRADAS (hallazgo de auditoria,
+        # 2026-10-08, a pedido explicito del usuario - ver
+        # RiskConfig.enforce_entry_spread_gate para el caso real completo
+        # que lo motiva). Usa el mismo umbral que ya existia solo para el
+        # hedge (RiskLimits.max_spread_relative/min_book_size, ver
+        # OrderBookSnapshot.is_tradeable) - nunca se habia aplicado a una
+        # entrada real de weekly_asymmetric/scalping.
+        if SETTINGS.risk.enforce_entry_spread_gate:
+            rm_for_liquidity = risk_manager if risk_manager is not None else self.risk_manager
+            if not quote.book.is_tradeable(
+                rm_for_liquidity.limits.max_spread_relative, rm_for_liquidity.limits.min_book_size,
+            ):
+                logger.info(
+                    "Señal %s descartada: punta no operable para abrir entrada nueva "
+                    "(bid=%.3f ask=%.3f spread_rel=%.4f limite=%.4f bid_size=%.1f ask_size=%.1f min_size=%.1f).",
+                    signal.symbol, quote.book.bid, quote.book.ask, quote.book.spread_relative,
+                    rm_for_liquidity.limits.max_spread_relative, quote.book.bid_size, quote.book.ask_size,
+                    rm_for_liquidity.limits.min_book_size,
+                )
+                self.position_event_journal.log_event(
+                    "REJECT", symbol=signal.symbol, strategy_tag=strategy_tag,
+                    side="buy", reason=f"spread_not_tradeable: spread_relative={quote.book.spread_relative:.4f}",
+                )
+                return
 
         # Kill switch centralizado (Fase 5.3, ver ggal_bot/risk/kill_switch.py):
         # bloquea SOLO entradas nuevas, nunca salidas (ver docstring de

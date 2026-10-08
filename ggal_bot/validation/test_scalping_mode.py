@@ -104,7 +104,7 @@ def _scalping_config(**overrides) -> ScalpingConfig:
 
 
 def _quote(symbol, strike, iv, spot_ref, days_biz, expiry=date(2026, 9, 4),
-           option_type=OptionType.CALL, greeks=None, bid=95.0, ask=105.0,
+           option_type=OptionType.CALL, greeks=None, bid=99.0, ask=101.0,
            bid_size=100.0, ask_size=100.0):
     book = OrderBookSnapshot(symbol, bid=bid, ask=ask, bid_size=bid_size, ask_size=ask_size, last_volume=1000.0)
     q = OptionQuote(symbol, strike=strike, expiry=expiry, option_type=option_type,
@@ -783,7 +783,7 @@ def test_bot_act_on_entry_signal_scalping_not_blocked_by_weekly_asymmetric_vega_
         # abajo NUNCA se abriria.
         assert bot.risk_manager.should_halt_new_positions(bot.portfolio.total_greeks())
 
-        new_quote = _quote("GFSCALP1", 6600.0, 0.30, 6600.0, 1, bid=95.0, ask=105.0,
+        new_quote = _quote("GFSCALP1", 6600.0, 0.30, 6600.0, 1, bid=99.0, ask=101.0,
                             greeks={"delta": 0.5, "gamma": 0.01, "vega": 1.0, "theta": -1.0})
         bot.option_chain.upsert_quote(new_quote)
         signal = EntrySignal(
@@ -820,7 +820,7 @@ def test_bot_act_on_entry_signal_weekly_asymmetric_not_blocked_by_scalping_vega_
             bot.portfolio.greeks_for_strategy_tag("scalping")
         )
 
-        new_quote = _quote("GFWEEKLY1", 6600.0, 0.30, 6600.0, 5, bid=95.0, ask=105.0,
+        new_quote = _quote("GFWEEKLY1", 6600.0, 0.30, 6600.0, 5, bid=99.0, ask=101.0,
                             greeks={"delta": 0.5, "gamma": 0.01, "vega": 1.0, "theta": -1.0})
         bot.option_chain.upsert_quote(new_quote)
         signal = EntrySignal(
@@ -866,7 +866,7 @@ def test_bot_act_on_entry_signal_weekly_asymmetric_blocked_by_its_own_delta_brea
         assert abs(totals["delta"]) > SETTINGS.risk.max_delta_total
         assert bot.risk_manager.should_halt_new_positions(totals) is True
 
-        new_quote = _quote("GFWEEKLY2", 6600.0, 0.30, 6600.0, 5, bid=95.0, ask=105.0,
+        new_quote = _quote("GFWEEKLY2", 6600.0, 0.30, 6600.0, 5, bid=99.0, ask=101.0,
                             greeks={"delta": 0.4, "gamma": 0.0005, "vega": 0.05, "theta": -1.0})
         bot.option_chain.upsert_quote(new_quote)
         signal = EntrySignal(
@@ -908,7 +908,7 @@ def test_bot_act_on_entry_signal_weekly_asymmetric_blocked_by_unknown_greeks_fai
             totals, has_unknown_greeks=bot.portfolio.has_unknown_greeks("weekly_asymmetric"),
         ) is True
 
-        new_quote = _quote("GFWEEKLY3", 6600.0, 0.30, 6600.0, 5, bid=95.0, ask=105.0,
+        new_quote = _quote("GFWEEKLY3", 6600.0, 0.30, 6600.0, 5, bid=99.0, ask=101.0,
                             greeks={"delta": 0.4, "gamma": 0.0005, "vega": 0.05, "theta": -1.0})
         bot.option_chain.upsert_quote(new_quote)
         signal = EntrySignal(
@@ -945,7 +945,7 @@ def test_bot_act_on_entry_signal_scalping_still_blocked_by_its_own_vega_breach()
             expiry=date(2026, 9, 4), strategy_tag="scalping",
         ))
 
-        new_quote = _quote("GFSCALP2", 6600.0, 0.30, 6600.0, 1, bid=95.0, ask=105.0,
+        new_quote = _quote("GFSCALP2", 6600.0, 0.30, 6600.0, 1, bid=99.0, ask=101.0,
                             greeks={"delta": 0.5, "gamma": 0.01, "vega": 1.0, "theta": -1.0})
         bot.option_chain.upsert_quote(new_quote)
         signal = EntrySignal(
@@ -989,7 +989,7 @@ def test_bot_act_on_entry_signal_scalping_blocked_by_its_own_delta_breach():
         assert abs(totals["delta"]) > SETTINGS.scalping.max_delta_total
         assert bot.scalping_risk_manager.should_halt_new_positions(totals) is True
 
-        new_quote = _quote("GFSCALP3", 6600.0, 0.30, 6600.0, 1, bid=95.0, ask=105.0,
+        new_quote = _quote("GFSCALP3", 6600.0, 0.30, 6600.0, 1, bid=99.0, ask=101.0,
                             greeks={"delta": 0.5, "gamma": 0.001, "vega": 0.1, "theta": -1.0})
         bot.option_chain.upsert_quote(new_quote)
         signal = EntrySignal(
