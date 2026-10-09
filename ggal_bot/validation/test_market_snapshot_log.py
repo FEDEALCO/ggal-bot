@@ -157,8 +157,28 @@ def test_logger_archives_and_compresses_file_left_from_a_previous_day_on_startup
     Simula un restart del bot cruzando la medianoche UTC: el archivo
     "vivo" quedo con una fila de AYER (mtime de ayer). Al construir una
     nueva instancia (equivalente a un restart), debe archivarse comprimido
-    con gzip (contenido intacto) y dejar el path vivo libre para un
-    archivo nuevo.
+    con gzip (contenido intacto) y dejar el path vivo libre de datos viejos
+    para un archivo nuevo.
+
+    BUG DE TEST CORREGIDO (2026-10-09, hallazgo de auditoria): la version
+    original hardcodeaba `today = date(2026, 10, 9)` - un dia en el FUTURO
+    relativo a cuando se escribio el test (2026-10-08). Eso rompia en dos
+    frentes apenas el reloj real alcanzaba esa fecha: (1) el constructor de
+    `new_logger` dispara su propio chequeo de rotacion automatico
+    (`_ensure_header` -> `_rotate_if_new_day_locked(now=None)`, que usa el
+    reloj real, no el `today` hardcodeado) - mientras el reloj real no
+    llegaba a esa fecha, ese chequeo automatico era un no-op y SOLO la
+    llamada explicita de mas abajo rotaba (sin volver a crear el header);
+    en cuanto el reloj real alcanzo esa fecha, el chequeo automatico paso a
+    disparar el solo, y como SI pasa por `_ensure_header`, deja el archivo
+    vivo con el header recien creado (no vacio/inexistente como asumia el
+    assert original). (2) El nombre del archivo comprimido tambien estaba
+    hardcodeado a `-2026-10-08`. Fix: usar el `today` REAL (reloj de la
+    maquina en el momento de correr el test) en vez de una fecha fija, asi
+    el test es determinista para siempre (sin fecha de vencimiento), y
+    verificar el invariante real - que no sobreviva ninguna fila de datos
+    de ayer en el path vivo - en vez de asumir "vacio o inexistente"
+    (puede quedar con el header nuevo, que es igualmente valido).
     """
     path = _temp_logger_path()
     archive_path = None
@@ -167,17 +187,25 @@ def test_logger_archives_and_compresses_file_left_from_a_previous_day_on_startup
         old_logger.log_quotes([_quote("GFGC5150O")])
         with open(path, "rb") as f:
             original_content = f.read()
-        today = date(2026, 10, 9)
+        today = datetime.now(timezone.utc).date()
         _set_mtime_to_yesterday(path, today)
 
         new_logger = MarketSnapshotLogger(path=path, rotate_daily=True)
         new_logger._rotate_if_new_day_locked(now=datetime(today.year, today.month, today.day, 1, 0, tzinfo=timezone.utc))
 
-        archive_path = path.with_name(f"{path.stem}-2026-10-08{path.suffix}.gz")
+        yesterday = today - timedelta(days=1)
+        archive_path = path.with_name(f"{path.stem}-{yesterday.isoformat()}{path.suffix}.gz")
         assert archive_path.exists(), "El archivo de ayer deberia haberse archivado comprimido."
-        assert not path.exists() or path.stat().st_size == 0, (
-            "El path vivo deberia quedar libre (sin el contenido de ayer) tras rotar."
-        )
+        if path.exists():
+            with open(path, "r", newline="", encoding="utf-8") as f:
+                remaining_rows = list(csv.reader(f))
+            data_rows = (
+                remaining_rows[1:] if remaining_rows and remaining_rows[0] == MarketSnapshotLogger._HEADER
+                else remaining_rows
+            )
+            assert not data_rows, (
+                f"El path vivo no deberia conservar filas de ayer tras rotar (quedaron: {data_rows})."
+            )
         with gzip.open(archive_path, "rb") as f:
             archived_content = f.read()
         assert archived_content == original_content, "El contenido archivado debe ser identico al original."
