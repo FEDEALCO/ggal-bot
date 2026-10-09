@@ -551,6 +551,42 @@ class RiskConfig:
     # prefiere un solo archivo acumulado).
     market_snapshot_rotate_daily: bool = _env_bool("GGAL_BOT_MARKET_SNAPSHOT_ROTATE_DAILY", True)
 
+    # --- Griegas "vigentes" solo si el book esta VIVO ahora (hallazgo de ---
+    # --- auditoria, 2026-10-09, a pedido explicito del usuario) ----------------
+    # OptionChain.recompute_all() (ver data/option_chain.py) solo recalcula
+    # iv/greeks de una opcion cuando su book tiene bid>0 y ask>0 ese ciclo -
+    # si la punta se vacio, deliberadamente NO recalcula (para no mezclar un
+    # spot fresco con un precio de opcion viejo), pero tampoco limpia el
+    # iv/greeks ya calculado en un ciclo anterior: el objeto OptionQuote los
+    # conserva tal cual. Hasta esta mejora, run_bot.py armaba el diccionario
+    # `current_greeks` (usado por la salida por compresion de vega,
+    # evaluate_vega_decay_exit) tomando CUALQUIER quote con greeks != None,
+    # sin chequear si esa punta esta viva ESTE ciclo - es decir, una
+    # posicion abierta cuya opcion se quedo sin cotizacion de ningun lado
+    # podia comparar su vega de entrada contra una vega "actual" que en
+    # realidad podia ser de horas o dias atras, sin ninguna marca de que
+    # era vieja. Confirmado con datos reales de produccion
+    # (market_snapshots.csv, ciclo 2026-10-09T01:56:04 UTC): filas con
+    # bid=0.0/ask=0.0 que sin embargo tenian iv/delta/gamma/vega/theta
+    # poblados (el leftover del ultimo book valido).
+    #
+    # Default True: guarda de riesgo (misma categoria que
+    # enforce_entry_spread_gate/enforce_market_hours_gate arriba), no una
+    # estrategia nueva - con esto activo, current_greeks solo incluye
+    # simbolos cuyo book esta vivo (bid>0 y ask>0) ESTE ciclo; para el resto,
+    # evaluate_vega_decay_exit recibe current_vega=None (mismo criterio que
+    # "greeks desconocidas" en el resto del proyecto - positions_with_unknown_greeks,
+    # nunca se fabrica un valor de reemplazo) y simplemente no evalua esa
+    # salida este ciclo, en vez de evaluarla contra un dato stale sin saberlo.
+    # Nunca bloquea una entrada ni impide cerrar una posicion por otra via -
+    # solo evita que UNA salida puntual (compresion de vega) se decida con
+    # un numero que no es el de ahora. Configurable igual, para poder
+    # desactivarla explicitamente (ej. debugging local/tests que inyectan
+    # greeks sin pasar por un book real).
+    require_fresh_book_for_current_greeks: bool = _env_bool(
+        "GGAL_BOT_REQUIRE_FRESH_BOOK_FOR_CURRENT_GREEKS", True
+    )
+
     # --- Presupuesto PREVENTIVO de Griegas por entrada (MEJORA 2026-09-28) ---
     # A pedido explicito del usuario ("mejor trader quant... presupuesto de
     # riesgo agregado en vez de esperar al muro duro"): hasta esta mejora, el

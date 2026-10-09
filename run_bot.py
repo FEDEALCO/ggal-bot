@@ -1661,8 +1661,22 @@ class GgalOptionsBot:
         # arriba en option_chain.recompute_all() al inicio de este mismo
         # ciclo, asi que ya reflejan el spot/tiempo actual, no el de la
         # entrada (esa base de comparacion es Position.greeks_per_unit,
-        # congelada al fill).
-        current_greeks = {q.symbol: q.greeks for q in self.option_chain.all_quotes() if q.greeks is not None}
+        # congelada al fill). OJO (BUG REAL CORREGIDO, hallazgo de auditoria
+        # 2026-10-09, ver RiskConfig.require_fresh_book_for_current_greeks):
+        # recompute_all() SOLO recalcula iv/greeks cuando bid>0 y ask>0 ese
+        # ciclo - si la punta esta vacia, deja el iv/greeks del ultimo ciclo
+        # valido tal cual, sin limpiarlo. Por eso, igual que current_prices
+        # arriba, se filtra a simbolos con book vivo AHORA - si no, una
+        # posicion cuya opcion se quedo sin cotizacion compararia su vega de
+        # entrada contra una vega "actual" que en realidad es vieja, sin
+        # ninguna marca de que lo es.
+        if SETTINGS.risk.require_fresh_book_for_current_greeks:
+            current_greeks = {
+                q.symbol: q.greeks for q in self.option_chain.all_quotes()
+                if q.greeks is not None and q.book.bid > 0 and q.book.ask > 0
+            }
+        else:
+            current_greeks = {q.symbol: q.greeks for q in self.option_chain.all_quotes() if q.greeks is not None}
         exit_signals = self.strategy.build_exit_signals(
             self.portfolio, current_prices, now, current_greeks=current_greeks, trend=trend,
         )
