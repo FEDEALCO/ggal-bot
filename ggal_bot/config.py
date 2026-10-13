@@ -587,6 +587,46 @@ class RiskConfig:
         "GGAL_BOT_REQUIRE_FRESH_BOOK_FOR_CURRENT_GREEKS", True
     )
 
+    # --- Filtro de "quote operable" para Stop Loss/Take Profit (Fase 0 del ---
+    # mandato de research cuantitativo, 2026-10-13, a pedido EXPLICITO del
+    # usuario: "Construi el filtro de quote operable (dos puntas, spread
+    # maximo, antiguedad maxima) y aplicalo a stops y salidas: si el quote no
+    # pasa, el stop espera al primer quote valido. Esto reemplaza tu
+    # hipotesis #1 [ventana de apertura], que es un fix de ejecucion y no una
+    # fuente de edge." Contexto real que lo motiva: el caso GFGC6800OC
+    # (2026-10-07T13:30:21 UTC, spread_rel=0.80, 16x el limite de 5%) ya
+    # generaba una alerta WARNING al salir (ver
+    # test_exit_execution_quality.py) pero la salida se ejecutaba igual
+    # contra ese precio no confiable - y `current_prices` (el precio que
+    # evaluate_position_exit usa para medir PnL% de Stop Loss/Take Profit,
+    # ver _run_weekly_asymmetric_cycle/_run_scalping_cycle en run_bot.py)
+    # hasta esta mejora solo exigia book de dos puntas (bid>0 y ask>0), sin
+    # chequear spread ni antiguedad - un book con dos puntas pero
+    # anormalmente ancho o viejo (ej. justo despues de la apertura, cuando el
+    # libro recien se esta reconstruyendo) podia disparar un Stop
+    # Loss/Take Profit real contra un precio que nadie podria haber cruzado
+    # de verdad.
+    #
+    # Con esta guarda activa (default True, misma categoria que
+    # require_fresh_book_for_current_greeks/enforce_entry_spread_gate
+    # arriba): `current_prices` excluye simbolos cuyo book no pase
+    # OrderBookSnapshot.is_valid_quote(max_spread_relative,
+    # max_option_quote_staleness_seconds) - reutiliza EXACTAMENTE los mismos
+    # dos umbrales ya usados en otros lados del proyecto (el spread-gate de
+    # entradas y el log de WARNING de salidas), nunca umbrales nuevos. Para
+    # esos simbolos, current_price llega None a evaluate_position_exit, que
+    # (ver su propio BUG REAL VERIFICADO de 2026-09-08, mas arriba en
+    # risk_manager.py) sigue evaluando las salidas puramente calendario
+    # (horizonte semanal, guardia de fin de semana) pero POSPONE Stop
+    # Loss/Take Profit al primer ciclo en que ese book vuelva a ser valido -
+    # nunca ejecuta un stop contra el primer precio no validado del dia.
+    # Nunca bloquea una salida que YA se decidio disparar por otra via (ver
+    # docstring de KillSwitch: una salida nunca debe quedar atrapada) - solo
+    # decide con que precio se EVALUA el gatillo de SL/TP.
+    enforce_quote_validity_filter_for_exits: bool = _env_bool(
+        "GGAL_BOT_ENFORCE_QUOTE_VALIDITY_FILTER_FOR_EXITS", True
+    )
+
     # --- Presupuesto PREVENTIVO de Griegas por entrada (MEJORA 2026-09-28) ---
     # A pedido explicito del usuario ("mejor trader quant... presupuesto de
     # riesgo agregado en vez de esperar al muro duro"): hasta esta mejora, el

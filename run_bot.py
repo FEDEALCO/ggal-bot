@@ -1652,10 +1652,28 @@ class GgalOptionsBot:
                 logger.exception("Error refrescando la tendencia 1D; se degrada a NEUTRAL este ciclo.")
 
         # -- 1) Salidas primero -------------------------------------------------
-        current_prices = {
-            q.symbol: q.book.mid for q in self.option_chain.all_quotes()
-            if q.book.bid > 0 and q.book.ask > 0
-        }
+        # Filtro de "quote operable" (ver RiskConfig.
+        # enforce_quote_validity_filter_for_exits, hallazgo/mandato de
+        # Fase 0 2026-10-13): no alcanza con dos puntas (bid>0/ask>0) para
+        # confiar en un precio al medir Stop Loss/Take Profit - un book
+        # anormalmente ancho o viejo (ej. recien reabierta la rueda) queda
+        # afuera igual, y esa posicion simplemente espera al primer quote
+        # valido (ver evaluate_position_exit en risk_manager.py: sin precio,
+        # las salidas de calendario siguen evaluandose, solo se posponen
+        # SL/TP).
+        if SETTINGS.risk.enforce_quote_validity_filter_for_exits:
+            current_prices = {
+                q.symbol: q.book.mid for q in self.option_chain.all_quotes()
+                if q.book.is_valid_quote(
+                    SETTINGS.risk.max_spread_relative,
+                    SETTINGS.risk.max_option_quote_staleness_seconds,
+                )
+            }
+        else:
+            current_prices = {
+                q.symbol: q.book.mid for q in self.option_chain.all_quotes()
+                if q.book.bid > 0 and q.book.ask > 0
+            }
         # Griegas vigentes por simbolo (para la salida por compresion de
         # vega - ver risk_manager.evaluate_vega_decay_exit): se recalculan
         # arriba en option_chain.recompute_all() al inicio de este mismo
@@ -1932,10 +1950,22 @@ class GgalOptionsBot:
             self._scalping_last_ta_snapshot_logged = snapshot
 
         # -- 1) Salidas primero ---------------------------------------------------
-        current_prices = {
-            q.symbol: q.book.mid for q in self.option_chain.all_quotes()
-            if q.book.bid > 0 and q.book.ask > 0
-        }
+        # Mismo filtro de "quote operable" que weekly_asymmetric arriba (ver
+        # RiskConfig.enforce_quote_validity_filter_for_exits) - aplicado
+        # uniformemente a ambas estrategias, tal como fue pedido.
+        if SETTINGS.risk.enforce_quote_validity_filter_for_exits:
+            current_prices = {
+                q.symbol: q.book.mid for q in self.option_chain.all_quotes()
+                if q.book.is_valid_quote(
+                    SETTINGS.risk.max_spread_relative,
+                    SETTINGS.risk.max_option_quote_staleness_seconds,
+                )
+            }
+        else:
+            current_prices = {
+                q.symbol: q.book.mid for q in self.option_chain.all_quotes()
+                if q.book.bid > 0 and q.book.ask > 0
+            }
         exit_signals = self.scalping_strategy.build_exit_signals(self.portfolio, current_prices, now)
         all_signals.extend(exit_signals)
         for ex in exit_signals:

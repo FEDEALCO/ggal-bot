@@ -362,8 +362,14 @@ def test_weekly_asymmetric_cycle_reconciles_exit_before_sizing_new_entry():
             symbol="GFGC5300O", quantity=5, multiplier=100.0,
             entry_price=100.0, entry_time=entry_time, expiry=date(2026, 9, 4),
         ))
-        # Precio actual muy por debajo de la prima de entrada (-60%): dispara stop_loss.
-        exit_quote = _quote("GFGC5300O", 5300, iv=None, spot_ref=5200.0, days_biz=3, bid=38.0, ask=42.0)
+        # Precio actual muy por debajo de la prima de entrada (-60%): dispara
+        # stop_loss. bid=39.5/ask=40.5 -> mid=40.0, spread_relative=2.5%
+        # (MEJORA 2026-10-13, RiskConfig.enforce_quote_validity_filter_for_exits,
+        # default True: un book de dos puntas ya no alcanza para marcar Stop
+        # Loss si el spread supera max_spread_relative=5% - este fixture usa
+        # un spread angosto a proposito, porque el objetivo del test es el
+        # ORDEN salida-antes-que-entrada, no la calidad del spread).
+        exit_quote = _quote("GFGC5300O", 5300, iv=None, spot_ref=5200.0, days_biz=3, bid=39.5, ask=40.5)
         exit_quote.iv = None  # fuera de la superficie de vol (no debe competir por señales de entrada)
         bot.option_chain.upsert_quote(exit_quote)
 
@@ -442,7 +448,9 @@ def test_weekly_asymmetric_cycle_skips_entries_and_spreads_when_market_data_stal
             symbol="GFGC5300O", quantity=5, multiplier=100.0,
             entry_price=100.0, entry_time=entry_time, expiry=date(2026, 9, 4),
         ))
-        exit_quote = _quote("GFGC5300O", 5300, iv=None, spot_ref=5200.0, days_biz=3, bid=38.0, ask=42.0)
+        # Mismo ajuste de spread angosto que en el test de reconciliacion de
+        # arriba (RiskConfig.enforce_quote_validity_filter_for_exits).
+        exit_quote = _quote("GFGC5300O", 5300, iv=None, spot_ref=5200.0, days_biz=3, bid=39.5, ask=40.5)
         exit_quote.iv = None
         bot.option_chain.upsert_quote(exit_quote)
 

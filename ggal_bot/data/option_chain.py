@@ -84,6 +84,38 @@ class OrderBookSnapshot:
             return False
         return True
 
+    def is_valid_quote(
+        self, max_spread_relative: float, max_age_seconds: float, now: Optional[float] = None,
+    ) -> bool:
+        """
+        Filtro unificado de "quote operable" (dos puntas + spread maximo +
+        antiguedad maxima) - MEJORA 2026-10-13 (Fase 0 del mandato de
+        research cuantitativo, a pedido explicito del usuario: "Construi el
+        filtro de quote operable (dos puntas, spread maximo, antiguedad
+        maxima) y aplicalo a stops y salidas: si el quote no pasa, el stop
+        espera al primer quote valido"). Pensado para decidir si un book es
+        lo bastante bueno para ACTUAR sobre su precio marcando una posicion
+        YA ABIERTA (ej. medir PnL% de Stop Loss/Take Profit) - ver
+        RiskConfig.enforce_quote_validity_filter_for_exits y su uso en
+        run_bot.py al armar `current_prices`.
+
+        A diferencia de `is_tradeable()` (pensado para decidir si se puede
+        EJECUTAR una orden nueva de cierto tamaño), este metodo
+        deliberadamente NO exige un tamaño minimo de punta (`min_size`): el
+        tamaño de la punta es un criterio de ejecutabilidad de una orden
+        nueva, no de si el PRECIO que esa punta implica es confiable para
+        marcar a mercado una posicion que ya existe. Reutiliza exactamente
+        la misma nocion de "stale" que `is_stale()` (abajo) - mismo campo
+        `as_of`, ninguna logica nueva de antiguedad.
+        """
+        if self.bid <= 0 or self.ask <= 0:
+            return False
+        if self.spread_relative > max_spread_relative:
+            return False
+        if self.is_stale(max_age_seconds, now):
+            return False
+        return True
+
 
 @dataclass
 class OptionQuote:
