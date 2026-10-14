@@ -14,10 +14,25 @@ auditoria puntual.
 
 Invariantes verificados (cada uno documentado en su propia funcion
 check_*):
-  1. long_only: ninguna strategy_tag conocida como long-only (todas las
-     que existen hoy: weekly_asymmetric, scalping - ver
-     strategy/*.py, ninguna vende en descubierto) debe tener
-     quantity_after negativo en ningun evento ENTRY/PARTIAL_EXIT/CLOSE.
+  1. long_only: ninguna strategy_tag conocida como long-only (hoy:
+     weekly_asymmetric, scalping) debe tener quantity_after negativo en
+     ningun evento ENTRY/PARTIAL_EXIT/CLOSE - CON UNA EXCEPCION explicita:
+     el wing corto de un spread completion de weekly_asymmetric
+     (reason="spread_completion", ver run_bot.py::
+     _act_on_spread_completion_signal) ABRE una posicion nueva con
+     quantity_after NEGATIVO por diseño (vende la pata corta de un Bull
+     Call / Bear Put spread YA financiado por una larga confirmada) - NO
+     es una venta en descubierto real, asi que no se la trata como
+     violacion aca.
+     CORRECCION 2026-10-13 (hallazgo de auditoria, a pedido explicito del
+     usuario, verificado contra el journal real): antes de esta
+     correccion, este check SI marcaba esos wings como CRITICAL (falso
+     positivo confirmado en produccion: GFGV5000OC, 2026-10-01, ENTRY
+     quantity_after=-75.0, reason=spread_completion, cerrada
+     legitimamente al dia siguiente via manual_close) - la vieja
+     docstring de este check afirmaba "ninguna vende en descubierto", lo
+     cual es FALSO para weekly_asymmetric (su propio diseño "long-first"
+     permite exactamente esto).
   2. position_id_consistency: todo evento con el mismo position_id (no
      vacio) debe tener el mismo symbol/contract_key/strategy_tag en TODOS
      sus eventos - un position_id no puede "cambiar de identidad".
@@ -39,6 +54,32 @@ check_*):
      es necesariamente un bug (puede ser una posicion legitimamente
      abierta al momento del export), pero se reporta siempre para
      revision manual.
+  7. cumulative_long_only_ledger (NUEVO 2026-10-13, hallazgo de auditoria,
+     a pedido explicito del usuario - "¿Por que el chequeo de invariantes
+     no marca el -8 de GFGC6600OC?"): el check #1 solo mira el
+     quantity_after DE CADA FILA por separado - no detecta una posicion
+     que termina neta corta cuando cada fila individual del camino hacia
+     ahi sigue siendo >= 0 (GFGC6600OC real: PARTIAL_EXIT(4)->
+     PARTIAL_EXIT(2)->PARTIAL_EXIT(1)->CLOSE(0), cuatro position_id
+     DISTINTOS y NINGUN evento ENTRY que explique de donde salio el "8"
+     inicial - ver RESEARCH.md para el detalle completo). Este check suma
+     quantity_delta CRONOLOGICAMENTE por (symbol, strategy_tag) -
+     deliberadamente SIN pasar por position_id (que no persiste de forma
+     confiable entre restarts del bot, confirmado con el propio ejemplo
+     de GFGC6600OC: su ENTRY/PARTIAL_EXIT/CLOSE originales del 2026-09-08
+     al 2026-09-11 YA usan 3 position_id distintos) - si el acumulado
+     cae por debajo de cero, es una violacion real. Se excluyen de este
+     check las filas reason="spread_completion" (ver #1) en el lado de
+     la venta, porque abren intencionalmente en negativo.
+     Se distingue, solo a fines de severidad (NUNCA se oculta el
+     hallazgo): si la PRIMERA fila que existe en el journal para ese
+     (symbol, strategy_tag) ya arranca en negativo, es casi seguro el
+     hueco de cobertura ya documentado (fills anteriores al inicio real
+     del journal - "unknown_legacy" en dashboard/pnl_engine.py) y se
+     reporta como INFO; si el acumulado fue >= 0 en algun momento previo
+     (como GFGC6600OC, que llego a cerrar en 0 el 2026-09-11) y despues
+     cae negativo, es CRITICAL - no hay cobertura faltante que lo
+     explique, es un gap real en el logging de alguna ENTRY.
 
 USO:
     python audit_journal_invariants.py <path a position_events.csv fresco>
@@ -51,7 +92,7 @@ from __future__ import annotations
 
 import sys
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 
 import pandas as pd
 
@@ -89,6 +130,11 @@ def load_journal(path: str) -> pd.DataFrame:
 def check_long_only(df: pd.DataFrame) -> List[Violation]:
     violations = []
     effective = df[df["event_type"].isin(["ENTRY", "PARTIAL_EXIT", "CLOSE"])]
+    # Excepcion explicita (ver docstring del modulo, punto 1): el wing
+    # corto de un spread completion de weekly_asymmetric abre en negativo
+    # por diseño - no es una venta en descubierto real.
+    is_spread_completion_wing = effective.get("reason", pd.Series(dtype=object)) == "spread_completion"
+    effective = effective[~is_spread_completion_wing]
     for strategy in LONG_ONLY_STRATEGIES:
         sub = effective[effective["strategy_tag"] == strategy]
         bad = sub[sub["quantity_after"] < 0]
@@ -213,8 +259,61 @@ def check_orphaned_open_positions(df: pd.DataFrame, now: datetime = None) -> Lis
     return violations
 
 
+def check_cumulative_long_only_ledger(df: pd.DataFrame) -> List[Violation]:
+    """Ver punto 7 del docstring del modulo."""
+    violations = []
+    effective = df[df["event_type"].isin(["ENTRY", "PARTIAL_EXIT", "CLOSE", "REDUCE", "ADD"])].copy()
+    is_spread_completion_wing = effective.get("reason", pd.Series(dtype=object)) == "spread_completion"
+    effective = effective[~is_spread_completion_wing]
+    effective = effective.sort_values("timestamp_utc")
+
+    for (symbol, strategy), group in effective.groupby(["symbol", "strategy_tag"]):
+        if strategy not in LONG_ONLY_STRATEGIES:
+            continue
+        cumulative = 0.0
+        first_row_was_already_negative: Optional[bool] = None
+        ever_non_negative = False
+        for _, row in group.iterrows():
+            delta = row["quantity_delta"]
+            if pd.isna(delta):
+                continue
+            if first_row_was_already_negative is None:
+                # Se evalua DESPUES de sumar este primer delta: si el
+                # journal "nace" negativo para este (symbol, strategy),
+                # es el hueco de cobertura ya documentado (unknown_legacy),
+                # no un gap de logging real.
+                first_row_was_already_negative = (cumulative + delta) < -1e-6
+            cumulative += delta
+            if cumulative >= -1e-6:
+                ever_non_negative = True
+            if cumulative < -1e-6:
+                if ever_non_negative and not first_row_was_already_negative:
+                    severity = "CRITICAL"
+                    note = (
+                        "el acumulado de este (symbol, strategy_tag) ya habia estado en 0 o positivo "
+                        "antes de esta fila - no hay hueco de cobertura que lo explique, es un gap real "
+                        "de logging (falta una ENTRY/ADD en algun lado)."
+                    )
+                else:
+                    severity = "INFO"
+                    note = (
+                        "este (symbol, strategy_tag) ya arranca negativo en su primera fila en el journal "
+                        "- consistente con el hueco de cobertura ya documentado (fills anteriores al "
+                        "inicio real del journal, ver unknown_legacy en dashboard/pnl_engine.py); "
+                        "revisar igual si el export cubre todo el periodo esperado."
+                    )
+                violations.append(Violation(
+                    "cumulative_long_only_ledger", severity,
+                    f"{row['timestamp_utc']} symbol={symbol} strategy_tag={strategy} "
+                    f"position_id={row['position_id']} acumulado={cumulative:g} ({note})",
+                ))
+                break  # una por (symbol, strategy) alcanza para el reporte
+    return violations
+
+
 ALL_CHECKS = [
     check_long_only,
+    check_cumulative_long_only_ledger,
     check_position_id_consistency,
     check_close_is_terminal,
     check_order_client_id_not_reused,
