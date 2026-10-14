@@ -27,11 +27,17 @@ import pandas as pd
 from ggal_bot import paths
 from dashboard.data import load_errors
 
-# Mismo header que MarketSnapshotLogger._HEADER (ggal_bot/data/market_snapshot_log.py)
+# Mismo header que MarketSnapshotLogger._HEADER (ggal_bot/data/market_snapshot_log.py).
+# last_price/last_volume agregados 2026-10-13 (ver MEJORA en ese modulo) -
+# un archivo diario ARCHIVADO antes de esa fecha no las tiene (17
+# columnas en vez de 19), pero pd.read_csv() lee cada archivo con SU
+# PROPIO header, asi que eso nunca rompe nada - esta lista solo se usa
+# como fallback para el DataFrame vacio cuando no hay archivo todavia.
 MARKET_SNAPSHOT_COLUMNS = [
     "timestamp_utc", "symbol", "option_type", "strike", "expiry",
     "days_calendar", "days_business", "spot_ref", "bid", "ask",
     "bid_size", "ask_size", "iv", "delta", "gamma", "vega", "theta",
+    "last_price", "last_volume",
 ]
 
 

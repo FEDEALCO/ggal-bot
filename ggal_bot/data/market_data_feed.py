@@ -99,10 +99,12 @@ class MarketDataFeed:
             ask = offers[0]["price"] if offers else 0.0
             ask_size = offers[0]["size"] if offers else 0.0
             last_volume = last.get("size", 0.0) if isinstance(last, dict) else 0.0
+            last_price = last.get("price", 0.0) if isinstance(last, dict) else 0.0
 
             book = OrderBookSnapshot(
                 symbol=symbol, bid=bid, ask=ask,
-                bid_size=bid_size, ask_size=ask_size, last_volume=last_volume,
+                bid_size=bid_size, ask_size=ask_size,
+                last_volume=last_volume, last_price=last_price,
             )
             self.on_book_update(symbol, book)
         except (KeyError, IndexError) as exc:

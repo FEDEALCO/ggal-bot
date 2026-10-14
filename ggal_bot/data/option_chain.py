@@ -51,6 +51,16 @@ class OrderBookSnapshot:
     bid_size: float
     ask_size: float
     last_volume: float = 0.0
+    # last_price (MEJORA 2026-10-13, Fase 0/Hipotesis 1 del mandato de
+    # research cuantitativo): ultimo precio REALMENTE operado en el
+    # mercado (distinto de `mid`, que es un punto medio de puntas, nunca
+    # un trade real). Ya se parseaba desde la fuente real (data912: campo
+    # "c"; pyRofex: "LA"."price") en data.live_shadow_feed.RawQuote/
+    # data.market_data_feed, pero se descartaba al construir este objeto -
+    # ver MarketSnapshotLogger, que ahora lo persiste junto con
+    # last_volume para poder calibrar un modelo de fill pasivo (Hipotesis
+    # 1: provision de liquidez) sin inventar ningun dato.
+    last_price: float = 0.0
     as_of: float = field(default_factory=time.time)
 
     @property

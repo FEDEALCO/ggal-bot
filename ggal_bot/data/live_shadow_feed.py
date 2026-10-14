@@ -530,7 +530,7 @@ class PrimaryMarketDataSource(ShadowDataSource):
             self._book_cache[symbol] = RawQuote(
                 symbol=symbol, bid=book.bid, ask=book.ask,
                 bid_size=book.bid_size, ask_size=book.ask_size,
-                last_volume=book.last_volume,
+                last_volume=book.last_volume, last_price=book.last_price,
             )
             self._last_message_at = time.time()
 
@@ -1593,7 +1593,7 @@ class LiveShadowFeed:
                 symbol=SETTINGS.instruments.contado_ticker,
                 bid=spot_quote.bid, ask=spot_quote.ask,
                 bid_size=spot_quote.bid_size, ask_size=spot_quote.ask_size,
-                last_volume=spot_quote.last_volume,
+                last_volume=spot_quote.last_volume, last_price=spot_quote.last_price,
                 # BUG REAL CORREGIDO: se propaga el `as_of` ORIGINAL del
                 # RawQuote (cuando se parseo de verdad), no la hora de este
                 # despacho - ver docstring de RawQuote.as_of / OrderBookSnapshot.as_of.
@@ -1611,7 +1611,8 @@ class LiveShadowFeed:
                 continue
             book = OrderBookSnapshot(
                 symbol=symbol, bid=raw.bid, ask=raw.ask,
-                bid_size=raw.bid_size, ask_size=raw.ask_size, last_volume=raw.last_volume,
+                bid_size=raw.bid_size, ask_size=raw.ask_size,
+                last_volume=raw.last_volume, last_price=raw.last_price,
                 as_of=raw.as_of,  # ver comentario equivalente arriba, mismo motivo
             )
             self.on_book_update(symbol, book)

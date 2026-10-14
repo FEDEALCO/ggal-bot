@@ -75,7 +75,20 @@ class MarketSnapshotLogger:
         "timestamp_utc", "symbol", "option_type", "strike", "expiry",
         "days_calendar", "days_business", "spot_ref", "bid", "ask",
         "bid_size", "ask_size", "iv", "delta", "gamma", "vega", "theta",
+        "last_price", "last_volume",
     ]
+    # last_price/last_volume (MEJORA 2026-10-13, Fase 0/Hipotesis 1 del
+    # mandato de research cuantitativo, a pedido explicito del usuario:
+    # "confirma si market_snapshots registra el ultimo precio operado y el
+    # volumen por contrato"): no se registraban - el dato YA se parseaba en
+    # memoria desde la fuente real (ver OrderBookSnapshot.last_price/
+    # last_volume) pero se perdia al loguear. Agregar columnas AL FINAL de
+    # un header fijo es seguro aca porque este archivo rota A DIARIO (ver
+    # MEJORA 2026-10-08 arriba): cada dia es un archivo propio y autonomo,
+    # nunca se mezclan filas de dos esquemas distintos dentro del mismo
+    # archivo (a diferencia de shadow_trades.csv, que si necesito rotacion
+    # de esquema con sufijo .schemaN). Sin dato real todavia (0.0 desde el
+    # origen) se registra igual, nunca se fabrica un valor.
 
     def __init__(self, path: Optional[Path] = None, rotate_daily: Optional[bool] = None):
         """
@@ -168,6 +181,7 @@ class MarketSnapshotLogger:
                 "" if not greeks else greeks.get("gamma", ""),
                 "" if not greeks else greeks.get("vega", ""),
                 "" if not greeks else greeks.get("theta", ""),
+                q.book.last_price, q.book.last_volume,
             ])
         if not rows:
             return

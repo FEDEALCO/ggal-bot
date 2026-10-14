@@ -105,6 +105,42 @@ def test_logger_leaves_iv_and_greeks_blank_when_missing_never_fabricated():
         path.unlink(missing_ok=True)
 
 
+def test_logger_persists_last_price_and_last_volume():
+    """
+    MEJORA 2026-10-13 (Fase 0/Hipotesis 1 del mandato de research
+    cuantitativo, a pedido explicito del usuario): last_price/last_volume
+    ya se parseaban en memoria (ver OrderBookSnapshot.last_price) pero se
+    perdian al loguear. Verifica que ahora se persisten tal cual (sin
+    redondear ni transformar) y que un book sin dato real (0.0 desde el
+    origen, nunca fabricado) tambien se registra tal cual.
+    """
+    path = _temp_logger_path()
+    try:
+        logger = MarketSnapshotLogger(path=path)
+        book_con_dato = OrderBookSnapshot(
+            "GFGC5150O", bid=95.0, ask=105.0, bid_size=100.0, ask_size=100.0,
+            last_price=101.5, last_volume=42.0,
+        )
+        q = OptionQuote(
+            "GFGC5150O", strike=5150.0, expiry=date(2026, 10, 2),
+            option_type=OptionType.CALL, book=book_con_dato, days_calendar=10, days_business=7,
+        )
+        q.iv = 0.45
+        logger.log_quotes([q, _quote("GFGV5150O", option_type=OptionType.PUT)])
+        with open(path, newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        header = rows[0]
+        assert header[-2:] == ["last_price", "last_volume"]
+        row_con_dato = dict(zip(header, rows[1]))
+        assert float(row_con_dato["last_price"]) == 101.5
+        assert float(row_con_dato["last_volume"]) == 42.0
+        row_sin_dato = dict(zip(header, rows[2]))
+        assert float(row_sin_dato["last_price"]) == 0.0
+        assert float(row_sin_dato["last_volume"]) == 1000.0  # ver _quote(): last_volume=1000.0 por defecto
+    finally:
+        path.unlink(missing_ok=True)
+
+
 def test_logger_appends_across_multiple_calls():
     path = _temp_logger_path()
     try:
@@ -300,6 +336,7 @@ ALL_TESTS = [
     test_logger_does_not_duplicate_header_on_reuse,
     test_logger_appends_one_row_per_quote,
     test_logger_leaves_iv_and_greeks_blank_when_missing_never_fabricated,
+    test_logger_persists_last_price_and_last_volume,
     test_logger_appends_across_multiple_calls,
     test_logger_does_nothing_with_empty_quotes_iterable,
     test_logger_write_failure_does_not_raise,
