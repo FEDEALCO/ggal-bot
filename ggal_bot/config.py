@@ -627,6 +627,65 @@ class RiskConfig:
         "GGAL_BOT_ENFORCE_QUOTE_VALIDITY_FILTER_FOR_EXITS", True
     )
 
+    # --- Respaldo de ultimo resorte para el filtro de quote operable de ---
+    # arriba (MEJORA 2026-10-13, Fase 2 del mandato de research
+    # cuantitativo, a pedido EXPLICITO del usuario: "si no hay quote válido
+    # en N minutos o la pérdida supera un umbral catastrófico, salir con
+    # orden límite a un precio protegido (mid − margen, nunca a mercado).
+    # Proponé N, el umbral y el spread máximo según la distribución medida,
+    # no un número fijo." Ver risk/risk_manager.py::
+    # RiskManager.evaluate_quote_gap_backstop y run_bot.py::
+    # GgalOptionsBot._apply_quote_gap_backstop para la mecanica completa.
+    #
+    # INTENTO REAL de medir la distribucion pedida (no se inventa un
+    # numero): se corrio el filtro is_valid_quote() (dos puntas, spread<=
+    # max_spread_relative, antiguedad<=max_option_quote_staleness_seconds)
+    # contra el UNICO export real de logs/market_snapshots.csv disponible
+    # en este seguimiento (87.018 filas, 52 simbolos del vencimiento
+    # 2026-10-16). RESULTADO: DATA INSUFFICIENT para calibrar - ese export
+    # cubre exclusivamente 2026-10-09T00:00:04 a 01:56:04 UTC, una ventana
+    # de ~2hs ENTERAMENTE FUERA de la rueda de BYMA (10:30-17:00 ART =
+    # 13:30-20:00 UTC desde el 28/7/2025 - ver market_hours.py) - mide el
+    # libro NOCTURNO, no la liquidez real durante la rueda. Sobre esa
+    # ventana (irrelevante para calibrar, se reporta solo por transparencia):
+    # apenas 3.2% de filas con dos puntas, 0% pasando el filtro completo -
+    # un numero asi de bajo mediria "cuan vacio esta el libro de noche", no
+    # "con que frecuencia el stop queda de hecho desactivado durante la
+    # rueda real", que es la pregunta que el usuario hizo. Los 3 valores de
+    # abajo son DEFAULTS RAZONADOS (construidos sobre el UNICO precedente
+    # real que ya existe en este archivo para cada uno, nunca un numero
+    # arbitrario nuevo) - quedan EXPLICITAMENTE pendientes de recalibrar en
+    # cuanto exista un export de market_snapshots.csv que cubra una rueda
+    # real completa (ahora que la rotacion diaria esta activa, ver
+    # data/market_snapshot_log.py, cada dia queda en su propio archivo
+    # descargable de Northflank).
+    enable_quote_gap_backstop: bool = _env_bool("GGAL_BOT_ENABLE_QUOTE_GAP_BACKSTOP", True)
+    # N minutos (INTERIM): 2x stale_quote_warning_seconds (300s=5min, el
+    # UNICO umbral de "cuanto esperar antes de actuar sobre una cotizacion
+    # faltante" que ya existe en este archivo) - le da tiempo a esa alerta
+    # (puramente informativa) de avisar y permitir revision manual antes de
+    # que este mecanismo fuerce una salida automatica.
+    quote_gap_backstop_minutes: float = _env_float("GGAL_BOT_QUOTE_GAP_BACKSTOP_MINUTES", 10.0)
+    # Umbral catastrofico (INTERIM): deliberadamente mas severo que
+    # LongFirstConfig.stop_loss_pct (0.50, incluso que su etapa mas angosta
+    # del stop escalonado, 0.20) - este gatillo es el ULTIMO resorte cuando
+    # el stop normal ya no se puede evaluar con un book confiable, no un
+    # reemplazo del stop normal; tiene que ser claramente peor para no
+    # disparar en casos donde el stop normal ya habria actuado si el book
+    # hubiera sido valido.
+    quote_gap_backstop_catastrophic_loss_pct: float = _env_float(
+        "GGAL_BOT_QUOTE_GAP_BACKSTOP_CATASTROPHIC_LOSS_PCT", 0.75
+    )
+    # Margen del limite protegido (INTERIM): reutiliza max_spread_relative
+    # (0.05) - el mismo umbral de "spread operable" ya establecido en este
+    # archivo para decisiones de calidad de ejecucion, en vez de inventar
+    # una magnitud nueva. mid * (1 - este margen) al vender / mid * (1 +
+    # este margen) al comprar - nunca una orden de mercado (ver
+    # mid_price_exec.py::MidPriceExecutionEngine.submit_protected_limit).
+    quote_gap_backstop_limit_margin_pct: float = _env_float(
+        "GGAL_BOT_QUOTE_GAP_BACKSTOP_LIMIT_MARGIN_PCT", 0.05
+    )
+
     # --- Presupuesto PREVENTIVO de Griegas por entrada (MEJORA 2026-09-28) ---
     # A pedido explicito del usuario ("mejor trader quant... presupuesto de
     # riesgo agregado en vez de esperar al muro duro"): hasta esta mejora, el

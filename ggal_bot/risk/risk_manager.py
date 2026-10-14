@@ -303,6 +303,71 @@ class RiskManager:
 
         return None
 
+    def evaluate_quote_gap_backstop(
+        self,
+        last_known_pnl_pct: Optional[float],
+        quote_invalid_since: Optional[datetime],
+        now: datetime,
+        backstop_minutes: float,
+        catastrophic_loss_pct: float,
+    ) -> Optional[str]:
+        """
+        Respaldo de ULTIMO RESORTE (MEJORA 2026-10-13, Fase 2 del mandato de
+        research cuantitativo, a pedido explicito del usuario - item 1:
+        "Agregá un respaldo: si no hay quote válido en N minutos o la
+        pérdida supera un umbral catastrófico, salir con orden límite a un
+        precio protegido"). Motivo real que lo justifica: con
+        RiskConfig.enforce_quote_validity_filter_for_exits activo (default
+        True), evaluate_position_exit() de arriba simplemente POSPONE Stop
+        Loss/Take Profit mientras el book no pase el filtro de quote
+        operable (dos puntas + spread<=max_spread_relative +
+        antiguedad<=max_option_quote_staleness_seconds) - si ese book NUNCA
+        vuelve a pasar el filtro (caso real documentado: GFGC6800OC,
+        2026-10-07T13:30:21 UTC, spread_rel=0.80, 16x el limite de 5%, ver
+        _act_on_exit_signal), el stop queda de hecho desactivado para esa
+        base de forma indefinida. Este metodo es ADICIONAL (nunca reemplaza
+        evaluate_position_exit, que sigue siendo la primera linea de
+        defensa mientras el book sea operable) y se evalua con el book SIN
+        filtrar (el book puede ser invalido/viejo/ancho - esa es
+        precisamente la situacion que motiva este respaldo).
+
+        Dos gatillos independientes, ninguno requiere al otro (devuelve en
+        cuanto UNO se cumple):
+
+          1. "catastrophic_loss_backstop": `last_known_pnl_pct` (PnL% sobre
+             la prima, medido por el caller con el ultimo bid/ask>0
+             conocido aunque ese book no pase is_valid_quote(), YA
+             orientado segun el lado de la posicion - negativo = perdida
+             tanto para una posicion larga como para una corta, a
+             diferencia de evaluate_position_exit() que asume solo largas,
+             ver su propio docstring) es <= -`catastrophic_loss_pct`. No
+             espera los N minutos - si la perdida ya es inequivoca con el
+             unico dato disponible, no tiene sentido esperar mas.
+          2. "quote_gap_backstop": el book lleva sin pasar el filtro de
+             quote operable (`quote_invalid_since` != None, ver el caller
+             en run_bot.py para como se trackea esto) por >=
+             `backstop_minutes` minutos, sin importar el PnL conocido (que
+             puede faltar del todo - ver mas abajo).
+
+        `last_known_pnl_pct` ausente (NUNCA hubo un bid/ask>0 para esta
+        base, ej. recien entro y el feed se cayo de inmediato, o no hay
+        entry_price real): el gatillo 1 simplemente no se evalua (no se
+        fabrica un PnL sin dato), pero el gatillo 2 SI puede disparar igual
+        - sin ningun precio para proteger la orden, el caller en run_bot.py
+        no puede armar un limite protegido real (ver su propio docstring)
+        y debe tratarlo como alerta/revision manual, no como una orden
+        ejecutable.
+        """
+        if last_known_pnl_pct is not None and last_known_pnl_pct <= -abs(catastrophic_loss_pct):
+            return "catastrophic_loss_backstop"
+
+        if quote_invalid_since is not None:
+            elapsed_minutes = (now - quote_invalid_since).total_seconds() / 60.0
+            if elapsed_minutes >= backstop_minutes:
+                return "quote_gap_backstop"
+
+        return None
+
     def evaluate_vega_decay_exit(
         self,
         entry_vega: Optional[float],

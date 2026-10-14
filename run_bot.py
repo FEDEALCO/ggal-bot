@@ -542,6 +542,19 @@ class GgalOptionsBot:
         # logger.warning en cada ciclo de ~2-4s mientras la condicion
         # persista - mismo criterio que self._option_staleness_logged).
         self._position_missing_quote_warned: set = set()
+        # Respaldo de ultimo resorte (MEJORA 2026-10-13, ver RiskConfig.
+        # enable_quote_gap_backstop / _apply_quote_gap_backstop) -
+        # DELIBERADAMENTE un tracking SEPARADO del de arriba: este usa el
+        # criterio COMPLETO is_valid_quote() (spread+antiguedad), mas
+        # estricto que el bid>0/ask>0 de _position_missing_quote_since, y
+        # mezclarlos cambiaria el comportamiento ya testeado de esa alerta
+        # (ver test_stale_quote_alert.py) sin que el usuario lo haya
+        # pedido. symbol -> timestamp (time.time()) desde el cual esa base
+        # dejo de pasar is_valid_quote(), y el ULTIMO book.mid real
+        # (bid>0 y ask>0, aunque no pase is_valid_quote()) conocido para
+        # esa base - None/ausente si JAMAS hubo un book con dos puntas.
+        self._position_invalid_quote_since: Dict[str, float] = {}
+        self._position_invalid_quote_last_mid: Dict[str, float] = {}
         self._shutting_down = False
         # Numero de señal (SIGINT/SIGTERM) que disparo el shutdown, o None si
         # todavia no se recibio ninguna. Se guarda aca (en vez de loguearse
@@ -1120,6 +1133,14 @@ class GgalOptionsBot:
         self._warn_positions_without_valid_quote()
         self._warn_position_invariant_violations()
 
+        # Respaldo de ultimo resorte para el filtro de quote operable
+        # (MEJORA 2026-10-13, ver RiskConfig.enable_quote_gap_backstop) -
+        # se ubica DESPUES de las alertas puramente informativas de arriba
+        # (les da la primera oportunidad de avisar) pero TODAVIA antes del
+        # dispatch de estrategia, mismo criterio de "lo mas temprano
+        # posible dentro del ciclo" que _warn_positions_without_valid_quote.
+        self._apply_quote_gap_backstop(spot)
+
         # Snapshot de mercado (MEJORA 2026-09-28, ver
         # data/market_snapshot_log.py): corre SIEMPRE, sin importar la
         # estrategia activa (mismo criterio que la alerta de arriba) - se
@@ -1405,6 +1426,137 @@ class GgalOptionsBot:
                     symbol, elapsed, threshold,
                 )
                 self._position_missing_quote_warned.add(symbol)
+
+    def _apply_quote_gap_backstop(self, spot: float, now: Optional[float] = None) -> None:
+        """
+        Respaldo de ULTIMO RESORTE (MEJORA 2026-10-13, ver RiskConfig.
+        enable_quote_gap_backstop y risk_manager.RiskManager.
+        evaluate_quote_gap_backstop para la motivacion/mecanica completa).
+        A diferencia de _warn_positions_without_valid_quote (que SOLO
+        loguea), este metodo FUERZA el cierre de la posicion via una orden
+        LIMITE protegida (nunca de mercado - ver mid_price_exec.
+        MidPriceExecutionEngine.submit_protected_limit) cuando el book de
+        la base lleva demasiado tiempo sin pasar is_valid_quote(), o
+        cuando la perdida medida con el ULTIMO precio conocido ya es
+        catastrofica.
+
+        Aplica a CUALQUIER posicion abierta (larga o corta, de cualquier
+        strategy_tag) - a diferencia de evaluate_position_exit (que asume
+        posiciones largas por construccion bajo Long-First), el PnL% aca
+        se orienta explicitamente segun el signo de `pos.quantity` antes
+        de pasarlo a evaluate_quote_gap_backstop.
+
+        `now`: timestamp inyectable (time.time()) para tests deterministas
+        - mismo criterio que _warn_positions_without_valid_quote.
+        """
+        if not SETTINGS.risk.enable_quote_gap_backstop:
+            return
+        now_ts = now if now is not None else time.time()
+
+        open_positions = [p for p in self.portfolio.positions if p.quantity != 0]
+        open_symbols = {p.symbol for p in open_positions}
+        for symbol in list(self._position_invalid_quote_since.keys()):
+            if symbol not in open_symbols:
+                del self._position_invalid_quote_since[symbol]
+                self._position_invalid_quote_last_mid.pop(symbol, None)
+
+        for pos in open_positions:
+            if self.mid_price_exec.has_open_order_for(pos.symbol):
+                continue  # ya hay una orden en vigilancia sobre esta base este ciclo
+
+            quote = self.option_chain.get(pos.symbol)
+            book_has_two_sided_quote = quote is not None and quote.book.bid > 0 and quote.book.ask > 0
+            if book_has_two_sided_quote:
+                self._position_invalid_quote_last_mid[pos.symbol] = quote.book.mid
+
+            is_valid_quote = book_has_two_sided_quote and quote.book.is_valid_quote(
+                SETTINGS.risk.max_spread_relative, SETTINGS.risk.max_option_quote_staleness_seconds,
+            )
+            if is_valid_quote:
+                if pos.symbol in self._position_invalid_quote_since:
+                    logger.info(
+                        "Cotizacion valida recuperada para %s (respaldo de quote gap): se "
+                        "resuelve el tracking de este mecanismo para esta base.", pos.symbol,
+                    )
+                self._position_invalid_quote_since.pop(pos.symbol, None)
+                continue
+
+            invalid_since_ts = self._position_invalid_quote_since.setdefault(pos.symbol, now_ts)
+
+            last_known_mid = self._position_invalid_quote_last_mid.get(pos.symbol)
+            last_known_pnl_pct = None
+            if last_known_mid is not None and pos.entry_price:
+                raw_pnl_pct = (last_known_mid - pos.entry_price) / pos.entry_price
+                # Orientacion por signo de la posicion (ver docstring): una
+                # posicion CORTA pierde cuando el precio SUBE, al reves de
+                # una larga - evaluate_quote_gap_backstop espera el PnL% ya
+                # orientado (negativo = perdida, sea cual sea el lado).
+                last_known_pnl_pct = raw_pnl_pct if pos.quantity > 0 else -raw_pnl_pct
+
+            reason = self.risk_manager.evaluate_quote_gap_backstop(
+                last_known_pnl_pct=last_known_pnl_pct,
+                quote_invalid_since=datetime.fromtimestamp(invalid_since_ts, tz=timezone.utc),
+                now=datetime.fromtimestamp(now_ts, tz=timezone.utc),
+                backstop_minutes=SETTINGS.risk.quote_gap_backstop_minutes,
+                catastrophic_loss_pct=SETTINGS.risk.quote_gap_backstop_catastrophic_loss_pct,
+            )
+            if reason is None:
+                continue
+
+            if not book_has_two_sided_quote:
+                # Sin NINGUN precio para proteger la orden (ver docstring
+                # de evaluate_quote_gap_backstop) - no hay nada ejecutable,
+                # se deja constancia y se sigue confiando en la alerta
+                # puramente informativa (_warn_positions_without_valid_quote)
+                # mientras dure.
+                logger.error(
+                    "RESPALDO [%s] disparado para %s pero sin NINGUN book operable (bid/ask=0) - "
+                    "no se puede armar una orden limite protegida sin un precio real. Requiere "
+                    "revision manual (ver dashboard, pestaña 'Abiertas', o ggal_bot/ops/manual_close.py).",
+                    reason, pos.symbol,
+                )
+                continue
+
+            logger.warning(
+                "RESPALDO [%s] disparado para %s: book sin pasar el filtro de quote operable "
+                "hace %.0fs (umbral=%.0fmin) / PnL%% ultimo conocido=%s. Se fuerza el cierre via "
+                "orden limite protegida (NUNCA de mercado).",
+                reason, pos.symbol, now_ts - invalid_since_ts, SETTINGS.risk.quote_gap_backstop_minutes,
+                f"{last_known_pnl_pct:.1%}" if last_known_pnl_pct is not None else "N/D",
+            )
+            side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
+            quantity = abs(pos.quantity)
+            strategy_tag = pos.strategy_tag or "weekly_asymmetric"
+            state = self.mid_price_exec.submit_protected_limit(
+                symbol=pos.symbol, book=quote.book, side=side, quantity=quantity,
+                spot_reference=spot, margin_pct=SETTINGS.risk.quote_gap_backstop_limit_margin_pct,
+            )
+            if state.status is OrderStatus.FILLED:
+                matching = [
+                    p for p in self.portfolio.positions
+                    if p.symbol == pos.symbol and (p.strategy_tag or "weekly_asymmetric") == strategy_tag
+                    and (p.quantity > 0) == (pos.quantity > 0)
+                ]
+                matching.sort(key=lambda p: p.entry_time or datetime.min.replace(tzinfo=timezone.utc))
+                remaining_to_close = quantity
+                for p in matching:
+                    if remaining_to_close <= 0:
+                        break
+                    lot_qty = abs(p.quantity)
+                    close_qty = min(lot_qty, remaining_to_close)
+                    p.quantity += close_qty if p.quantity < 0 else -close_qty
+                    remaining_to_close -= close_qty
+                    self.position_event_journal.log_event(
+                        "CLOSE" if abs(p.quantity) <= 1e-9 else "REDUCE",
+                        position_id=p.position_id, contract_key=p.contract_key,
+                        symbol=p.symbol, strategy_tag=strategy_tag,
+                        side=side.value.lower(), quantity_delta=(close_qty if side is OrderSide.BUY else -close_qty),
+                        quantity_after=p.quantity, price=state.avg_fill_price,
+                        order_client_id=getattr(getattr(state, "request", None), "client_order_id", ""),
+                        reason=reason,
+                    )
+                self._position_invalid_quote_since.pop(pos.symbol, None)
+                self._position_invalid_quote_last_mid.pop(pos.symbol, None)
 
     def _run_vol_arbitrage_cycle(self, spot: float) -> List[object]:
         """Ciclo bajo el modo original de arbitraje de volatilidad delta-neutral."""

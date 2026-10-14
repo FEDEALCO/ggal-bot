@@ -109,6 +109,62 @@ class MidPriceExecutionEngine:
         )
         return state
 
+    def submit_protected_limit(
+        self,
+        symbol: str,
+        book: OrderBookSnapshot,
+        side: OrderSide,
+        quantity: float,
+        spot_reference: float,
+        margin_pct: float,
+    ) -> OrderState:
+        """
+        Respaldo de ultimo resorte (MEJORA 2026-10-13, ver RiskConfig.
+        enable_quote_gap_backstop / risk_manager.RiskManager.
+        evaluate_quote_gap_backstop / run_bot.py::
+        GgalOptionsBot._apply_quote_gap_backstop) - a diferencia de
+        submit() (que cotiza a mid-price o cruza el spread segun
+        `aggressive`, pensado para un book SANO), esto arma una orden
+        LIMITE deliberadamente peor que el mid conocido, para maximizar la
+        chance de fill real incluso contra un book viejo o anormalmente
+        ancho (exactamente la situacion que motiva este metodo - ver el
+        docstring de evaluate_quote_gap_backstop). SIEMPRE LIMITE, NUNCA DE
+        MERCADO (pedido explicito del usuario) - `margin_pct` es el piso/
+        techo protegido: nunca vende mas abajo que
+        `book.mid * (1 - margin_pct)` ni compra mas arriba que
+        `book.mid * (1 + margin_pct)`, sin importar que tan mal este el
+        book en este momento.
+
+        No reutiliza MarketMakingEngine.decide_price (esa logica asume un
+        book en el que vale la pena ser paciente) ni el cruce agresivo de
+        `submit(aggressive=True)` (que cruza EXACTAMENTE al bid/ask
+        vigente, sin margen adicional de proteccion mas alla de esa punta,
+        que en esta situacion puede ser vieja o artificialmente angosta/
+        ancha) - `margin_pct` es un parametro propio (ver RiskConfig.
+        quote_gap_backstop_limit_margin_pct), pensado especificamente para
+        este escenario de respaldo.
+        """
+        if side is OrderSide.SELL:
+            protected_price = book.mid * (1.0 - abs(margin_pct))
+        else:
+            protected_price = book.mid * (1.0 + abs(margin_pct))
+
+        request = OrderRequest(
+            symbol=symbol, side=side, quantity=quantity, price=protected_price,
+            order_type=OrderTypeEnum.LIMIT,
+        )
+        state = self.order_gateway.send(request, reference_price=book.mid, book=book)
+        self._contexts[request.client_order_id] = _OpenOrderContext(
+            symbol=symbol, side=side, aggressive=True, spot_reference=spot_reference,
+        )
+        logger.warning(
+            "Orden de RESPALDO insertada [limite protegido, NUNCA mercado]: %s %s x%.0f @ %.2f "
+            "(mid=%.2f, margen=%.1f%%, id=%s)",
+            side.value, symbol, quantity, protected_price, book.mid, abs(margin_pct) * 100,
+            request.client_order_id,
+        )
+        return state
+
     # -- Vigilancia: timeout + movimiento adverso ---------------------------
 
     def monitor_and_reprice(
