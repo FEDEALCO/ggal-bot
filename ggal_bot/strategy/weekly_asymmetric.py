@@ -1123,3 +1123,105 @@ class WeeklyAsymmetricStrategy:
                     action="buy_to_close", quantity=min(uncovered, short_qty),
                 ))
         return signals
+
+    @staticmethod
+    def build_itm_short_leg_risk_exit_signals(
+        portfolio: Portfolio,
+        option_chain: OptionChain,
+        now: datetime,
+        strategy_tag: str = "weekly_asymmetric",
+        business_days_before_expiry: int = 1,
+        ex_dividend_dates: Optional[tuple] = None,
+    ) -> List[ExitSignal]:
+        """
+        Guardia de riesgo de asignacion anticipada (2026-10-15, a pedido
+        explicito del usuario - ver config.LongFirstConfig.
+        enable_itm_short_leg_assignment_guard, DEFAULT ON porque esto
+        REDUCE riesgo, nunca abre exposicion nueva).
+
+        Cierra (`action="buy_to_close"`) cualquier pata corta de esta
+        estrategia (`position.quantity < 0`) que este ACTUALMENTE In The
+        Money contra el spot vigente, cuando se cumple CUALQUIERA de estas
+        dos condiciones:
+
+            (a) quedan <= `business_days_before_expiry` ruedas habiles
+                hasta el vencimiento de esa base (`quote.days_business`,
+                dato real ya calculado cada ciclo - no requiere ningun
+                calendario externo); o
+            (b) hay una fecha ex-dividendo real conocida
+                (`ex_dividend_dates`, ver config - deliberadamente vacio
+                por defecto, NUNCA se fabrica una fecha) estrictamente
+                entre hoy y el vencimiento de esa base (inclusive).
+
+        Por que ITM + (a) o (b), y no solo ITM: una pata corta ITM que
+        todavia tiene varias ruedas de vida y ningun corte de dividendo en
+        el medio puede normalizarse sola (la convexidad de la pata larga
+        que la financia sigue intacta) - cerrarla de entrada
+        contradiria la logica de "comprar primero, vender para financiar"
+        del modulo. El riesgo real de asignacion anticipada (que el
+        tenedor del lado comprado ejerza antes del vencimiento) se
+        concentra, en la practica de mercado, en los dias inmediatos al
+        vencimiento (theta residual bajo, la asignacion ya no "regala"
+        valor temporal al ejercer) y el dia anterior a un corte de
+        dividendo (ejercer una call corta ITM antes del corte captura el
+        dividendo, algo que un tenedor racional de la call larga puede
+        preferir a seguir sosteniendo la opcion) - exactamente las dos
+        condiciones que dispara esta guardia.
+
+        Simetrico para calls y puts: una call corta esta ITM si
+        `spot > strike`; una put corta esta ITM si `spot < strike`
+        (bull call spread y bear put spread, ambos con pata corta mas
+        OTM que la larga que financia).
+
+        Sin cotizacion vigente para el simbolo (`option_chain.get(...)`
+        devuelve None) o sin `spot_ref` valido todavia, esa posicion se
+        omite de este chequeo en este ciclo (nunca se fabrica un
+        ITM/moneyness con datos que no existen) - el resto de los guards
+        de este modulo (`build_naked_short_wing_exit_signals`,
+        risk_manager) sigue vigente igual.
+
+        `ex_dividend_dates` default None se trata como tupla vacia (sin
+        fechas configuradas = ese gatillo nunca dispara, comportamiento
+        no-op para esa condicion especifica - ver
+        config.LongFirstConfig.ex_dividend_dates).
+        """
+        ex_div_dates = ex_dividend_dates or ()
+        today = now.date()
+        signals: List[ExitSignal] = []
+        for position in portfolio.positions:
+            if (position.strategy_tag or "weekly_asymmetric") != strategy_tag:
+                continue
+            if position.quantity >= 0:
+                continue  # solo patas cortas
+
+            quote = option_chain.get(position.symbol)
+            if quote is None or not quote.spot_ref or quote.spot_ref <= 0:
+                continue  # sin dato de mercado vigente - no se adivina ITM
+
+            spot = quote.spot_ref
+            if quote.option_type is OptionType.CALL:
+                is_itm = spot > quote.strike
+            else:
+                is_itm = spot < quote.strike
+            if not is_itm:
+                continue
+
+            near_expiry = quote.days_business <= business_days_before_expiry
+            pre_ex_dividend = any(
+                today < d <= quote.expiry for d in ex_div_dates
+            )
+            if not (near_expiry or pre_ex_dividend):
+                continue
+
+            if near_expiry and pre_ex_dividend:
+                reason = "itm_short_leg_near_expiry_and_pre_exdividend"
+            elif pre_ex_dividend:
+                reason = "itm_short_leg_pre_exdividend"
+            else:
+                reason = "itm_short_leg_near_expiry"
+
+            signals.append(ExitSignal(
+                symbol=position.symbol, reason=reason,
+                action="buy_to_close", quantity=abs(position.quantity),
+            ))
+        return signals

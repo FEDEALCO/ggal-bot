@@ -1559,6 +1559,45 @@ class LongFirstConfig:
     earnings_dates: Tuple[date, ...] = field(default_factory=lambda: _env_date_list("GGAL_BOT_EARNINGS_DATES"))
     earnings_blackout_days_before: int = _env_int("GGAL_BOT_EARNINGS_BLACKOUT_DAYS_BEFORE", 2)
 
+    # --- Guardia de asignacion anticipada sobre patas cortas ITM (2026-10-15) ---
+    # A pedido explicito del usuario: "ejercicio anticipado: como
+    # weekly_asymmetric ya tiene patas cortas, agregá (opt-in no, es
+    # riesgo: default ON) cerrar toda pata corta ITM antes de una fecha
+    # ex-dividendo y en los últimos N días al vencimiento." Esta es una
+    # guardia que REDUCE riesgo (nunca abre exposicion nueva, solo cierra
+    # una pata corta YA abierta cuando queda ITM en una ventana de riesgo
+    # de asignacion) - por eso, a diferencia de toda MEJORA de arriba
+    # (opt-in, default False), esta va default TRUE, siguiendo la misma
+    # excepcion ya vigente para otras guardias de riesgo de este proyecto
+    # (ver, por ejemplo, el respaldo de ultimo resorte de
+    # risk_manager.evaluate_quote_gap_backstop: "nueva funcionalidad debe
+    # ser opt-in via env var, off por defecto... EXCEPTO guardias que
+    # reducen riesgo, que van default ON").
+    #
+    # `ex_dividend_dates` sigue EXACTAMENTE el mismo criterio que
+    # `earnings_dates` arriba: deliberadamente VACIO por defecto (ver
+    # _env_date_list) porque este codigo no tiene forma de conocer con
+    # certeza el calendario real de dividendos de Grupo Financiero
+    # Galicia - inventar una fecha seria fabricar un dato. Con la lista
+    # vacia (default), el gatillo "antes de una fecha ex-dividendo" es un
+    # no-op (nunca dispara) aunque el guard este en True; el gatillo "en
+    # los ultimos N dias al vencimiento" SI funciona sin configuracion
+    # adicional porque days_business_to_expiry ya es un dato real
+    # calculado en cada ciclo (no requiere ningun calendario externo). Ver
+    # strategy/weekly_asymmetric.py:build_itm_short_leg_risk_exit_signals
+    # y RESEARCH.md para que haria falta para poblar esta lista con datos
+    # reales (ej. GGAL_BOT_EX_DIVIDEND_DATES="2026-11-10", o un fetch real
+    # contra el endpoint de eventos corporativos del broker).
+    enable_itm_short_leg_assignment_guard: bool = _env_bool(
+        "GGAL_BOT_ITM_SHORT_LEG_ASSIGNMENT_GUARD", True,
+    )
+    ex_dividend_dates: Tuple[date, ...] = field(
+        default_factory=lambda: _env_date_list("GGAL_BOT_EX_DIVIDEND_DATES"),
+    )
+    itm_short_leg_guard_business_days_before_expiry: int = _env_int(
+        "GGAL_BOT_ITM_SHORT_LEG_GUARD_DAYS_BEFORE_EXPIRY", 1,
+    )
+
 
 @dataclass
 class VolArbitrageConfig:

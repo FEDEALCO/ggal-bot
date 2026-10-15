@@ -1933,6 +1933,28 @@ class GgalOptionsBot:
             )
             self._act_on_naked_short_wing_exit_signal(nw, spot)
 
+        # -- 1c) Guardia de asignacion anticipada sobre patas cortas ITM --------
+        # (2026-10-15, a pedido explicito del usuario - default ON, ver
+        # config.LongFirstConfig.enable_itm_short_leg_assignment_guard y
+        # strategy/weekly_asymmetric.py:build_itm_short_leg_risk_exit_signals).
+        # Corre INMEDIATAMENTE despues de la limpieza de patas descubiertas
+        # de arriba, en el MISMO ciclo, por el mismo motivo: libera/corrige
+        # exposicion de riesgo ANTES de evaluar entradas nuevas (paso 2) o
+        # completar spreads (paso 3).
+        if SETTINGS.long_first.enable_itm_short_leg_assignment_guard:
+            itm_risk_signals = self.strategy.build_itm_short_leg_risk_exit_signals(
+                self.portfolio, self.option_chain, now,
+                business_days_before_expiry=SETTINGS.long_first.itm_short_leg_guard_business_days_before_expiry,
+                ex_dividend_dates=SETTINGS.long_first.ex_dividend_dates,
+            )
+            all_signals.extend(itm_risk_signals)
+            for ir in itm_risk_signals:
+                logger.warning(
+                    "Salida [Long-First]: %s %s x%.2f - %s (guardia de asignacion anticipada)",
+                    ir.action, ir.symbol, ir.quantity, ir.reason,
+                )
+                self._act_on_itm_short_leg_risk_exit_signal(ir, spot)
+
         # -- 1.5) Guardia de staleness de datos de mercado ----------------------
         # Ver RiskConfig.max_market_data_staleness_seconds / _is_market_data_stale().
         # Deliberadamente DESPUES de las salidas (paso 1, arriba) y ANTES de
@@ -2790,6 +2812,78 @@ class GgalOptionsBot:
             if remaining_to_reduce > 1e-9:
                 logger.warning(
                     "Recompra de pata corta %s: se compraron %.2f contratos pero solo %.2f "
+                    "estaban disponibles en patas cortas marcadas '%s' - revisar estado.",
+                    signal.symbol, signal.quantity, signal.quantity - remaining_to_reduce, strategy_tag,
+                )
+
+    def _act_on_itm_short_leg_risk_exit_signal(
+        self, signal, spot: float, strategy_tag: str = "weekly_asymmetric",
+    ) -> None:
+        """
+        Ejecuta un ExitSignal `action="buy_to_close"` producido por
+        WeeklyAsymmetricStrategy.build_itm_short_leg_risk_exit_signals()
+        (guardia de asignacion anticipada, 2026-10-15). Misma mecanica de
+        ejecucion/journal que _act_on_naked_short_wing_exit_signal (recompra
+        `signal.quantity`, reduce los lotes negativos que matcheen
+        symbol+strategy_tag mas antiguo primero) pero es una funcion
+        separada a proposito: el mensaje/razon de negocio es distinto
+        (riesgo de asignacion, no "pata descubierta sin su larga") y asi
+        cada guardia queda testeable/auditable de forma independiente sin
+        que un cambio futuro en una afecte el logging de la otra.
+        """
+        quote = self.option_chain.get(signal.symbol)
+        if quote is None or quote.book.bid <= 0 or quote.book.ask <= 0:
+            logger.warning(
+                "Cierre de pata corta ITM (riesgo de asignacion) %s no ejecutable este ciclo: "
+                "sin punta operable.",
+                signal.symbol,
+            )
+            return
+        if self.mid_price_exec.has_open_order_for(signal.symbol):
+            logger.debug(
+                "Cierre de pata corta ITM %s pospuesto: ya hay una orden en vigilancia.",
+                signal.symbol,
+            )
+            return
+
+        logger.warning(
+            "Pata corta ITM detectada bajo guardia de asignacion anticipada: %s x%.2f (razon=%s) - "
+            "recomprando antes de exponerse a un ejercicio anticipado.",
+            signal.symbol, signal.quantity, signal.reason,
+        )
+
+        state = self.mid_price_exec.submit(
+            symbol=signal.symbol, book=quote.book, side=OrderSide.BUY, quantity=signal.quantity,
+            spot_reference=spot, aggressive=False,
+        )
+
+        if state.status is OrderStatus.FILLED:
+            remaining_to_reduce = signal.quantity
+            matching = [
+                pos for pos in self.portfolio.positions
+                if pos.symbol == signal.symbol and pos.quantity < 0
+                and (pos.strategy_tag or "weekly_asymmetric") == strategy_tag
+            ]
+            matching.sort(key=lambda p: p.entry_time or datetime.min.replace(tzinfo=timezone.utc))
+            for pos in matching:
+                if remaining_to_reduce <= 0:
+                    break
+                reduce_qty = min(abs(pos.quantity), remaining_to_reduce)
+                pos.quantity += reduce_qty  # se acerca a 0 desde negativo
+                remaining_to_reduce -= reduce_qty
+
+                self.position_event_journal.log_event(
+                    "CLOSE" if abs(pos.quantity) <= 1e-9 else "REDUCE",
+                    position_id=pos.position_id, contract_key=pos.contract_key,
+                    symbol=pos.symbol, strategy_tag=pos.strategy_tag or "weekly_asymmetric",
+                    side="buy", quantity_delta=reduce_qty, quantity_after=pos.quantity,
+                    price=state.avg_fill_price,
+                    order_client_id=getattr(getattr(state, "request", None), "client_order_id", ""),
+                    reason=signal.reason,
+                )
+            if remaining_to_reduce > 1e-9:
+                logger.warning(
+                    "Cierre de pata corta ITM %s: se compraron %.2f contratos pero solo %.2f "
                     "estaban disponibles en patas cortas marcadas '%s' - revisar estado.",
                     signal.symbol, signal.quantity, signal.quantity - remaining_to_reduce, strategy_tag,
                 )

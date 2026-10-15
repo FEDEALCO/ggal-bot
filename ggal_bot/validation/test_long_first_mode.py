@@ -1522,6 +1522,162 @@ def test_naked_short_wing_ignores_long_positions():
 
 
 # ---------------------------------------------------------------------------
+# strategy/weekly_asymmetric.py: build_itm_short_leg_risk_exit_signals
+# (guardia de asignacion anticipada, 2026-10-15, a pedido explicito del
+# usuario - default ON, ver config.LongFirstConfig.
+# enable_itm_short_leg_assignment_guard)
+# ---------------------------------------------------------------------------
+
+_NOW_MON = datetime(2026, 10, 13, 14, 0, tzinfo=timezone.utc)   # lunes
+_EXPIRY_FRI = date(2026, 10, 16)                                 # viernes de esa misma semana
+
+
+def _itm_chain_with_short_put(spot_ref, days_biz, strike=5400.0, symbol="GFGV5400OC"):
+    chain = OptionChain()
+    chain.upsert_quote(_quote(
+        symbol, strike=strike, iv=0.40, spot_ref=spot_ref, days_biz=days_biz,
+        expiry=_EXPIRY_FRI, option_type=OptionType.PUT,
+    ))
+    return chain
+
+
+def test_itm_short_leg_guard_closes_itm_put_near_expiry():
+    portfolio = Portfolio()
+    portfolio.add(Position(symbol="GFGV5400OC", quantity=-50.0, multiplier=100.0, strategy_tag="weekly_asymmetric"))
+    chain = _itm_chain_with_short_put(spot_ref=5300.0, days_biz=1)  # spot<strike -> put ITM
+
+    signals = WeeklyAsymmetricStrategy.build_itm_short_leg_risk_exit_signals(
+        portfolio, chain, _NOW_MON, business_days_before_expiry=1,
+    )
+    assert len(signals) == 1
+    sig = signals[0]
+    assert sig.symbol == "GFGV5400OC"
+    assert sig.action == "buy_to_close"
+    assert abs(sig.quantity - 50.0) < 1e-6
+    assert sig.reason == "itm_short_leg_near_expiry"
+
+
+def test_itm_short_leg_guard_no_signal_when_otm():
+    portfolio = Portfolio()
+    portfolio.add(Position(symbol="GFGV5400OC", quantity=-50.0, multiplier=100.0, strategy_tag="weekly_asymmetric"))
+    chain = _itm_chain_with_short_put(spot_ref=5500.0, days_biz=1)  # spot>strike -> put OTM
+
+    assert WeeklyAsymmetricStrategy.build_itm_short_leg_risk_exit_signals(
+        portfolio, chain, _NOW_MON, business_days_before_expiry=1,
+    ) == []
+
+
+def test_itm_short_leg_guard_no_signal_when_itm_but_far_from_expiry_and_no_exdiv():
+    portfolio = Portfolio()
+    portfolio.add(Position(symbol="GFGV5400OC", quantity=-50.0, multiplier=100.0, strategy_tag="weekly_asymmetric"))
+    chain = _itm_chain_with_short_put(spot_ref=5300.0, days_biz=5)  # ITM, pero lejos del vencimiento
+
+    assert WeeklyAsymmetricStrategy.build_itm_short_leg_risk_exit_signals(
+        portfolio, chain, _NOW_MON, business_days_before_expiry=1, ex_dividend_dates=(),
+    ) == []
+
+
+def test_itm_short_leg_guard_fires_for_upcoming_ex_dividend_even_far_from_expiry():
+    portfolio = Portfolio()
+    portfolio.add(Position(symbol="GFGV5400OC", quantity=-50.0, multiplier=100.0, strategy_tag="weekly_asymmetric"))
+    chain = _itm_chain_with_short_put(spot_ref=5300.0, days_biz=5)  # ITM, lejos del vencimiento
+
+    signals = WeeklyAsymmetricStrategy.build_itm_short_leg_risk_exit_signals(
+        portfolio, chain, _NOW_MON, business_days_before_expiry=1,
+        ex_dividend_dates=(date(2026, 10, 15),),  # entre hoy (13) y el vencimiento (16)
+    )
+    assert len(signals) == 1
+    assert signals[0].reason == "itm_short_leg_pre_exdividend"
+
+
+def test_itm_short_leg_guard_combined_reason_when_both_conditions_true():
+    portfolio = Portfolio()
+    portfolio.add(Position(symbol="GFGV5400OC", quantity=-50.0, multiplier=100.0, strategy_tag="weekly_asymmetric"))
+    chain = _itm_chain_with_short_put(spot_ref=5300.0, days_biz=1)  # ITM y cerca del vencimiento
+
+    signals = WeeklyAsymmetricStrategy.build_itm_short_leg_risk_exit_signals(
+        portfolio, chain, _NOW_MON, business_days_before_expiry=1,
+        ex_dividend_dates=(date(2026, 10, 15),),
+    )
+    assert len(signals) == 1
+    assert signals[0].reason == "itm_short_leg_near_expiry_and_pre_exdividend"
+
+
+def test_itm_short_leg_guard_ex_dividend_date_outside_window_no_signal():
+    portfolio = Portfolio()
+    portfolio.add(Position(symbol="GFGV5400OC", quantity=-50.0, multiplier=100.0, strategy_tag="weekly_asymmetric"))
+    chain = _itm_chain_with_short_put(spot_ref=5300.0, days_biz=5)  # ITM, lejos del vencimiento
+
+    # una fecha ya pasada y otra posterior al vencimiento: ninguna cae en
+    # la ventana (hoy, vencimiento] - no deberia disparar.
+    signals = WeeklyAsymmetricStrategy.build_itm_short_leg_risk_exit_signals(
+        portfolio, chain, _NOW_MON, business_days_before_expiry=1,
+        ex_dividend_dates=(date(2026, 10, 10), date(2026, 10, 20)),
+    )
+    assert signals == []
+
+
+def test_itm_short_leg_guard_ignores_long_positions():
+    portfolio = Portfolio()
+    portfolio.add(Position(symbol="GFGV5400OC", quantity=50.0, multiplier=100.0, strategy_tag="weekly_asymmetric"))
+    chain = _itm_chain_with_short_put(spot_ref=5300.0, days_biz=1)
+
+    assert WeeklyAsymmetricStrategy.build_itm_short_leg_risk_exit_signals(
+        portfolio, chain, _NOW_MON, business_days_before_expiry=1,
+    ) == []
+
+
+def test_itm_short_leg_guard_ignores_other_strategy_tags():
+    portfolio = Portfolio()
+    portfolio.add(Position(symbol="GFGV5400OC", quantity=-50.0, multiplier=100.0, strategy_tag="scalping"))
+    chain = _itm_chain_with_short_put(spot_ref=5300.0, days_biz=1)
+
+    assert WeeklyAsymmetricStrategy.build_itm_short_leg_risk_exit_signals(
+        portfolio, chain, _NOW_MON, business_days_before_expiry=1, strategy_tag="weekly_asymmetric",
+    ) == []
+
+
+def test_itm_short_leg_guard_skips_without_live_quote():
+    """Sin cotizacion vigente para el simbolo, nunca se adivina ITM - se
+    omite esa posicion este ciclo (ver docstring del metodo)."""
+    portfolio = Portfolio()
+    portfolio.add(Position(symbol="GFGV5400OC", quantity=-50.0, multiplier=100.0, strategy_tag="weekly_asymmetric"))
+    empty_chain = OptionChain()
+
+    assert WeeklyAsymmetricStrategy.build_itm_short_leg_risk_exit_signals(
+        portfolio, empty_chain, _NOW_MON, business_days_before_expiry=1,
+    ) == []
+
+
+def test_itm_short_leg_guard_detects_itm_call_symmetrically():
+    portfolio = Portfolio()
+    portfolio.add(Position(symbol="GFGC5400OC", quantity=-50.0, multiplier=100.0, strategy_tag="weekly_asymmetric"))
+    chain = OptionChain()
+    chain.upsert_quote(_quote(
+        "GFGC5400OC", strike=5400.0, iv=0.40, spot_ref=5500.0, days_biz=1,  # spot>strike -> call ITM
+        expiry=_EXPIRY_FRI, option_type=OptionType.CALL,
+    ))
+
+    signals = WeeklyAsymmetricStrategy.build_itm_short_leg_risk_exit_signals(
+        portfolio, chain, _NOW_MON, business_days_before_expiry=1,
+    )
+    assert len(signals) == 1
+    assert signals[0].symbol == "GFGC5400OC"
+
+
+def test_itm_short_leg_guard_default_ex_dividend_none_treated_as_empty():
+    """ex_dividend_dates=None (default del parametro) se comporta igual
+    que una tupla vacia - no revienta, simplemente ese gatillo es no-op."""
+    portfolio = Portfolio()
+    portfolio.add(Position(symbol="GFGV5400OC", quantity=-50.0, multiplier=100.0, strategy_tag="weekly_asymmetric"))
+    chain = _itm_chain_with_short_put(spot_ref=5300.0, days_biz=5)
+
+    assert WeeklyAsymmetricStrategy.build_itm_short_leg_risk_exit_signals(
+        portfolio, chain, _NOW_MON, business_days_before_expiry=1, ex_dividend_dates=None,
+    ) == []
+
+
+# ---------------------------------------------------------------------------
 # strategy/weekly_asymmetric.py: scan_expensive_iv_spread_signals (MEJORA
 # 2026-09-17, ver docstring de SpreadOpenSignal/config.LongFirstConfig.
 # enable_expensive_iv_spread_entry)
@@ -2516,6 +2672,17 @@ ALL_TESTS = [
     test_naked_short_wing_ignores_legacy_short_without_financed_by_symbol,
     test_naked_short_wing_ignores_other_strategy_tags,
     test_naked_short_wing_ignores_long_positions,
+    test_itm_short_leg_guard_closes_itm_put_near_expiry,
+    test_itm_short_leg_guard_no_signal_when_otm,
+    test_itm_short_leg_guard_no_signal_when_itm_but_far_from_expiry_and_no_exdiv,
+    test_itm_short_leg_guard_fires_for_upcoming_ex_dividend_even_far_from_expiry,
+    test_itm_short_leg_guard_combined_reason_when_both_conditions_true,
+    test_itm_short_leg_guard_ex_dividend_date_outside_window_no_signal,
+    test_itm_short_leg_guard_ignores_long_positions,
+    test_itm_short_leg_guard_ignores_other_strategy_tags,
+    test_itm_short_leg_guard_skips_without_live_quote,
+    test_itm_short_leg_guard_detects_itm_call_symmetrically,
+    test_itm_short_leg_guard_default_ex_dividend_none_treated_as_empty,
     test_scan_expensive_iv_spread_signals_disabled_by_default,
     test_scan_expensive_iv_spread_signals_generates_debit_spread_when_enabled_and_expensive,
     test_scan_expensive_iv_spread_signals_neutral_trend_no_signal,
