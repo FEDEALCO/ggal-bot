@@ -35,7 +35,7 @@ from ggal_bot.config import SETTINGS
 from ggal_bot.data.option_chain import OptionQuote, OrderBookSnapshot
 from ggal_bot.execution.order_gateway import OrderGateway, OrderSide
 from ggal_bot.execution.mid_price_exec import MidPriceExecutionEngine
-from ggal_bot.models.black_scholes import OptionType
+from ggal_bot.models.black_scholes import BlackScholesGreeks, OptionType
 from ggal_bot.portfolio.portfolio import Position
 from ggal_bot.risk.risk_manager import RiskLimits, RiskManager
 from run_bot import GgalOptionsBot
@@ -186,10 +186,19 @@ class _with_shadow_enabled:
         SETTINGS.shadow.enabled = self.orig
 
 
-def _upsert_quote(bot, symbol, bid, ask, expiry=date(2026, 12, 18)):
+def _upsert_quote(bot, symbol, bid, ask, expiry=date(2026, 12, 18), iv=None):
+    """
+    `iv` (CORRECCION 2026-10-14, caso real GFGC6800OC: book 64 -> 15 en la
+    apertura): opcional, se pasa directo a OptionQuote.iv - necesario desde
+    esta correccion para los tests que ejercitan el disparo CATASTROFICO
+    (_apply_quote_gap_backstop ahora exige una IV valida conocida de un
+    ciclo anterior para poder calcular un valor teorico; sin pasar `iv`
+    aca, igual que antes de esta correccion, queda en None - ningun test
+    existente que NO dependa del disparo catastrofico necesita tocarlo).
+    """
     book = OrderBookSnapshot(symbol, bid=bid, ask=ask, bid_size=50, ask_size=50)
     q = OptionQuote(symbol, strike=8000.0, expiry=expiry, option_type=OptionType.CALL,
-                     book=book, days_calendar=90, days_business=60)
+                     book=book, days_calendar=90, days_business=60, iv=iv)
     bot.option_chain.upsert_quote(q)
 
 
@@ -253,15 +262,35 @@ def test_tracks_invalid_quote_since_on_first_miss_without_acting_yet():
 
 
 def test_catastrophic_loss_forces_close_immediately_even_before_n_minutes():
+    """
+    CORRECCION 2026-10-14 (caso real GFGC6800OC: book 64 -> 15 en la
+    apertura): el PnL% catastrofico ya NO se mide contra el mid crudo de un
+    book invalido - se mide contra un VALOR TEORICO (Black-Scholes, spot
+    vigente + ultima IV valida conocida). Por eso este test ahora necesita
+    un primer ciclo con book VALIDO (siembra `last_valid_iv`=0.35) antes de
+    romperse - sin eso, `_apply_quote_gap_backstop` correctamente NO podria
+    estimar ningun PnL (ver test_no_book_at_all_logs_but_never_crashes...).
+    Los precios teoricos (strike=8000, 90d calendario/60d habiles, iv=0.35,
+    tasa/dividendo de SETTINGS.rate) se verificaron corriendo
+    BlackScholesGreeks.price() directo: spot=6000 -> 733.82; spot=4500 ->
+    57.03 (pnl=-92.2%, por encima del umbral catastrofico de 75%).
+    """
     with _with_backstop_settings(minutes=10.0, catastrophic_pct=0.75), _with_shadow_enabled():
         bot = _make_bot()
-        _add_long_position(bot, entry_price=100.0)
-        # Book invalido (spread muy ancho) pero con un mid que implica -80% de perdida sobre la prima.
-        _upsert_quote(bot, "GFGC8000OC", bid=10.0, ask=30.0)  # mid=20 -> pnl=(20-100)/100=-80%
+        _add_long_position(bot, entry_price=733.82)
+        # Paso 1: book VALIDO (spread 4%) - siembra last_valid_iv.
+        _upsert_quote(bot, "GFGC8000OC", bid=719.0, ask=749.0, iv=0.35)
+        bot._apply_quote_gap_backstop(spot=6000.0, now=500.0)
+        assert "GFGC8000OC" not in bot._position_invalid_quote_since
 
-        bot._apply_quote_gap_backstop(spot=6000.0, now=1_000.0)  # recien el primer miss, 0 minutos transcurridos
+        # Paso 2: book roto (spread muy ancho, estilo GFGC6800OC) Y el spot
+        # cae fuerte - el valor TEORICO (misma IV, nuevo spot) refleja la
+        # perdida real; el mid roto del book (bid=1/ask=3, irrelevante) ya
+        # NO se usa para nada.
+        _upsert_quote(bot, "GFGC8000OC", bid=1.0, ask=3.0, iv=0.35)
+        bot._apply_quote_gap_backstop(spot=4500.0, now=1_000.0)
 
-        assert bot.portfolio.positions[0].quantity == 0  # se forzo el cierre
+        assert bot.portfolio.positions[0].quantity == 0  # se forzo el cierre por perdida TEORICA real
         assert "GFGC8000OC" not in bot._position_invalid_quote_since  # tracking limpiado tras el cierre
 
 
@@ -296,17 +325,105 @@ def test_no_book_at_all_logs_but_never_crashes_and_never_fabricates_a_price():
 def test_short_position_loses_when_price_rises_not_falls():
     """Una posicion CORTA (quantity<0, ej. el wing corto de weekly_asymmetric) pierde cuando el
     precio SUBE - al reves de una larga. Verifica la orientacion por signo documentada en
-    _apply_quote_gap_backstop."""
+    _apply_quote_gap_backstop.
+
+    CORRECCION 2026-10-14 (mismo fix que el test catastrofico de arriba):
+    necesita un book VALIDO primero (siembra last_valid_iv) antes de
+    romperse - el valor teorico, no el mid roto, es lo que mide la
+    perdida. Precios teoricos (strike=8000, 90d/60d, iv=0.35) verificados
+    con BlackScholesGreeks.price(): spot=5500 -> 24.04; spot=6500 -> 185.33
+    (para la CORTA, pnl orientado = -(185.33-24.04)/24.04 = -670%, muy por
+    encima del umbral catastrofico de 75%)."""
     with _with_backstop_settings(minutes=10.0, catastrophic_pct=0.75), _with_shadow_enabled():
         bot = _make_bot()
-        _add_long_position(bot, symbol="GFGV5000OC", quantity=-8, entry_price=10.0)
-        # mid=28 -> para una posicion CORTA vendida a 10, esto es (28-10)/10=+180% crudo,
-        # orientado para CORTA: -180% (perdida grande) -> debe disparar el gatillo catastrofico.
-        _upsert_quote(bot, "GFGV5000OC", bid=20.0, ask=36.0)
+        _add_long_position(bot, symbol="GFGV5000OC", quantity=-8, entry_price=24.04)
+        # Paso 1: book VALIDO - siembra last_valid_iv.
+        _upsert_quote(bot, "GFGV5000OC", bid=23.5, ask=24.5, iv=0.35)
+        bot._apply_quote_gap_backstop(spot=5500.0, now=500.0)
+        assert "GFGV5000OC" not in bot._position_invalid_quote_since
 
-        bot._apply_quote_gap_backstop(spot=6000.0, now=1_000.0)
+        # Paso 2: book roto Y el spot sube fuerte - perdida real para la CORTA
+        # medida contra el valor TEORICO, no contra el mid roto de abajo.
+        _upsert_quote(bot, "GFGV5000OC", bid=20.0, ask=36.0, iv=0.35)
+        bot._apply_quote_gap_backstop(spot=6500.0, now=1_000.0)
 
         assert bot.portfolio.positions[0].quantity == 0  # se recompro (buy to close) para cerrar la corta
+
+
+def test_real_gfgc6800oc_case_broken_book_does_not_false_trigger_catastrophic():
+    """
+    CORRECCION 2026-10-14, a pedido explicito del usuario - caso REAL que
+    motivo la correccion #2: "el caso GFGC6800OC (64 -> 15 en la apertura)
+    lo habria disparado igual [con la logica vieja]". El usuario describio
+    el book pasando de un ultimo precio operable ~64 a un book roto que
+    mostraba ~15 en la apertura, sin que esto fuera una caida real del
+    subyacente. No hay en este sandbox la fila cruda de market_snapshots.csv
+    de ese instante (ver RESEARCH.md, limitacion explicita) - se usan aca
+    numeros REPRESENTATIVOS de esa misma magnitud (64≈60.03, 15 exacto,
+    verificados con BlackScholesGreeks.price() directo: GFGC6800OC, strike
+    6800, 5 dias calendario/3 habiles a vencimiento, iv=0.30):
+      - spot=6700 -> valor teorico 60.03 (book valido, mid~ese valor: "64" real)
+      - spot=6690 -> valor teorico 56.17 (el subyacente CASI NO se movio)
+      - el book roto, en el mismo instante, muestra mid=15 (bid=5/ask=25,
+        spread 133% >> el 5% default de SETTINGS.risk.max_spread_relative)
+
+    Logica VIEJA (antes de esta correccion, ver el commit anterior a esta
+    correccion para el codigo exacto): el PnL% catastrofico se calculaba
+    como (last_known_mid - entry_price) / entry_price usando el ULTIMO
+    book de DOS PUNTAS conocido - que para este book roto (bid=5>0,
+    ask=25>0) es el mid=15 mismo, NO el 60.03 valido. (15-60.03)/60.03 =
+    -75.0% >= umbral catastrofico default (75%) -> HABRIA DISPARADO el
+    cierre forzado sobre una perdida que nunca existio (se verifica mas
+    abajo con la formula vieja, sin pasar por el bot, ya que ese codigo ya
+    no esta en el repo).
+
+    Logica NUEVA (esta correccion): el PnL% se calcula contra el valor
+    TEORICO (Black-Scholes, spot vigente + ultima IV valida conocida =
+    0.30 del book sano) - (56.17-60.03)/60.03 = -6.4%, muy por debajo del
+    umbral. El book roto (mid=15) nunca se usa para nada. La posicion NO
+    se cierra.
+    """
+    entry_price = 60.02778750803509  # BlackScholesGreeks.price(0.30) @ spot=6700, strike=6800, 5cd/3hb
+    broken_mid = 15.0  # bid=5.0, ask=25.0 (spread 133%, invalido) - representativo del caso real
+    theoretical_after_small_move = 56.17492802802644  # BlackScholesGreeks.price(0.30) @ spot=6690
+
+    # --- Logica VIEJA (ya no existe en el repo) habria disparado: ---
+    old_logic_pnl_pct = (broken_mid - entry_price) / entry_price
+    assert old_logic_pnl_pct <= -0.75, (
+        "si esto deja de ser cierto, el caso elegido ya no reproduce el bug real - "
+        "ajustar los numeros, nunca borrar esta aserción."
+    )
+
+    with _with_backstop_settings(minutes=10.0, catastrophic_pct=0.75), _with_shadow_enabled():
+        bot = _make_bot()
+        bot.portfolio.add(Position(
+            symbol="GFGC6800OC", quantity=10, multiplier=100.0, entry_price=entry_price,
+            entry_time=datetime.now(timezone.utc), expiry=date(2026, 10, 16), strategy_tag="weekly_asymmetric",
+        ))
+
+        # Paso 1: book VALIDO en la apertura (spread 4%, mid~60.03≈"64" real) - siembra last_valid_iv=0.30.
+        book1 = OrderBookSnapshot("GFGC6800OC", bid=58.9, ask=61.1, bid_size=10, ask_size=10)
+        q1 = OptionQuote("GFGC6800OC", strike=6800.0, expiry=date(2026, 10, 16), option_type=OptionType.CALL,
+                          book=book1, days_calendar=5, days_business=3, iv=0.30)
+        bot.option_chain.upsert_quote(q1)
+        bot._apply_quote_gap_backstop(spot=6700.0, now=500.0)
+        assert "GFGC6800OC" not in bot._position_invalid_quote_since
+
+        # Paso 2: el book se rompe en el mismo instante (mid=15, spread 133%) - CASO REAL GFGC6800OC.
+        # El subyacente CASI NO se movio (6700 -> 6690): el valor teorico lo refleja, el mid roto no.
+        book2 = OrderBookSnapshot("GFGC6800OC", bid=5.0, ask=25.0, bid_size=10, ask_size=10)
+        q2 = OptionQuote("GFGC6800OC", strike=6800.0, expiry=date(2026, 10, 16), option_type=OptionType.CALL,
+                          book=book2, days_calendar=5, days_business=3, iv=0.30)
+        bot.option_chain.upsert_quote(q2)
+        bot._apply_quote_gap_backstop(spot=6690.0, now=600.0)
+
+        # La logica NUEVA NO dispara: el valor teorico (56.17) implica solo -6.4%, muy lejos del
+        # umbral catastrofico (75%) - exactamente lo que la logica VIEJA habria calculado mal.
+        assert bot.portfolio.positions[0].quantity == 10  # NUNCA se cerro
+        assert "GFGC6800OC" in bot._position_invalid_quote_since  # el gap de tiempo SI sigue trackeado
+
+        new_logic_pnl_pct = (theoretical_after_small_move - entry_price) / entry_price
+        assert new_logic_pnl_pct > -0.75  # muy por encima del umbral - no deberia haber disparado
 
 
 def test_recovering_valid_quote_resets_the_backstop_tracking():
@@ -355,6 +472,7 @@ ALL_TESTS = [
     test_time_gap_forces_close_after_n_minutes_without_catastrophic_loss,
     test_no_book_at_all_logs_but_never_crashes_and_never_fabricates_a_price,
     test_short_position_loses_when_price_rises_not_falls,
+    test_real_gfgc6800oc_case_broken_book_does_not_false_trigger_catastrophic,
     test_recovering_valid_quote_resets_the_backstop_tracking,
     test_closed_position_is_purged_from_tracking,
 ]

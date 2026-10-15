@@ -41,6 +41,7 @@ from ggal_bot.data.live_shadow_feed import LiveShadowFeed
 from ggal_bot.data.option_chain import OptionChain, OrderBookSnapshot
 from ggal_bot.models.implied_vol import ImpliedVolatilityCalculator
 from ggal_bot.models.volatility_surface import VolatilitySurface
+from ggal_bot.models.black_scholes import BlackScholesGreeks
 from ggal_bot.portfolio.portfolio import Portfolio, Position
 from ggal_bot.portfolio.event_journal import PositionEventJournal
 from ggal_bot.portfolio.portfolio_greeks_log import PortfolioGreeksLogger
@@ -553,8 +554,31 @@ class GgalOptionsBot:
         # dejo de pasar is_valid_quote(), y el ULTIMO book.mid real
         # (bid>0 y ask>0, aunque no pase is_valid_quote()) conocido para
         # esa base - None/ausente si JAMAS hubo un book con dos puntas.
+        #
+        # CORRECCION 2026-10-14 (a pedido explicito del usuario, caso real
+        # GFGC6800OC: book 64 -> 15 en la apertura): ANTES, `last_mid` se
+        # actualizaba con CUALQUIER book de dos puntas (bid>0 y ask>0),
+        # incluso uno que FALLABA is_valid_quote() por spread/antiguedad -
+        # es decir, el "ultimo precio conocido" podia ser el precio ROTO
+        # mismo que disparo la invalidez, no un precio real. Verificado
+        # contra el caso real: un book que pasa de mid=64 a un mid=15
+        # invalido (spread/stale) habria calculado un PnL% de ~-76%,
+        # disparando el respaldo catastrofico (umbral default 75%) sobre
+        # una perdida que nunca existio - el book roto no es un precio
+        # ejecutable, nunca deberia marcar a mercado una posicion.
+        # Fix: `last_mid`/`last_valid_iv` ahora se actualizan EXCLUSIVAMENTE
+        # cuando is_valid_quote() es True (ver el cuerpo de
+        # _apply_quote_gap_backstop mas abajo) - y el PnL%/precio de la
+        # orden limite protegida, cuando el book vigente SI es invalido, se
+        # calculan contra un VALOR TEORICO (Black-Scholes con el spot
+        # vigente validado + la ultima IV valida conocida), nunca contra
+        # book.mid de un book que ya fallo el filtro. `last_valid_iv`:
+        # symbol -> ultima IV (quote.iv) vista en un ciclo donde
+        # is_valid_quote() fue True - None/ausente si JAMAS hubo una
+        # cotizacion valida para esa base.
         self._position_invalid_quote_since: Dict[str, float] = {}
         self._position_invalid_quote_last_mid: Dict[str, float] = {}
+        self._position_invalid_quote_last_valid_iv: Dict[str, float] = {}
         self._shutting_down = False
         # Numero de señal (SIGINT/SIGTERM) que disparo el shutdown, o None si
         # todavia no se recibio ninguna. Se guarda aca (en vez de loguearse
@@ -1459,6 +1483,7 @@ class GgalOptionsBot:
             if symbol not in open_symbols:
                 del self._position_invalid_quote_since[symbol]
                 self._position_invalid_quote_last_mid.pop(symbol, None)
+                self._position_invalid_quote_last_valid_iv.pop(symbol, None)
 
         for pos in open_positions:
             if self.mid_price_exec.has_open_order_for(pos.symbol):
@@ -1466,13 +1491,20 @@ class GgalOptionsBot:
 
             quote = self.option_chain.get(pos.symbol)
             book_has_two_sided_quote = quote is not None and quote.book.bid > 0 and quote.book.ask > 0
-            if book_has_two_sided_quote:
-                self._position_invalid_quote_last_mid[pos.symbol] = quote.book.mid
 
             is_valid_quote = book_has_two_sided_quote and quote.book.is_valid_quote(
                 SETTINGS.risk.max_spread_relative, SETTINGS.risk.max_option_quote_staleness_seconds,
             )
             if is_valid_quote:
+                # CORRECCION 2026-10-14 (caso real GFGC6800OC, ver docstring
+                # de __init__ arriba): `last_mid`/`last_valid_iv` SOLO se
+                # actualizan aca, con un book que SI paso is_valid_quote() -
+                # nunca con un book roto que llego a tener dos puntas pero
+                # fallo el filtro (eso es exactamente lo que producia el
+                # falso disparo catastrofico).
+                self._position_invalid_quote_last_mid[pos.symbol] = quote.book.mid
+                if quote.iv is not None:
+                    self._position_invalid_quote_last_valid_iv[pos.symbol] = quote.iv
                 if pos.symbol in self._position_invalid_quote_since:
                     logger.info(
                         "Cotizacion valida recuperada para %s (respaldo de quote gap): se "
@@ -1483,10 +1515,36 @@ class GgalOptionsBot:
 
             invalid_since_ts = self._position_invalid_quote_since.setdefault(pos.symbol, now_ts)
 
-            last_known_mid = self._position_invalid_quote_last_mid.get(pos.symbol)
+            # Valor TEORICO de la opcion (CORRECCION 2026-10-14, a pedido
+            # explicito del usuario, caso real GFGC6800OC: book 64 -> 15 en
+            # la apertura) - se usa en vez del mid crudo del book VIGENTE
+            # (que en este punto del codigo YA SABEMOS que fallo
+            # is_valid_quote(): spread ancho, stale, o directamente sin dos
+            # puntas) tanto para medir el PnL% del disparo catastrofico como
+            # para la base de precio de la orden limite protegida mas abajo.
+            # Requiere: (a) el book vigente tenga al menos estructura de
+            # contrato real (`quote` no None - strike/expiry/option_type
+            # provienen del propio `quote`, NUNCA se fabrican), y (b) una IV
+            # valida conocida de un ciclo anterior donde is_valid_quote() SI
+            # fue True. Sin (a) o (b), `theoretical_value` queda en None -
+            # nunca se fabrica un valor: el disparo catastrofico simplemente
+            # no se evalua (solo puede seguir disparando por tiempo, igual
+            # que si no hubiera dato de PnL alguno).
+            theoretical_value: Optional[float] = None
+            if quote is not None:
+                last_valid_iv = self._position_invalid_quote_last_valid_iv.get(pos.symbol)
+                if last_valid_iv is not None:
+                    bs = BlackScholesGreeks(
+                        spot=spot, strike=quote.strike, rate=SETTINGS.rate.default_annual_rate,
+                        dividend_yield=SETTINGS.rate.dividend_yield,
+                        days_calendar=quote.days_calendar, days_business=quote.days_business,
+                        option_type=quote.option_type,
+                    )
+                    theoretical_value = bs.price(last_valid_iv)
+
             last_known_pnl_pct = None
-            if last_known_mid is not None and pos.entry_price:
-                raw_pnl_pct = (last_known_mid - pos.entry_price) / pos.entry_price
+            if theoretical_value is not None and pos.entry_price:
+                raw_pnl_pct = (theoretical_value - pos.entry_price) / pos.entry_price
                 # Orientacion por signo de la posicion (ver docstring): una
                 # posicion CORTA pierde cuando el precio SUBE, al reves de
                 # una larga - evaluate_quote_gap_backstop espera el PnL% ya
@@ -1530,6 +1588,12 @@ class GgalOptionsBot:
             state = self.mid_price_exec.submit_protected_limit(
                 symbol=pos.symbol, book=quote.book, side=side, quantity=quantity,
                 spot_reference=spot, margin_pct=SETTINGS.risk.quote_gap_backstop_limit_margin_pct,
+                # CORRECCION 2026-10-14: la orden limite protegida se arma
+                # contra el VALOR TEORICO (nunca contra el mid de un book
+                # que ya sabemos invalido) cuando ese valor pudo calcularse
+                # - None (comportamiento previo, book.mid) solo si tampoco
+                # hay IV valida conocida para estimarlo.
+                reference_value=theoretical_value,
             )
             if state.status is OrderStatus.FILLED:
                 matching = [
@@ -1557,6 +1621,7 @@ class GgalOptionsBot:
                     )
                 self._position_invalid_quote_since.pop(pos.symbol, None)
                 self._position_invalid_quote_last_mid.pop(pos.symbol, None)
+                self._position_invalid_quote_last_valid_iv.pop(pos.symbol, None)
 
     def _run_vol_arbitrage_cycle(self, spot: float) -> List[object]:
         """Ciclo bajo el modo original de arbitraje de volatilidad delta-neutral."""

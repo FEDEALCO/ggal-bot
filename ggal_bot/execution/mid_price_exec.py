@@ -117,6 +117,7 @@ class MidPriceExecutionEngine:
         quantity: float,
         spot_reference: float,
         margin_pct: float,
+        reference_value: Optional[float] = None,
     ) -> OrderState:
         """
         Respaldo de ultimo resorte (MEJORA 2026-10-13, ver RiskConfig.
@@ -143,25 +144,52 @@ class MidPriceExecutionEngine:
         ancha) - `margin_pct` es un parametro propio (ver RiskConfig.
         quote_gap_backstop_limit_margin_pct), pensado especificamente para
         este escenario de respaldo.
+
+        `reference_value` (CORRECCION 2026-10-14, a pedido explicito del
+        usuario, caso real GFGC6800OC: book 64 -> 15 en la apertura): base
+        de precio OPCIONAL distinta de `book.mid` - pasada por el llamador
+        (run_bot.py::_apply_quote_gap_backstop) con el VALOR TEORICO de la
+        opcion (Black-Scholes con el spot vigente validado + la ultima IV
+        valida conocida) exactamente cuando el book vigente NO pasa
+        is_valid_quote() - nunca se arma una orden protegida contra el mid
+        de un book que ya fallo el filtro de spread/antiguedad, que puede
+        ser un precio roto (ver el caso real arriba). Default None: con un
+        book SANO (is_valid_quote()==True) el llamador no pasa este
+        parametro y el comportamiento es IDENTICO al de antes de esta
+        correccion (`book.mid` como base).
         """
+        basis = reference_value if reference_value is not None else book.mid
         if side is OrderSide.SELL:
-            protected_price = book.mid * (1.0 - abs(margin_pct))
+            protected_price = basis * (1.0 - abs(margin_pct))
         else:
-            protected_price = book.mid * (1.0 + abs(margin_pct))
+            protected_price = basis * (1.0 + abs(margin_pct))
 
         request = OrderRequest(
             symbol=symbol, side=side, quantity=quantity, price=protected_price,
             order_type=OrderTypeEnum.LIMIT,
         )
-        state = self.order_gateway.send(request, reference_price=book.mid, book=book)
+        # LIMITACION EXPLICITA, NO RESUELTA EN ESTA CORRECCION (no fabricada):
+        # en modo shadow, OrderGateway.send() simula el fill CRUZANDO el
+        # book REAL vigente (book.bid/book.ask) en vez de respetar
+        # `request.price` como limite real lo haria - es decir, aunque la
+        # orden se arme con `basis`=valor teorico, el FILL simulado puede
+        # seguir viendo el book roto si bid>0/ask>0 (ver docstring de
+        # OrderGateway.send(), "Fix: si hay un book vigente... CRUZA EL
+        # SPREAD"). Esto es una simplificacion preexistente del simulador
+        # de shadow (no distingue LIMIT de MARKET al simular el fill), fuera
+        # del alcance de esta correccion puntual (que es sobre la base de
+        # PRECIO/DISPARO, no sobre la fidelidad del simulador de fills) -
+        # queda documentado para que el usuario decida si lo prioriza.
+        state = self.order_gateway.send(request, reference_price=basis, book=book)
         self._contexts[request.client_order_id] = _OpenOrderContext(
             symbol=symbol, side=side, aggressive=True, spot_reference=spot_reference,
         )
         logger.warning(
             "Orden de RESPALDO insertada [limite protegido, NUNCA mercado]: %s %s x%.0f @ %.2f "
-            "(mid=%.2f, margen=%.1f%%, id=%s)",
-            side.value, symbol, quantity, protected_price, book.mid, abs(margin_pct) * 100,
-            request.client_order_id,
+            "(base=%.2f%s, margen=%.1f%%, id=%s)",
+            side.value, symbol, quantity, protected_price, basis,
+            " [valor teorico, book invalido]" if reference_value is not None else " [mid]",
+            abs(margin_pct) * 100, request.client_order_id,
         )
         return state
 
