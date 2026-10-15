@@ -6,6 +6,26 @@ Disciplina de todo el proyecto aplica aca tambien: nunca fabricar un
 numero, dato o resultado; todo lo que sigue esta trazado a una fuente
 (codigo, log real, fuente externa citada, o tool call de esta sesion).
 
+**CONGELAMIENTO DE LOGICA DE TRADING, 2026-10-15 a 2026-11-05**: ver
+`FREEZE.md` (raiz del repo). Desde el deploy del 2026-10-15, solo bugs de
+integridad de datos o de riesgo - nada de features ni cambios de
+parametros - para preservar una muestra de una sola version. Este
+documento sigue actualizandose con analisis OFFLINE durante la ventana
+(eso esta explicitamente permitido - ver FREEZE.md).
+
+**REVISION SEMANAL EN UN COMANDO (a pedido explicito del usuario,
+2026-10-15, punto 4)**: `python -m ggal_bot.ops.weekly_review` (correr
+desde la raiz del repo, todos los viernes despues de las 17:00). Junta,
+desde los logs reales (nunca fabrica nada - cualquier seccion sin datos
+dice DATA INSUFFICIENT en vez de inventar un numero): trades y PnL neto
+por estrategia con IC bootstrap, violaciones de invariantes, fills fuera
+de horario de rueda, % de quotes validas por contrato operado, disparos
+del backstop de ultimo resorte, y acumulacion de datos para Hipotesis 1
+(filas con `last_price>0`). 22 tests en
+`ggal_bot/validation/test_weekly_review.py`. Ver docstring completo del
+modulo para el detalle de cada fuente reutilizada (audit_journal_
+invariants.py, backtest/metrics.py, dashboard/data/market_hours_quality.py).
+
 ## Fase 0 — estado final (cerrada 2026-10-13)
 
 ### 1. Horario de BYMA (opciones)
@@ -492,7 +512,7 @@ hace 13 dias.
 | # | Hipotesis | Datos | Estado |
 |---|---|---|---|
 | 1 | Provision de liquidez | book local (ya logueado) | **Datos acumulándose** (ver 2026-10-14 abajo) |
-| 2 | Venta de vol riesgo definido (VRP) | opciones locales + ADR (vol historica) | **Datos acumulándose** (gate rehecho 2026-10-14, ver pre-registro abajo - "sobrevive" fue un veredicto incorrecto, corregido) |
+| 2 | Venta de vol riesgo definido (VRP) | opciones locales + ADR (vol historica) | **Datos acumulándose** (gate rehecho 2026-10-14; test definitivo 2026-10-15 con puts OTM reales y distribucion empirica 10y: edge negativo en los 6 escenarios de vol probados, se descarta en el regimen actual - ver corrección 2026-10-15 abajo) |
 | 3 | Paridad put-call vs. caucion | caucion historica | **DATA INSUFFICIENT** - backlog (logging intradia bloqueado, ver seccion 5) |
 | 4 | Lead-lag ADR x CCL -> opciones locales | ADR (ok) + CCL **ahora calculado** | **Testeable** (CCL historico resuelto, ver seccion 4) |
 | 5 | scalping / weekly_asymmetric (sin privilegio) | ya logueado | **Testeable**, con filtro de quotes + respaldo aplicados |
@@ -735,6 +755,79 @@ H2), que H2 vuelve mas relevante por depender de vender puts/calls cortos
 como mecanismo central en vez de como wing secundario de un spread
 largo-primero.
 
+**ACTUALIZACION 2026-10-15 (pedido explicito del usuario, punto 2):**
+mientras no exista deteccion real de asignacion (ver abajo), se agrego
+una guardia PREVENTIVA que reduce la ventana de exposicion: cerrar
+(`buy_to_close`) toda pata corta de `weekly_asymmetric` que este
+ACTUALMENTE ITM, en los ultimos N dias habiles al vencimiento o antes de
+una fecha ex-dividendo real configurada - ver
+`strategy/weekly_asymmetric.py::build_itm_short_leg_risk_exit_signals` y
+`config.LongFirstConfig.enable_itm_short_leg_assignment_guard` (**default
+ON**, excepcion de riesgo igual que el resto de guardias de este
+proyecto - nunca opt-in). 12 tests nuevos en
+`test_long_first_mode.py`. Esto NO es deteccion de asignacion (eso sigue
+sin existir, ver abajo): es una guardia que evita LLEGAR a una situacion
+de asignacion en primer lugar, cerrando la exposicion antes de que el
+riesgo se materialice. Si IOL asignara una pata corta ANTES de que esta
+guardia alcance a cerrarla (ej. una asignacion fuera de horario, o una
+fecha ex-dividendo no cargada en `ex_dividend_dates` porque este codigo
+no tiene forma de conocerla con certeza - ver abajo), el bot sigue sin
+enterarse hasta una reconciliacion de arranque.
+
+**Dato real verificado hoy**: `get_next_corporate_events("GGAL")`
+(conector IOL) devuelve `next_ex_date: null` - **VERIFIED, no hay ninguna
+fecha ex-dividendo cargada en la fuente del broker para GGAL en este
+momento.** Consistente con que `ex_dividend_dates` (config) este vacio
+por defecto: hoy mismo, poblarlo con un valor real traido de ESTA fuente
+no agregaria ninguna fecha (no hay ninguna pendiente) - queda como
+tarea de monitoreo continuo, no como un dato que faltara cargar hoy.
+
+**Que haria falta para DETECCION real de asignacion en modo vivo (no
+solo esta guardia preventiva)** - documentado a pedido explicito del
+usuario, sin implementarlo (el bot sigue en shadow, sin ordenes reales -
+implementar esto recien tendria sentido al pasar a modo vivo):
+
+1. **Fuente de datos**: un endpoint del broker que distinga un
+   movimiento de "ejercicio"/"asignacion" de un trade comun. El conector
+   IOL de esta sesion expone `get_activities` (movimientos de cuenta,
+   default ultimos 30 dias) y `get_portfolio` (tenencias actuales) - en
+   principio los candidatos naturales, pero esta sesion NO tiene
+   confirmado el campo/codigo exacto que IOL usa para marcar un
+   ejercicio/asignacion dentro de `get_activities` (**DATA
+   INSUFFICIENT**: no se inspecciono su schema real ni se hizo la
+   llamada, para no leer actividad real de la cuenta del usuario sin un
+   motivo operativo concreto hoy - la respuesta de ese endpoint
+   requeriria revisarse el dia que una asignacion real (o un ejercicio de
+   prueba en un instrumento sin impacto) ocurra, para confirmar como se
+   ve en los datos reales antes de programar contra un campo asumido).
+2. **Poll o webhook**: `get_activities`/`get_portfolio` son pull (hay que
+   consultarlos); el bot necesitaria un ciclo de reconciliacion
+   adicional (ademas del de arranque que ya existe, ver seccion 6bis) que
+   compare periodicamente la cantidad esperada de cada `Position` del
+   portfolio en memoria contra la tenencia REAL que devuelve el broker, y
+   trate cualquier diferencia hacia abajo en una pata corta como
+   candidata a asignacion (nunca al reves - una diferencia hacia arriba
+   es un bug de otro tipo, no una asignacion).
+3. **Registro distinto en el Event Journal**: un asignacion NO es un
+   cierre voluntario - mismo razonamiento que motivo toda la
+   investigacion de la seccion 6bis (nunca mutar `Position.quantity` sin
+   loguear el evento, y el TIPO de evento debe permitir distinguir
+   despues "se cerro porque el bot decidio cerrarla" de "se cerro porque
+   el mercado la ejercio en contra nuestra" - esto ultimo es evidencia
+   sobre H2/el riesgo real de vender patas cortas, lo primero no). Se
+   recomienda un nuevo `reason`/tipo de evento explicito (ej.
+   `"ASSIGNED"`) en vez de reusar `"CLOSE"`.
+4. **Alertable, no silencioso**: dado que una asignacion real cambia el
+   perfil de riesgo del portfolio de forma inmediata (una pata corta
+   asignada puede convertirse en una posicion del subyacente, no en
+   cierre a cero), detectarla deberia disparar una alerta operativa (el
+   mismo canal/mecanismo que ya exista para otras condiciones criticas
+   del bot), no solo quedar como una fila mas del log.
+
+Nada de esto esta implementado hoy - es la especificacion pedida por el
+usuario para cuando el proyecto pase de shadow a vivo, no un cambio de
+codigo de esta entrega.
+
 **Resizing obligatorio a <=3% de perdida maxima semanal (regla nueva del
 usuario), con los numeros REALES de (a):**
 
@@ -820,6 +913,157 @@ exacto con secuencia long-first - H2 reutiliza esa solucion en vez de
 re-inventar una nueva. Se deja constancia del error y la correccion por
 transparencia (nunca se publica un resultado sin volver a chequearlo
 contra el codigo real).
+
+## CORRECCION 2026-10-15 (correccion #1 del usuario, ronda 2) — test definitivo con instrumento correcto
+
+El usuario senalo un error concreto en la seccion anterior: **el 2.74%
+de spread real (a) se midio sobre `shadow_trades.csv`, que son fills de
+CALLS ATM que el bot efectivamente opero (scalping) - no sobre los PUTS
+OTM (~5%/~10% fuera del dinero) que H2 necesitaria para el bull put
+spread.** Medir el spread del instrumento equivocado invalida la
+conclusion de esa seccion sobre liquidez/credito. Esta seccion repite el
+test con el instrumento correcto, usando datos reales nuevos disponibles
+hoy (conector de mercado IOL, agregado a este sandbox despues de la
+seccion anterior).
+
+**Disponibilidad de datos real, verificada hoy (2026-10-15):**
+
+- `logs/market_snapshots.csv` y sus rotaciones `.gz` en este sandbox:
+  **DATA INSUFFICIENT** (confirmado de nuevo) - todos los archivos tienen
+  unicamente la fila de encabezado, cero filas de datos. Este checkout no
+  corrio nunca contra el book real de BYMA.
+- Chain de opciones GGAL en vivo (conector IOL, `get_options_chain`):
+  **VERIFIED - datos reales, hoy 2026-10-15 ~13:48 ART, mercado abierto.**
+  Spot real BCBA: **5790 ARS**. Hay exactamente 3 vencimientos listados:
+  (1) semanal 2026-10-16 (a **T-1 rueda**, vence maniana - NO representa
+  el libro de una entrada semanal tipica a ~5 dias calendario/3 ruedas),
+  (2) mensual 2026-11-20 (sin liquidez, casi todo bid/ask en null), (3)
+  mensual 2026-12-18 (liquido, dos puntas reales en la mayoria de los
+  strikes). **No existe todavia una serie semanal "siguiente" (ej.
+  2026-10-23)** - normalmente abre recien despues de que vence la actual.
+  Un intento de leer la chain completa sin fecha fue bloqueado una vez por
+  el clasificador de permisos de la sesion ("Credential Exploration");
+  una llamada mas acotada (con `expiration` especifico) si fue autorizada
+  - no se insistio mas alla de eso.
+- **Conclusion de disponibilidad**: no existe hoy, ni en logs historicos
+  ni en vivo, un book semanal real a ~5 dias de vencimiento (el momento en
+  que `weekly_asymmetric` entraria la posicion). El book semanal vivo de
+  hoy esta a T-1 (demasiado cerca del vencimiento, premios casi nulos,
+  spreads porcentuales inflados por el piso de tick minimo - no sirve
+  como proxy de credito de entrada). **DATA INSUFFICIENT para el book
+  semanal real multi-fecha que pidio el usuario.** Lo que si se puede
+  medir con datos 100% reales, y se usa abajo: (i) la estructura real de
+  spread % en PUTS OTM de GGAL en BYMA (del book mensual liquido,
+  2026-12-18, mismo activo subyacente y mismo mercado, instrumento
+  correcto - PUT, no CALL), y (ii) la distribucion empirica real de
+  retornos a 5 ruedas del ADR a 10 anios (ya disponible, sin cambios).
+
+**Spread real medido en PUTS OTM (no calls) - book BYMA vivo, vencimiento
+2026-12-18, 2026-10-15:**
+
+| Strike | Moneyness (spot 5790) | Bid real | Ask real | Mid | Spread % del mid |
+|---|---|---|---|---|---|
+| 5600 | ~3.3% OTM | 219.207 | 224.984 | 222.10 | **2.60%** |
+| 5400 | ~6.7% OTM | 156.000 | 160.579 | 158.29 | **2.89%** |
+| 5200 | ~10.2% OTM | 103.384 | 115.014 | 109.20 | **10.65%** |
+
+Para comparacion honesta, el mismo strike en el book semanal real pero a
+T-1 (hoy, vence maniana - NO usable como credito de entrada, solo ilustra
+por que el book a T-1 no sirve): 5600 bid 12.405/ask 14.70 (16.9% del
+mid), 5400 bid 1.90/ask 2.20 (14.6%), 5200 bid 0.40/ask 0.67 (50.5%) - los
+premios son casi cero y el spread % se dispara por el tick minimo, exactamente
+el patron esperado a horas del vencimiento, no un spread de entrada real.
+
+**Limitacion explicita**: 2026-12-18 es un vencimiento mensual (2 meses),
+no semanal. Es razonable esperar que una serie semanal real tenga MENOS
+volumen/interes abierto que la mensual mas liquida del momento, por lo
+que el spread % real de la serie semanal en una entrada tipica
+probablemente sea IGUAL O PEOR (nunca mejor) que el medido aqui - este
+numero es, si acaso, optimista para H2, no pesimista.
+
+**Volatilidad real usada para escalar la distribucion empirica al
+regimen actual:**
+
+- Vol realizada 10 anios completos (serie diaria ADR, 2498 retornos
+  log validos): **64.91% anualizada**. VERIFIED (calculo directo, sin
+  modelo).
+- Vol realizada ultimas 60 ruedas ADR: **34.85% anualizada**. VERIFIED.
+- IV real de mercado HOY (promedio call/put ATM-ish, strikes 5600/5800/
+  6000, book mensual liquido 2026-12-18): **~44%**. VERIFIED (dato de
+  mercado, no supuesto).
+- IV real de mercado HOY, book semanal a T-1 (strike 5800 ATM):
+  **~68%** - se incluye como sensibilidad alta porque un book a T-1
+  puede sobre-estimar IV por ruido de microestructura cerca del
+  vencimiento; no se descarta, se marca como limite superior razonable.
+
+**Test definitivo: costo esperado empirico (10y ADR, 5 ruedas, rolling)
+vs. credito de mercado realista (BS al IV real de hoy, con el haircut de
+spread real de puts OTM medido arriba), para dos pares de strikes
+BYMA reales (incrementos de 200 ARS) que sandwichean el ~5%/~10% OTM
+pedido:**
+
+| Regimen de vol usado para escalar | Par (short/long) | Costo esperado empirico (ARS/contrato) | Credito realista (ARS/contrato) | Edge | Veredicto |
+|---|---|---|---|---|---|
+| Sin escalar (distribucion cruda 10y) | 5600/5200 (~3.3%/~10.2%) | 68.34 | n/a* | - | - |
+| Sin escalar (distribucion cruda 10y) | 5400/5200 (~6.7%/~10.2%) | 21.72 | n/a* | - | - |
+| Escalado a IV mensual real hoy (44%) | 5600/5200 | 38.38 | 35.22 | **-3.16** | **DESCARTA** |
+| Escalado a IV mensual real hoy (44%) | 5400/5200 | 9.86 | 6.80 | **-3.06** | **DESCARTA** |
+| Escalado a IV semanal T-1 (68%, sensib. alta) | 5600/5200 | 72.37 | 72.27 | **-0.09** | **DESCARTA** |
+| Escalado a IV semanal T-1 (68%, sensib. alta) | 5400/5200 | 23.60 | 23.00 | **-0.60** | **DESCARTA** |
+| Escalado a vol realizada reciente 60r (34.85%) | 5600/5200 | 24.74 | 20.24 | **-4.49** | **DESCARTA** |
+| Escalado a vol realizada reciente 60r (34.85%) | 5400/5200 | 5.44 | 2.28 | **-3.16** | **DESCARTA** |
+
+\* La fila "sin escalar" usa la cola de riesgo cruda de 10 anios (incluye
+PASO 2019, devaluaciones, crashes) sin fijar un sigma de credito
+consistente - se omite el credito ahi porque mezclar una distribucion de
+cola de 10 anios con un credito de regimen "actual" no es comparable
+apples-to-apples; igual se deja el costo esperado (68.34 y 21.72) para
+contexto: es muy superior a cualquier credito realista en cualquier
+regimen, asi que no cambia el veredicto, lo refuerza.
+
+**Probabilidad empirica de que la pata corta termine ITM al vencimiento
+(conteo directo sobre la serie real, no BS)**, para contexto frente al
+"win rate de breakeven" de la seccion anterior:
+
+| Regimen escalado | Short 5600 (~3.3% OTM) | Short 5400 (~6.7% OTM) |
+|---|---|---|
+| Sin escalar | 32.05% | 15.64% |
+| IV mensual 44% | 24.07% | 7.78% |
+| IV semanal T-1 68% | 33.05% | 16.97% |
+| Vol realizada 60r 34.85% | 18.25% | 4.69% |
+
+Confirma, con el instrumento correcto esta vez (puts OTM, no calls ATM),
+el mismo patron que la seccion anterior ya habia encontrado con el
+instrumento equivocado: la probabilidad empirica de ITM de la pata corta
+(4.7%-33%, segun regimen) es sistematicamente mayor que lo que un win
+rate de breakeven del 98.56% (BS, implicando ~1.44% de probabilidad de
+perdida) asumiria. La magnitud exacta de la brecha cambia con el
+regimen, pero el signo y la conclusion cualitativa no.
+
+**VEREDICTO (reemplaza cualquier numero de spread de la seccion
+anterior basado en calls ATM)**: en los 6 escenarios con credito
+calculable (2 pares de strikes x 3 regimenes de vol, cubriendo desde vol
+realizada reciente hasta el extremo superior de IV semanal observado
+hoy), el edge (credito realista - costo esperado empirico) es **negativo
+en los 6**. No hay un regimen de vol dentro del rango real observado
+hoy en el que el credito de mercado realista supere la perdida esperada
+empirica. Regla pre-acordada con el usuario ("si el credito de mercado
+es menor que la perdida esperada empirica, H2 se descarta en este
+regimen"): **H2 se descarta bajo el regimen de vol actual, con el
+instrumento correcto (puts OTM) y spread real medido del book liquido
+disponible hoy.** Se mantiene la clasificacion de la seccion anterior
+("datos acumulandose", no "sobrevive") - este test la refuerza con el
+instrumento corregido en vez de cambiarla.
+
+**Lo que haria falta para cerrar esto sin ninguna limitacion**: capturar
+en vivo, durante varias semanas consecutivas, el book real de
+`weekly_asymmetric` en el momento exacto de entrada (lunes, ~5 dias
+calendario al vencimiento) via `market_snapshots.csv` (que ya loguea
+`option_type`, `bid`, `ask` por contrato - simplemente no tiene filas
+todavia en este sandbox) o repitiendo esta misma consulta al chain en
+vivo cada lunes. Esto es exactamente el tipo de dato que la Tarea 4 (ver
+mas abajo) y el congelamiento de 3 semanas (Tarea 3) estan pensados para
+acumular.
 
 ## Pre-registro — Hipotesis 1: Provision de liquidez
 
