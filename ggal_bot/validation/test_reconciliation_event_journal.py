@@ -48,11 +48,12 @@ def _write_journal(path: Path, rows) -> None:
             w.writerow([row.get(col, "") for col in _HEADER])
 
 
-def _ev(ts, event_type, position_id, symbol, strategy_tag, side, delta, after, price, reason=""):
+def _ev(ts, event_type, position_id, symbol, strategy_tag, side, delta, after, price, reason="", contract_key=""):
     return {
         "timestamp_utc": ts, "event_type": event_type, "position_id": position_id,
         "symbol": symbol, "strategy_tag": strategy_tag, "side": side,
         "quantity_delta": delta, "quantity_after": after, "price": price, "reason": reason,
+        "contract_key": contract_key,
     }
 
 
@@ -317,3 +318,91 @@ def test_missing_journal_file_returns_empty_without_error(tmp_path):
     positions, warnings = reconstruct_positions_from_event_journal(csv_path=tmp_path / "no_existe.csv")
     assert positions == []
     assert warnings == []
+
+
+# ---------------------------------------------------------------------------
+# PRIORIDAD 1 (2026-10-21): regresion exacta del bug real encontrado en
+# produccion DESPUES de deployar el primer fix de expiry_handler.py (commit
+# 8ac2b38) - export fresco de Northflank a las 2026-10-21T18:46 mostro CERO
+# eventos EXPIRY y el kill switch seguia rechazando con el mismo delta de
+# siempre, pese al redeploy. Causa real: reconstruct_positions_from_event_journal
+# dejaba `expiry=None` para cualquier simbolo que ya no estuviera en el
+# option_chain vivo (es decir, TODAS las opciones vencidas - el caso exacto
+# que expiry_handler.close_expired_positions necesita para poder actuar), asi
+# que una Position reconstruida en CUALQUIER restart posterior quedaba
+# invisible para esa guardia para siempre, aunque su vencimiento real ya
+# estuviera en el contract_key que el journal trae desde la ENTRY original.
+# Este test reproduce esa reconstruccion (option_chain=None, igual que
+# "simbolo vencido, ya no esta en la cadena viva") y encadena el resultado
+# directo a close_expired_positions para probar que el ciclo completo
+# (restart -> reconciliacion -> cierre por vencimiento) ya funciona de punta
+# a punta, no solo que expiry quedo poblado.
+# ---------------------------------------------------------------------------
+
+def test_expired_symbol_off_live_chain_recovers_expiry_from_contract_key(tmp_path):
+    """
+    ENTRY con contract_key="GGAL|GFGC6400OC|2026-10-16" (vencida) y
+    option_chain=None (simbolo ya fuera de la cadena viva, igual que en
+    produccion tras el vencimiento del 16/10) - la Position reconstruida
+    debe traer expiry=2026-10-16 recuperado del contract_key, NUNCA None,
+    y su contract_key propio debe reconstruirse consistente con esa fecha.
+    """
+    from datetime import date
+
+    path = tmp_path / "position_events.csv"
+    _write_journal(path, [
+        _ev("2026-09-25T14:00:00+00:00", "ENTRY", "exp1", "GFGC6400OC", "weekly_asymmetric",
+            "buy", 3.0, 3.0, 150.0, contract_key="GGAL|GFGC6400OC|2026-10-16"),
+    ])
+
+    positions, _warnings = reconstruct_positions_from_event_journal(
+        csv_path=path, option_multiplier=100.0, option_chain=None,
+    )
+
+    assert len(positions) == 1
+    pos = positions[0]
+    assert pos.expiry == date(2026, 10, 16), (
+        f"expiry deberia recuperarse del contract_key de la ENTRY original, no quedar None "
+        f"(bug real: close_expired_positions nunca puede tocar una Position con expiry=None). "
+        f"Obtenido: {pos.expiry!r}"
+    )
+    assert pos.contract_key == "GGAL|GFGC6400OC|2026-10-16"
+    assert pos.greeks_per_unit is None  # sigue sin griegas vigentes - eso no cambia con este fix
+
+
+def test_expired_symbol_recovered_via_contract_key_is_then_closeable_by_expiry_handler(tmp_path):
+    """
+    Punta a punta: una Position reconstruida tras un restart (expiry
+    recuperado del contract_key, exactamente como en produccion) debe ser
+    EFECTIVAMENTE cerrable por expiry_handler.close_expired_positions - no
+    alcanza con que expiry quede poblado, tiene que alcanzar para que la
+    guardia completa funcione.
+    """
+    from datetime import datetime, timezone
+
+    from ggal_bot.portfolio.event_journal import PositionEventJournal
+    from ggal_bot.portfolio.expiry_handler import close_expired_positions
+    from ggal_bot.portfolio.portfolio import Portfolio
+
+    events_path = tmp_path / "position_events.csv"
+    _write_journal(events_path, [
+        _ev("2026-09-25T14:00:00+00:00", "ENTRY", "exp2", "GFGC6400OC", "weekly_asymmetric",
+            "buy", 3.0, 3.0, 150.0, contract_key="GGAL|GFGC6400OC|2026-10-16"),
+    ])
+
+    positions, _warnings = reconstruct_positions_from_event_journal(
+        csv_path=events_path, option_multiplier=100.0, option_chain=None,
+    )
+    assert len(positions) == 1
+
+    portfolio = Portfolio()
+    for p in positions:
+        portfolio.add(p)
+
+    journal = PositionEventJournal(path=tmp_path / "position_events_out.csv")
+    now = datetime(2026, 10, 21, 20, 0, tzinfo=timezone.utc)  # bien despues del cierre del 16/10
+    closures = close_expired_positions(portfolio, journal, spot=7000.0, now=now)
+
+    assert len(closures) == 1, "la posicion recuperada via contract_key debe quedar cerrable por vencimiento"
+    assert closures[0].symbol == "GFGC6400OC"
+    assert portfolio.positions[0].quantity == 0.0

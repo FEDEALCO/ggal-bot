@@ -72,6 +72,32 @@ logger = logging.getLogger("ggal_bot.portfolio.expiry_handler")
 _SYMBOL_RE = re.compile(r"^GFG([CV])(\d+)[A-Z]*$")
 
 
+def parse_contract_key_expiry(contract_key: Optional[str]) -> Optional[date]:
+    """
+    Extrae el vencimiento real de un contract_key "underlying|symbol|YYYY-MM-DD"
+    (mismo formato que ggal_bot.backtest.attribution.parse_contract_key_expiry -
+    duplicada aca por la misma razon de capas separadas que
+    parse_option_type_and_strike arriba). Devuelve None si el campo esta
+    vacio o no matchea ese formato - NUNCA fabrica una fecha.
+
+    `contract_key` acepta explicitamente `Any`, no solo `Optional[str]`: un
+    llamador que lee position_events.csv con pandas (ver dashboard/
+    pnl_engine.py::load_position_events) recibe `float('nan')` en vez de
+    None/"" para una celda vacia - `nan` es "truthy" en Python (bool(nan)
+    is True), asi que un simple `if not contract_key` NO lo filtra y
+    `.split()` explota. `isinstance(..., str)` lo cubre sin ambiguedad.
+    """
+    if not isinstance(contract_key, str) or not contract_key:
+        return None
+    parts = contract_key.split("|")
+    if len(parts) != 3:
+        return None
+    try:
+        return date.fromisoformat(parts[2])
+    except ValueError:
+        return None
+
+
 def parse_option_type_and_strike(symbol: str) -> Optional[tuple]:
     """Extrae (option_type, strike) de un ticker GGAL ("call"/"put", float).
     Devuelve None si el symbol no matchea el patron conocido - NUNCA fabrica

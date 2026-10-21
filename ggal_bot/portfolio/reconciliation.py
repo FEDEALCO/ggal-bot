@@ -159,6 +159,7 @@ from typing import List, Optional, Tuple
 
 from ggal_bot import paths
 from ggal_bot.config import SETTINGS
+from ggal_bot.portfolio.expiry_handler import parse_contract_key_expiry
 from ggal_bot.portfolio.portfolio import Position
 
 logger = logging.getLogger("ggal_bot.portfolio.reconciliation")
@@ -424,6 +425,7 @@ def _fifo_remaining_lot(events: List[dict]) -> Tuple[Optional[dict], List[dict]]
             queue.append({
                 "quantity": delta, "price": ev["price"],
                 "entry_time": ev["timestamp_utc"], "position_id": ev["position_id"],
+                "contract_key": ev.get("contract_key"),
             })
             continue
 
@@ -456,6 +458,15 @@ def _fifo_remaining_lot(events: List[dict]) -> Tuple[Optional[dict], List[dict]]
         # el journal registro para este (symbol, strategy_tag), la mas
         # razonable para seguir usando de ahora en mas (ver "BUG B").
         "position_id": last_event["position_id"] if last_event is not None else oldest["position_id"],
+        # contract_key (PRIORIDAD 1, 2026-10-21, ver expiry_handler.py):
+        # el que el journal ya trae en la pata de ENTRY/ADD mas vieja
+        # sobreviviente - es la MISMA identidad de contrato para todo el
+        # grupo (ver check_position_id_consistency en
+        # audit_journal_invariants.py, que ya lo exige). Se preserva aca
+        # para que reconstruct_positions_from_event_journal pueda recuperar
+        # el vencimiento REAL de una base que ya no esta en el option_chain
+        # vigente (vencida) sin tener que volver a consultar la cadena viva.
+        "contract_key": oldest.get("contract_key"),
     }
     return remaining, orphans
 
@@ -554,6 +565,21 @@ def reconstruct_positions_from_event_journal(
             quote = option_chain.get(symbol) if option_chain is not None else None
             if quote is not None:
                 expiry = quote.expiry
+            else:
+                # PRIORIDAD 1 (2026-10-21, ver expiry_handler.py): la base ya
+                # no esta en la cadena viva (vencida o rolleada) - antes esto
+                # dejaba `expiry=None` sin mas, lo que a su vez dejaba
+                # `new_pos.contract_key=None` mas abajo. Resultado real
+                # verificado en produccion: expiry_handler.close_expired_positions
+                # NUNCA se fabrica un vencimiento, asi que una Position
+                # reconstruida con expiry=None queda invisible para esa
+                # guardia en TODOS los restarts siguientes, aunque su
+                # vencimiento real sea perfectamente conocido - ya esta en el
+                # contract_key que el journal trae desde la ENTRY original
+                # (ver remaining["contract_key"] en _fifo_remaining_lot).
+                # Recuperarlo de ahi no fabrica nada: es el mismo dato real
+                # que ya se habia logueado al abrir la posicion.
+                expiry = parse_contract_key_expiry(remaining.get("contract_key"))
             if quote is not None and quote.greeks is not None:
                 greeks_per_unit = quote.greeks
             else:
