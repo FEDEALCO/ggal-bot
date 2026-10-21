@@ -67,6 +67,29 @@ VALID_EVENT_TYPES = (
     # igual que CLOSE), pero queda distinguible por su propio event_type
     # para que el dashboard pueda separar PnL antes/despues del reset.
     "SHADOW_RESET",
+    # EXPIRY (PRIORIDAD 1, 2026-10-21, bug de riesgo permitido durante el
+    # freeze - ver FREEZE.md): cierre AUTOMATICO de una Position cuyo
+    # vencimiento real (Position.expiry) ya paso - ver
+    # portfolio/expiry_handler.py::close_expired_positions. Hallazgo real
+    # que lo motiva: las 8 posiciones abiertas de la serie de Octubre
+    # (vencimiento real 2026-10-16, ver contract_key en cada una) seguian
+    # "abiertas" en Portfolio.positions 5 dias despues de vencer, cada una
+    # aportando su delta CONGELADO al momento del ultimo fill (ver
+    # Position.greeks_per_unit - "nunca se refresca post-creacion", ver
+    # docstring de reconciliation.py) al chequeo de riesgo direccional
+    # agregado de kill_switch.py (RiskLimitsConfig.max_portfolio_delta_ars) -
+    # un delta fantasma de una opcion que ya no existe, imposible de volver
+    # a cero por falta de cotizacion viva (el feed dejo de cotizarla al
+    # vencer). Mismo patron EXACTO que SHADOW_RESET (arriba): se trata como
+    # un cierre mas para reconstruct_positions_from_event_journal() (ver
+    # reconciliation.py) y para reconstruct_lifecycle_trades()/
+    # reconstruct_open_positions() (ver backtest/reconstruct.py) - consume
+    # el lote FIFO igual que CLOSE, pero queda distinguible por su propio
+    # event_type (`reason` indica "expiry_otm" o "expiry_itm_ejercicio_supuesto",
+    # `price` es el valor intrinseco contra el spot de cierre de ese dia,
+    # NUNCA una cotizacion de mercado real - no existe para un contrato
+    # vencido).
+    "EXPIRY",
 )
 
 

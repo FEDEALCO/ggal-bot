@@ -44,6 +44,7 @@ from ggal_bot.models.volatility_surface import VolatilitySurface
 from ggal_bot.models.black_scholes import BlackScholesGreeks
 from ggal_bot.portfolio.portfolio import Portfolio, Position
 from ggal_bot.portfolio.event_journal import PositionEventJournal
+from ggal_bot.portfolio.expiry_handler import close_expired_positions
 from ggal_bot.portfolio.portfolio_greeks_log import PortfolioGreeksLogger
 from ggal_bot.data.market_snapshot_log import MarketSnapshotLogger
 from ggal_bot.data.signal_funnel_log import SignalFunnelLogger
@@ -1181,6 +1182,25 @@ class GgalOptionsBot:
         # no-op completo, sin ningun poll HTTP adicional.
         if SETTINGS.shadow.enable_ccl_bond_quote_log:
             self.ccl_bond_quote_log.fetch_and_log()
+
+        # Cierre automatico de posiciones vencidas (PRIORIDAD 1, 2026-10-21,
+        # ver RiskConfig.enable_expiry_autoclose y
+        # ggal_bot/portfolio/expiry_handler.py para el bug real que esto
+        # corrige) - DELIBERADAMENTE antes del kill switch de abajo: una
+        # Position vencida cerrada aca YA no aporta su delta congelado al
+        # chequeo de riesgo direccional agregado de este mismo ciclo (ver
+        # docstring del modulo). Default ON (guardia que reduce riesgo,
+        # nunca abre exposicion nueva - mismo criterio que
+        # enable_quote_gap_backstop/enable_itm_short_leg_assignment_guard).
+        if SETTINGS.risk.enable_expiry_autoclose:
+            expired = close_expired_positions(
+                self.portfolio, self.position_event_journal, spot=spot,
+            )
+            if expired:
+                logger.warning(
+                    "expiry_handler: %d posicion(es) cerrada(s) por vencimiento este ciclo: %s",
+                    len(expired), [c.symbol for c in expired],
+                )
 
         # Kill switch centralizado (Fase 5.3, ver ggal_bot/risk/kill_switch.py):
         # se evalua ANTES de correr el escaneo de entradas de este ciclo,

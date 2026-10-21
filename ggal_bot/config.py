@@ -708,6 +708,35 @@ class RiskConfig:
     enable_preemptive_greeks_budget: bool = _env_bool("GGAL_BOT_ENABLE_PREEMPTIVE_GREEKS_BUDGET", False)
     preemptive_greeks_budget_fraction: float = _env_float("GGAL_BOT_PREEMPTIVE_GREEKS_BUDGET_FRACTION", 0.85)
 
+    # --- Cierre automatico de posiciones vencidas (PRIORIDAD 1, 2026-10-21) ---
+    # BUG REAL DE RIESGO (permitido durante el freeze de 3 semanas, ver
+    # FREEZE.md: "solo bugs de integridad de datos o riesgo"), hallado
+    # analizando un export real de Northflank (ver RESEARCH.md): las 8
+    # posiciones abiertas de produccion en ese momento eran TODAS de la
+    # serie de Octubre, vencida el 2026-10-16 - 5 dias antes del export.
+    # Ninguna se cerro sola porque nada en el codigo cerraba una Position
+    # por vencimiento (ver portfolio/expiry_handler.py). Dos consecuencias
+    # reales y verificadas contra el codigo:
+    #   1. Mientras el proceso sigue corriendo SIN restart, cada una sigue
+    #      aportando su Position.greeks_per_unit CONGELADO al momento del
+    #      ultimo fill (nunca se refresca post-creacion, ver docstring de
+    #      portfolio/reconciliation.py) al delta agregado de
+    #      Portfolio.total_greeks() - un delta fantasma de opciones que ya
+    #      no existen, que alimenta directamente
+    #      RiskLimitsConfig.max_portfolio_delta_ars (kill_switch.py).
+    #   2. Tras cualquier restart/redeploy, reconciliation.py reconstruye
+    #      el portfolio y, al no encontrar estos simbolos en la cadena viva
+    #      (vencieron, el feed dejo de cotizarlos), les asigna
+    #      greeks_per_unit=None -> Portfolio.has_unknown_greeks()=True ->
+    #      RiskManager.should_halt_new_positions() devuelve True
+    #      INCONDICIONALMENTE (ver risk/risk_manager.py), bloqueando
+    #      entradas nuevas sin importar el delta.
+    # Es una guardia que REDUCE riesgo (nunca abre exposicion nueva, solo
+    # cierra una posicion YA vencida, a su valor intrinseco real contra el
+    # spot de cierre) - mismo criterio que enable_itm_short_leg_assignment_guard/
+    # enable_quote_gap_backstop de arriba: default TRUE, no opt-in.
+    enable_expiry_autoclose: bool = _env_bool("GGAL_BOT_ENABLE_EXPIRY_AUTOCLOSE", True)
+
 
 # ---------------------------------------------------------------------------
 # Kill switch y limites de riesgo CENTRALIZADOS a nivel de portfolio

@@ -43,7 +43,14 @@ from typing import Dict, List, Optional, Tuple
 from dashboard.pnl_engine import multiplier_for_symbol
 
 _ENTRY_EVENT_TYPES = ("ENTRY", "ADD")
-_EXIT_EVENT_TYPES = ("REDUCE", "PARTIAL_EXIT", "CLOSE")
+# EXPIRY (PRIORIDAD 1, 2026-10-21, ver ggal_bot/portfolio/event_journal.py):
+# cierre automatico por vencimiento - mismo trato que CLOSE para esta
+# reconstruccion (consume cantidad, cuenta como salida con PnL real al
+# valor intrinseco logueado en su propia fila `price`). _TERMINAL_EVENT_TYPES
+# es lo que decide "esta posicion ya termino dentro de la ventana" (antes
+# solo era `== "CLOSE"` - ver los dos usos abajo).
+_EXIT_EVENT_TYPES = ("REDUCE", "PARTIAL_EXIT", "CLOSE", "EXPIRY")
+_TERMINAL_EVENT_TYPES = ("CLOSE", "EXPIRY")
 
 # Mapeo columna-en-español (tal como las exporta dashboard/app.py, ver
 # tab_lifecycle) -> nombre de campo interno (mismas claves que
@@ -232,7 +239,7 @@ def reconstruct_lifecycle_trades(
         pos_rows = by_position[pid]
         entry_rows = [r for r in pos_rows if r.get("event_type") in _ENTRY_EVENT_TYPES]
         exit_rows = [r for r in pos_rows if r.get("event_type") in _EXIT_EVENT_TYPES]
-        close_rows = [r for r in pos_rows if r.get("event_type") == "CLOSE"]
+        close_rows = [r for r in pos_rows if r.get("event_type") in _TERMINAL_EVENT_TYPES]
 
         position_still_open = not close_rows
         if position_still_open:
@@ -418,10 +425,10 @@ def reconstruct_open_positions(
 
     for pid in order:
         pos_rows = by_position[pid]
-        close_rows = [r for r in pos_rows if r.get("event_type") == "CLOSE"]
+        close_rows = [r for r in pos_rows if r.get("event_type") in _TERMINAL_EVENT_TYPES]
         if close_rows:
             closed_count += 1
-            continue  # ya cerrada - la cubre reconstruct_lifecycle_trades, no se duplica aca
+            continue  # ya cerrada (CLOSE o EXPIRY) - la cubre reconstruct_lifecycle_trades, no se duplica aca
 
         entry_rows = [r for r in pos_rows if r.get("event_type") in _ENTRY_EVENT_TYPES]
         symbol = str(pos_rows[0].get("symbol") or "")

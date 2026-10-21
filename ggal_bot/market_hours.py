@@ -107,3 +107,29 @@ def is_within_byma_session(now_utc: Optional[datetime] = None) -> bool:
     hour_frac = art.hour + art.minute / 60.0
     end_hour = _session_end_hour_art(art.date())
     return BYMA_SESSION_START_HOUR_ART <= hour_frac < end_hour
+
+
+def art_date(now_utc: Optional[datetime] = None) -> date:
+    """Fecha calendario en ART (ver ART_OFFSET_HOURS arriba) de `now_utc`
+    (o el momento actual si se omite). Unica fuente de verdad para "que
+    dia es HOY en ART" - ver portfolio/expiry_handler.py, que la usa para
+    decidir si una opcion ya vencio (nunca convierte UTC->ART con su
+    propia aritmetica, para no divergir de este modulo)."""
+    now_utc = _to_aware_utc(now_utc) if now_utc is not None else datetime.now(timezone.utc)
+    return (now_utc + timedelta(hours=ART_OFFSET_HOURS)).date()
+
+
+def is_after_session_close(now_utc: Optional[datetime] = None) -> bool:
+    """True si `now_utc` (o el momento actual) ya cruzo la hora de cierre
+    de la rueda BYMA de SU PROPIA fecha calendario ART - a diferencia de
+    is_within_byma_session() (que tambien es False antes de la apertura o
+    en fin de semana, porque responde "esta la rueda abierta ahora"), esta
+    funcion responde unicamente "ya paso el cierre de hoy" (True tambien
+    en fin de semana / fuera de dias habiles, porque el cierre del ultimo
+    dia habil ya quedo atras). Pensada para portfolio/expiry_handler.py:
+    una opcion que vence HOY se cierra recien cuando esto es True, nunca
+    antes de que la rueda de hoy termine."""
+    now_utc = _to_aware_utc(now_utc) if now_utc is not None else datetime.now(timezone.utc)
+    art = now_utc + timedelta(hours=ART_OFFSET_HOURS)
+    hour_frac = art.hour + art.minute / 60.0
+    return hour_frac >= _session_end_hour_art(art.date())

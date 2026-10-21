@@ -129,7 +129,10 @@ def load_journal(path: str) -> pd.DataFrame:
 
 def check_long_only(df: pd.DataFrame) -> List[Violation]:
     violations = []
-    effective = df[df["event_type"].isin(["ENTRY", "PARTIAL_EXIT", "CLOSE"])]
+    # EXPIRY (PRIORIDAD 1, 2026-10-21, ver ggal_bot/portfolio/event_journal.py):
+    # cierre automatico por vencimiento - mismo trato que CLOSE (siempre
+    # deja quantity_after=0, nunca abre una posicion nueva).
+    effective = df[df["event_type"].isin(["ENTRY", "PARTIAL_EXIT", "CLOSE", "EXPIRY"])]
     # Excepcion explicita (ver docstring del modulo, punto 1): el wing
     # corto de un spread completion de weekly_asymmetric abre en negativo
     # por diseño - no es una venta en descubierto real.
@@ -174,16 +177,20 @@ def check_position_id_consistency(df: pd.DataFrame) -> List[Violation]:
 
 def check_close_is_terminal(df: pd.DataFrame) -> List[Violation]:
     violations = []
+    # EXPIRY (PRIORIDAD 1, 2026-10-21) es tan terminal como CLOSE (ver
+    # event_journal.py) - se trata exactamente igual aca, "CLOSE" en los
+    # mensajes de abajo abarca ambos.
+    terminal_types = ["CLOSE", "EXPIRY"]
     with_id = df[df["position_id"].notna() & (df["position_id"] != "")]
     for position_id, group in with_id.groupby("position_id"):
         group = group.sort_values("timestamp_utc")
-        close_rows = group[group["event_type"] == "CLOSE"]
+        close_rows = group[group["event_type"].isin(terminal_types)]
         if close_rows.empty:
             continue
         if len(close_rows) > 1:
             violations.append(Violation(
                 "close_is_terminal", "HIGH",
-                f"position_id={position_id} tiene {len(close_rows)} eventos CLOSE "
+                f"position_id={position_id} tiene {len(close_rows)} eventos CLOSE/EXPIRY "
                 f"(se esperaba a lo sumo 1).",
             ))
         last_close_ts = close_rows["timestamp_utc"].max()
@@ -192,14 +199,14 @@ def check_close_is_terminal(df: pd.DataFrame) -> List[Violation]:
             violations.append(Violation(
                 "close_is_terminal", "CRITICAL",
                 f"position_id={position_id}: hay {len(after_close)} evento(s) DESPUES "
-                f"del CLOSE ({last_close_ts}): {list(after_close['event_type'])}",
+                f"del CLOSE/EXPIRY ({last_close_ts}): {list(after_close['event_type'])}",
             ))
         last_close_row = close_rows.loc[close_rows["timestamp_utc"].idxmax()]
         qty_after = last_close_row.get("quantity_after")
         if pd.notna(qty_after) and qty_after != 0:
             violations.append(Violation(
                 "close_is_terminal", "HIGH",
-                f"position_id={position_id}: CLOSE en {last_close_ts} deja "
+                f"position_id={position_id}: CLOSE/EXPIRY en {last_close_ts} deja "
                 f"quantity_after={qty_after} (se esperaba 0).",
             ))
     return violations
@@ -242,7 +249,8 @@ def check_orphaned_open_positions(df: pd.DataFrame, now: datetime = None) -> Lis
     now = now or datetime.now(timezone.utc)
     with_id = df[df["position_id"].notna() & (df["position_id"] != "")]
     for position_id, group in with_id.groupby("position_id"):
-        has_terminal = (group["event_type"] == "CLOSE").any()
+        # EXPIRY (PRIORIDAD 1, 2026-10-21) cuenta como terminal igual que CLOSE.
+        has_terminal = group["event_type"].isin(["CLOSE", "EXPIRY"]).any()
         has_entry = (group["event_type"] == "ENTRY").any()
         if has_entry and not has_terminal:
             first_entry_ts = group[group["event_type"] == "ENTRY"]["timestamp_utc"].min()
@@ -262,7 +270,10 @@ def check_orphaned_open_positions(df: pd.DataFrame, now: datetime = None) -> Lis
 def check_cumulative_long_only_ledger(df: pd.DataFrame) -> List[Violation]:
     """Ver punto 7 del docstring del modulo."""
     violations = []
-    effective = df[df["event_type"].isin(["ENTRY", "PARTIAL_EXIT", "CLOSE", "REDUCE", "ADD"])].copy()
+    # EXPIRY (PRIORIDAD 1, 2026-10-21) es un evento que reduce la cantidad
+    # igual que CLOSE/PARTIAL_EXIT - se incluye para que el acumulado
+    # long-only refleje el cierre real.
+    effective = df[df["event_type"].isin(["ENTRY", "PARTIAL_EXIT", "CLOSE", "REDUCE", "ADD", "EXPIRY"])].copy()
     is_spread_completion_wing = effective.get("reason", pd.Series(dtype=object)) == "spread_completion"
     effective = effective[~is_spread_completion_wing]
     effective = effective.sort_values("timestamp_utc")

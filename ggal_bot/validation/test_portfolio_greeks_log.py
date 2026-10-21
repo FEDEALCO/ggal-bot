@@ -155,7 +155,6 @@ def test_recompute_cycle_wires_portfolio_greeks_log_with_portfolio_and_per_strat
     abajo), y tmp_path no esta disponible fuera de pytest.
     """
     import tempfile
-    from datetime import date
 
     from ggal_bot.validation import _shadow_audit_isolation  # noqa: F401
     from ggal_bot.config import SETTINGS
@@ -180,7 +179,18 @@ def test_recompute_cycle_wires_portfolio_greeks_log_with_portfolio_and_per_strat
                 symbol="GFGC7000OC", quantity=2, multiplier=100,
                 entry_price=100.0, entry_time=datetime.now(timezone.utc) - timedelta(days=1),
                 greeks_per_unit={"delta": 0.5, "gamma": 0.01, "vega": 1.0, "theta": -1.0},
-                expiry=date(2026, 10, 16), strategy_tag="weekly_asymmetric",
+                # Vencimiento a futuro RELATIVO a "ahora" (no una fecha fija) a
+                # proposito (PRIORIDAD 1, 2026-10-21): desde que
+                # RiskConfig.enable_expiry_autoclose esta default ON (ver
+                # portfolio/expiry_handler.py), recompute_cycle() cierra
+                # automaticamente cualquier Position cuyo `expiry` ya paso -
+                # una fecha fija (2026-10-16) terminaria "venciendo" sola el
+                # dia que el calendario real la alcance, rompiendo este test
+                # sin que el bug sea del codigo. Este test no ejercita
+                # expiry_handler (ver test_expiry_handler.py para eso), asi
+                # que simplemente se mantiene la posicion bien lejos de vencer.
+                expiry=(datetime.now(timezone.utc) + timedelta(days=60)).date(),
+                strategy_tag="weekly_asymmetric",
             ))
 
             bot.recompute_cycle()

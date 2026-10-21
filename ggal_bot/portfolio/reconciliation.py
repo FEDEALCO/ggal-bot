@@ -508,10 +508,16 @@ def reconstruct_positions_from_event_journal(
     if df.empty:
         return [], warnings
 
-    # SHADOW_RESET (Tarea #27 item 5) se incluye junto a los cierres
-    # normales - _fifo_remaining_lot la consume igual que un CLOSE (no esta
-    # en ("ENTRY","ADD"), cae a la rama de reduccion generica).
-    df = df[df["event_type"].isin(("ENTRY", "ADD", "REDUCE", "PARTIAL_EXIT", "CLOSE", "SHADOW_RESET"))].copy()
+    # SHADOW_RESET (Tarea #27 item 5) y EXPIRY (PRIORIDAD 1, 2026-10-21, ver
+    # event_journal.py) se incluyen junto a los cierres normales -
+    # _fifo_remaining_lot las consume igual que un CLOSE (no estan en
+    # ("ENTRY","ADD"), caen a la rama de reduccion generica) - CRITICO para
+    # EXPIRY: sin esto, una posicion cerrada por vencimiento volveria a
+    # reconstruirse como abierta en cada restart del bot (exactamente el
+    # bug real que motiva EXPIRY), porque esta funcion es la que arma el
+    # Portfolio en memoria al arrancar (ver run_bot.py::
+    # _reconcile_portfolio_on_startup).
+    df = df[df["event_type"].isin(("ENTRY", "ADD", "REDUCE", "PARTIAL_EXIT", "CLOSE", "SHADOW_RESET", "EXPIRY"))].copy()
     if df.empty:
         return [], warnings
     df["quantity_delta"] = _to_numeric(df["quantity_delta"])
