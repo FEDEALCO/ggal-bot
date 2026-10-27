@@ -1170,6 +1170,79 @@ ahora con un numero concreto en vez de cero.
 (Hipotesis 2 y 5 se pre-registran de la misma forma antes de correrlas -
 secciones a agregar aca mismo cuando empiecen.)
 
+## Pre-registro — Hipotesis 1b: señal de scalping + ejecucion pasiva
+
+**Pre-registrado 2026-10-27, ANTES de correr el modelo de fill contra
+`market_snapshots.csv`.** Pedido explicito del usuario: la señal de
+scalping ya mostro edge real al mid (ver "Descomposicion al mid" en la
+seccion de Hipotesis 5 arriba, +607 ARS/trade, IC95% positivo), pero el
+costo de EJECUTARLA (cruzar el spread + comision/derechos/IVA) se lo
+come. H1b pregunta: ¿sobrevive la señal si se ejecuta pasivamente (orden
+limite, no cruce) en vez de apagarla del todo?
+
+**Mecanismo (pre-registrado)**:
+- **Entrada**: cuando la señal dispara, se coloca una orden limite AL
+  MID vigente en ese momento (no se cruza el spread). Si no se llena
+  dentro de la ventana de timeout, la señal se descarta y **no se
+  entra** - sin costo de oportunidad mas alla de no tomar ese trade
+  (instruccion literal del usuario: "si no llena, no se entra").
+- **Salida**: se extiende la MISMA regla a la salida (limite al mid,
+  mismo timeout) - si no llena, se cruza el spread real para garantizar
+  el cierre, en vez de dejar una posicion de scalping abierta
+  indefinidamente. **Esto es una extension del pedido del usuario** (que
+  hablo solo de la entrada) a la salida, necesaria para poder medir el
+  resultado economico completo de un round-trip - se deja explicito como
+  decision de modelado, no como parte literal del pedido original.
+- **Timeout**: N=30 segundos como caso primario (decidido ahora, antes
+  de ver ningun resultado). Se reporta tambien N=10 y N=60 como analisis
+  de sensibilidad. Se eligio 30s por ser del orden de 5-8 polls del
+  propio sistema de snapshots (ver intervalo real medido abajo), ni tan
+  corto que casi nunca llene ni tan largo que sea irrealista para una
+  señal de scalping (tenencia mediana real de estos trades: 1,2 min).
+- **Modelo de fill CONSERVADOR** (exactamente como pidio el usuario): una
+  orden se considera llena UNICAMENTE si un `last_price` POSTERIOR (un
+  print real de trade, no solo el bid/ask tocando el limite) atraviesa el
+  precio limite dentro de la ventana de N segundos. Precio de fill = el
+  limite mismo (mid), nunca mejor que el limite (no se asume mejora de
+  precio por gap).
+- **Universo de prueba**: los 213 trades de scalping con bid/ask/mid real
+  registrado (post-fix `55d2f67`, 2026-10-05 a 2026-10-26) - mismo
+  dataset ya usado en la descomposicion al mid.
+
+**Metricas a reportar (pre-registradas)**: tasa de llenado de la entrada,
+de la salida, y de ambas patas juntas; PnL-al-mid de los trades llenados
+vs. no llenados (test de seleccion adversa: ¿los que llenan pasivamente
+tienen sistematicamente peor edge subsecuente que los que no llenan?);
+neto por escala de comision IOL (gold/platinum/black) sobre la submuestra
+de trades donde la entrada llena pasivamente (la salida sigue la regla de
+fallback de arriba).
+
+**Criterio de exito (definido AHORA, antes de ver resultados)**: H1b se
+considera soporte para una futura implementacion (sujeta a aprobacion
+del usuario - el freeze de 3 semanas sigue vigente, nada de esto se
+implementa en el bot todavia) si, en la escala **Black**: neto promedio
+por trade > 0 con IC95% bootstrap (mismo `bootstrap_ci` de
+`backtest/metrics.py`, 10.000 resamples, semilla 1234) enteramente > 0, Y
+al menos **30 trades** con la entrada llenada pasivamente en la muestra.
+Si no se cumple en Black (la escala con menor costo regulatorio), se
+considera NO soportada automaticamente en Gold/Platinum.
+
+**Limitacion de datos conocida de antemano (declarada antes de correr
+nada)**: `market_snapshots.csv` es polling periodico (intervalo real
+medido ~3-6 segundos para un simbolo liquido el 2026-10-22), no un feed
+de trades tick-by-tick - el modelo conservador de fill solo puede
+detectar un cruce si el polling capturo una fila con `last_price`
+distinto dentro de la ventana de N segundos, lo cual pone un piso de
+sensibilidad a esta medicion que no se puede mejorar con los datos
+disponibles. Ademas: no hay archivo de snapshots para 2026-10-05,
+10-06 ni 10-07 (3 de las 13 fechas con trades reales) - los trades de
+esos dias quedan como DATA INSUFFICIENT para este test especifico (se
+reportan aparte, no se descartan silenciosamente). El archivo del
+2026-10-08 es un outlier de tamaño (21,5M filas vs. ~1-2M filas/dia
+tipico, ya flagueado en la seccion de Hipotesis 1 sin investigar a
+fondo) - se incluye en este analisis pero sus resultados se reportan
+por separado para poder detectar si el outlier distorsiona algo.
+
 ## Hipotesis 5 (scalping) — VEREDICTO 2026-10-27: APAGAR
 
 **Decision del usuario, 2026-10-27, en base a evidencia real (no una
