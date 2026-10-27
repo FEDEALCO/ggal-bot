@@ -1139,13 +1139,51 @@ real, spread_round_trip_pct=0.0): **-86.497 ARS / 52 trades**. Los
 numeros de 6%/10% reportados en el chat esa misma tarde quedan
 RETRACTADOS.
 
-**Pendiente, alimenta Hipotesis 1**: descomponer estos mismos trades al
-`mid_at_fill` real (entrada y salida) contra `shadow_trades.csv` (+
-siblings `.schemaN.csv` rotados, todavia no bajados del volumen de
-Northflank) para separar PnL-al-mid / costo-de-spread-pagado /
-costos-regulatorios por trade, y asi saber si la señal de IV mean
-reversion tiene edge al mid (sin la fricción de cruzar el spread) - ver
-seccion a agregar aca mismo cuando esos datos lleguen.
+**Descomposicion al mid (2026-10-27, resuelve el pendiente de arriba)**:
+se bajo `shadow_trades.schema2.csv` (el sibling rotado del volumen de
+Northflank, cubre 2026-10-05 a 2026-10-26, con `bid_at_fill`/
+`ask_at_fill`/`mid_at_fill` reales por fill) y se joineo contra
+`position_events.csv` por `order_client_id`/`client_order_id` - 213 de
+213 trades de scalping con ambas patas en ese rango matchearon 1:1 (join
+completo, sin huecos). Para cada trade: `pnl_mid = (mid_salida -
+mid_entrada) * qty * mult` (el PnL que hubiera tenido llenando siempre al
+mid, sin fricción de spread), `costo_spread = pnl_mid - pnl_fill` (lo que
+cruzar el spread real le costo), `costo_regulatorio` = comision+derechos+
+IVA de `costs.py` sobre el notional real. Identidad verificada:
+`pnl_mid - costo_spread == pnl_fill` en los 213 casos (el join es
+consistente).
+
+| | n | PnL total | PnL promedio/trade | win% |
+|---|---|---|---|---|
+| Al FILL (real, ya reportado arriba) | 213 | -369.777 ARS | -1.736 | 17.8% |
+| **Al MID (sin fricción de spread)** | 213 | **+129.278 ARS** | **+607** | 49.8% |
+| Costo de spread pagado (mid→fill) | 213 | 499.055 ARS | 2.343 | - |
+| Costo regulatorio (comision+derechos+IVA) | 213 | 260.163 ARS | 1.221 | - |
+| Neto (fill - regulatorio, = fila de arriba de esta tabla) | 213 | -629.940 ARS | -2.957 | 8.0% |
+
+**Respuesta a "¿la señal tiene edge al mid?": SI** - IC95% bootstrap
+(5000 resamples) del PnL-al-mid promedio por trade: **[+59.8, +1.195.6]
+ARS/trade**, enteramente positivo, no cruza cero. La señal de IV mean
+reversion de scalping identifica movimientos reales en la dirección
+correcta con mas frecuencia de la que explicaria el azar. El problema NO
+es la señal: es que el costo de EJECUTARLA (cruzar el spread real +
+comision/derechos/IVA, ~3.564 ARS/trade combinados en promedio) es 5-6x
+mas grande que el edge que la señal genera (~607 ARS/trade al mid). Por
+dia, el costo de spread fue mas alto durante la serie de Octubre cerca de
+su vencimiento (hasta ~5.255 ARS/trade promedio el 16/10, el ultimo dia
+de esa serie) y bajo notablemente con la serie de Diciembre mas liquida
+desde el 21/10 (560-968 ARS/trade) - sigue siendo friccion grande, pero
+mejora con liquidez.
+
+**Conexion directa con Hipotesis 1 (provision de liquidez)**: esto
+cuantifica EXACTAMENTE lo que H1 propone capturar en vez de pagar -
+cotizar DENTRO del spread en vez de cruzarlo. Si una version de scalping
+pudiera capturar (no solo evitar pagar) una fraccion de esos ~2.343
+ARS/trade de costo de spread, combinado con el edge al mid ya positivo
+(~607 ARS/trade), el caso economico cambia por completo. Esto no revierte
+el veredicto APAGAR de hoy (la implementacion actual cruza el spread, no
+lo captura), pero es el primer dato real que conecta scalping con el
+pre-registro de H1 - a tener en cuenta cuando se testee esa hipotesis.
 
 **Descartado explicitamente (2026-10-27)**: escalar el tamaño de
 posicion para diluir un costo fijo por operacion. Verificado con el
