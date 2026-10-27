@@ -221,17 +221,25 @@ def test_bootstrap_universe_classifies_by_underlying_field_without_symbol_prefix
     identificarlas igual usando los campos semanticos que SI trae pyRofex
     (underlying, cficode, strike), sin depender del texto del simbolo.
     """
+    # BUG REAL 2026-10-27 (encontrado corriendo la suite completa, a pedido
+    # del usuario): este test tenia la fecha de vencimiento HARDCODEADA como
+    # literal "20261016". bootstrap_universe descarta (correctamente) toda
+    # opcion cuyo vencimiento ya paso (`expiry >= date.today()`), asi que en
+    # cuanto el reloj del sistema cruzo esa fecha el test empezo a fallar -
+    # no por un bug de produccion, sino porque el fixture quedo vencido. Se
+    # calcula relativo a `date.today()` para que nunca vuelva a vencer.
+    future_maturity = (date.today() + timedelta(days=60)).strftime("%Y%m%d")
     fake_instruments = [
         {"instrumentId": {"symbol": "MERV - XMEV - GGAL - 24hs"}, "underlying": "GGAL",
          "cficode": "ESXXXX", "strike": 0, "maturityDate": None},
         # Simbolo sin "GGAL"/"GFG" como texto: solo se identifica por underlying/cficode/strike.
         {"instrumentId": {"symbol": "RAROSYM123"}, "underlying": "GGAL",
-         "cficode": "OCASPS", "strike": 5400, "maturityDate": "20261016"},
+         "cficode": "OCASPS", "strike": 5400, "maturityDate": future_maturity},
         {"instrumentId": {"symbol": "OTHERSYM456"}, "underlying": "GGAL",
-         "cficode": "OPASPS", "strike": 4800, "maturityDate": "20261016"},
+         "cficode": "OPASPS", "strike": 4800, "maturityDate": future_maturity},
         # Futuro de GGAL: mismo underlying, pero sin strike y cficode no-opcion -> debe descartarse.
         {"instrumentId": {"symbol": "GGAL/OCT26"}, "underlying": "GGAL",
-         "cficode": "FXXXXX", "strike": 0, "maturityDate": "20261016"},
+         "cficode": "FXXXXX", "strike": 0, "maturityDate": future_maturity},
         # Otra especie: debe descartarse por underlying distinto.
         {"instrumentId": {"symbol": "MERV - XMEV - PAMP - 24hs"}, "underlying": "PAMP",
          "cficode": "ESXXXX", "strike": 0, "maturityDate": None},
