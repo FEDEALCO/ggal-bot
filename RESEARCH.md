@@ -515,7 +515,7 @@ hace 13 dias.
 | 2 | Venta de vol riesgo definido (VRP) | opciones locales + ADR (vol historica) | **Datos acumulándose** (gate rehecho 2026-10-14; test definitivo 2026-10-15 con puts OTM reales y distribucion empirica 10y: edge negativo en los 6 escenarios de vol probados, se descarta en el regimen actual - ver corrección 2026-10-15 abajo) |
 | 3 | Paridad put-call vs. caucion | caucion historica | **DATA INSUFFICIENT** - backlog (logging intradia bloqueado, ver seccion 5) |
 | 4 | Lead-lag ADR x CCL -> opciones locales | ADR (ok) + CCL **ahora calculado** | **Testeable** (CCL historico resuelto, ver seccion 4) |
-| 5 | scalping / weekly_asymmetric (sin privilegio) | ya logueado | **Testeable**, con filtro de quotes + respaldo aplicados |
+| 5 | scalping / weekly_asymmetric (sin privilegio) | ya logueado | scalping: **APAGAR** (veredicto 2026-10-27, ver seccion dedicada abajo - PnL neto negativo, IC95% nunca cruza cero, historico y ventana reciente consistentes); weekly_asymmetric: **Testeable**, con filtro de quotes + respaldo aplicados |
 
 Backlog explicito (3): queda pre-registrada en texto para no perderse,
 pero no se testea hasta tener caucion historica o forward logging
@@ -1099,3 +1099,64 @@ acumular.
 
 (Hipotesis 2 y 5 se pre-registran de la misma forma antes de correrlas -
 secciones a agregar aca mismo cuando empiecen.)
+
+## Hipotesis 5 (scalping) — VEREDICTO 2026-10-27: APAGAR
+
+**Decision del usuario, 2026-10-27, en base a evidencia real (no una
+hipotesis mas a pre-registrar: scalping ya opero en shadow, hay historia
+real de journal para evaluarlo).**
+
+Corrida con `ggal_bot/ops/weekly_review.py` (escenario `CostAssumptions()`
+default - gold, `spread_round_trip_pct=0.0` - el correcto para fills
+post-1/10 que ya cruzan el spread real, ver advertencia agregada hoy en
+`backtest/costs.py` junto a `spread_round_trip_pct`):
+
+| Ventana | n trades | win% | PnL neto (comision+derechos+IVA) | IC95% expectancy/trade |
+|---|---|---|---|---|
+| Historico completo (desde 2026-09-01) | 502 | 14.5% | -815.906 ARS | [-1.973, -1.261] ARS/tr |
+| Ultimos 5 dias habiles (20-26/10) | 52 | 3.8% | -86.497 ARS | [-1.940, -1.381] ARS/tr |
+
+Los dos IC95% son enteramente negativos y consistentes entre si (la
+ventana reciente no es una racha distinta de la historia completa).
+Descomposicion adicional sobre los 52 trades recientes (PnL BRUTO, precio
+puro, antes de cualquier costo): -32.960 ARS, 9 ganadoras/41
+perdedoras/2 flat, ganancia promedio $727 vs. perdida promedio -$963 - el
+edge de precio YA es plano-a-negativo antes de aplicar ningun costo.
+Tenencia mediana 1,2 min (scalping real, no la etiqueta). Separado por
+motivo de cierre, tanto el exit de señal (`scalping_iv_mean_reversion`,
+48 trades, promedio bruto -$610) como el forzado de EOD (`scalping_eod_close`,
+4 trades, promedio bruto -$922) son negativos - no es un exit forzado
+arrastrando a uno bueno.
+
+**Correccion metodologica (2026-10-27)**: un analisis previo, en el mismo
+dia, aplico ADEMAS escenarios de `spread_round_trip_pct` (6%, 10%) sobre
+este mismo PnL bruto para "estresar" el costo de cruzar el spread - eso
+es un doble conteo (ver advertencia nueva en `costs.py`): los fills reales
+desde el commit `55d2f67` (2026-10-01) YA cruzan el spread real (compran
+al ask, venden al bid), asi que `pnl_gross_ars` ya lo paga. El numero
+valido es el de la tabla arriba (comision+derechos+IVA sobre el fill
+real, spread_round_trip_pct=0.0): **-86.497 ARS / 52 trades**. Los
+numeros de 6%/10% reportados en el chat esa misma tarde quedan
+RETRACTADOS.
+
+**Pendiente, alimenta Hipotesis 1**: descomponer estos mismos trades al
+`mid_at_fill` real (entrada y salida) contra `shadow_trades.csv` (+
+siblings `.schemaN.csv` rotados, todavia no bajados del volumen de
+Northflank) para separar PnL-al-mid / costo-de-spread-pagado /
+costos-regulatorios por trade, y asi saber si la señal de IV mean
+reversion tiene edge al mid (sin la fricción de cruzar el spread) - ver
+seccion a agregar aca mismo cuando esos datos lleguen.
+
+**Descartado explicitamente (2026-10-27)**: escalar el tamaño de
+posicion para diluir un costo fijo por operacion. Verificado con el
+usuario: IOL no tiene comision minima (todos los costos de
+`backtest/costs.py` son proporcionales al notional) - escalar el tamaño
+no cambia el resultado por trade en términos porcentuales, asi que no es
+una via de mejora para esta estrategia.
+
+**VEREDICTO: APAGAR.** `GGAL_BOT_ENABLE_SCALPING=false` (default del
+propio flag, hoy en `true` en produccion - ver `ScalpingConfig.enabled`
+en `config.py`). Al momento de esta decision el portfolio esta flat en
+scalping (0 posiciones abiertas, ver verificacion de vencimientos de
+octubre mas abajo), asi que apagar el flag no deja ninguna posicion sin
+gestion de salida.

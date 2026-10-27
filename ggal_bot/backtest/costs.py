@@ -107,6 +107,21 @@ class CostAssumptions:
     market_rights_pct: float = MARKET_RIGHTS_OPTIONS_PRIVADOS_PCT
     iva_pct: float = IVA_PCT
     spread_round_trip_pct: float = 0.0  # 0.0 = "a mid" (igual al log historico), sin costo de spread
+    # ADVERTENCIA (2026-10-27, error real cometido en una exploracion ad-hoc
+    # de este mismo campo - no en este modulo ni en weekly_review.py, que ya
+    # usan 0.0 por default, ver docstring de section_trades_pnl_by_strategy):
+    # este campo modela el costo de REEMPLAZAR un fill "a mid" (como eran
+    # TODOS los fills shadow antes del commit 55d2f67, 2026-10-01, "shadow ya
+    # no llena al mid - cruza el spread y registra bid/ask/mid por fill") por
+    # uno que cruza el spread real. Para un fill posterior a ese commit, el
+    # `price` que ya esta logueado en position_events.csv/shadow_trades.csv
+    # YA cruzo el spread real (compra al ask, vende al bid) - aplicar un
+    # spread_round_trip_pct>0 ENCIMA de ese pnl_gross_ars ya realista sería
+    # cobrar el spread DOS VECES. Usar esta banda de sensibilidad solo sobre
+    # pnl_gross_ars reconstruido de fills ANTERIORES a esa fecha (o de un
+    # escenario hipotetico "a mid" explicito, ej. Fase 0 antes de tener datos
+    # reales) - nunca sobre un pnl_gross_ars que ya viene de un fill con
+    # bid_at_fill/ask_at_fill registrado (ver shadow_trades.csv/ShadowAuditLogger).
 
     @property
     def commission_pct(self) -> float:
