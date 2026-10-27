@@ -2413,3 +2413,144 @@ se pide, se pre-registrara ese gate aparte antes de calcularla.)
 **Nada de esto se corrió todavía** — este pre-registro se commitea
 ANTES de ejecutar una sola línea del backtest del panel, a pedido
 explícito del usuario, igual que la ronda anterior.
+
+## Resultados — Módulo B PANEL — 2026-10-27
+
+Corrido con la metodología pre-registrada arriba (commit `e8d92e7`,
+corregido en `fe83229` — bug real de unidades en el costo de acciones,
+encontrado y corregido ANTES de publicar ningún número, ver ese
+commit — ningún otro parámetro se tocó después de ver un resultado).
+Script: `modulo_b_panel.py` (scratchpad de esta sesión, generaliza
+`modulo_b_breakout.py`, no forma parte de `ggal_bot/`).
+
+**Bug real encontrado y corregido antes de publicar nada** (documentado
+también en el commit `fe83229` y en la sección de costos arriba): la
+primera corrida (con costo de acciones calculado sobre un notional
+asumido de 1 ADR) daba expectancies de -53% a -61% por trade — un
+numero economicamente absurdo para un stop de 2×ATR con holding maximo
+de 20 ruedas. Causa: el minimo de US$2+IVA por pata, comparado contra
+un notional de ~US$10-40 (1 ADR), domina el costo (hasta ~48% de ida y
+vuelta) — un artefacto de unidades (nadie opera 1 ADR), no un costo
+real. Corregido a la formula fija de 0,8470% de ida y vuelta (valida
+para cualquier tamaño de orden realista, ver arriba) y re-corrido.
+Todos los números de abajo son de la corrida CORREGIDA.
+
+### N de señales generadas (panel completo, 2010/2016/2018/2020 según
+ticker — ver tabla de disponibilidad — a 2026-10-26, antes de cortar
+por holdout)
+
+**Alcista: 673.** Por ticker: BBAR 68, BMA 54, CAAP 26, CEPU 36, CRESY
+55, EDN 56, GGAL 38, IRS 53, LOMA 31, PAM 71, SUPV 27, TEO 58, TGS 72,
+YPF 28.
+
+**Bajista: 588.** Por ticker: BBAR 56, BMA 49, CAAP 16, CEPU 30, CRESY
+52, EDN 43, GGAL 37, IRS 53, LOMA 32, PAM 64, SUPV 26, TEO 55, TGS 44,
+YPF 31.
+
+### Rama ALCISTA (calls) — expectancy neta de costos de acciones, IC95% por bootstrap agrupado por fecha de señal
+
+| Ventana | N | Expectancy | IC95% (cluster) | Profit factor | Max DD cartera | Benchmark aleatorio (mean) | p-valor | Percentil |
+|---|---|---|---|---|---|---|---|---|
+| Completo | 673 | +1,13% | [-0,26%, +2,55%] | 1,25 | -91,31% | +0,21% | 0,0310 | 97,0 |
+| Desarrollo | 584 | +1,29% | [-0,12%, +2,69%] | 1,29 | -91,31% | +0,30% | 0,0285 | 97,2 |
+| **Holdout (2024-10-26 a 2026-10-26)** | **89** | **+0,07%** | **[-4,04%, +5,67%]** | 1,01 | -44,34% | +0,05% | 0,4828 | 51,8 |
+
+N por ticker en el holdout: BBAR 6, BMA 5, CAAP 6, CEPU 8, CRESY 5, EDN
+4, GGAL 7, IRS 8, LOMA 7, PAM 7, SUPV 5, TEO 8, TGS 6, YPF 7.
+
+### Rama BAJISTA (puts) — misma metodología, siempre separada
+
+| Ventana | N | Expectancy | IC95% (cluster) | Profit factor | Max DD cartera | Benchmark aleatorio (mean) | p-valor | Percentil |
+|---|---|---|---|---|---|---|---|---|
+| Completo | 588 | -1,97% | [-3,44%, -0,42%] | 0,68 | -99,54% | -1,97% | 0,5102 | 49,0 |
+| Desarrollo | 471 | -1,87% | [-3,49%, -0,24%] | 0,69 | -99,30% | -2,00% | 0,4123 | 58,8 |
+| **Holdout** | **117** | **-2,38%** | **[-6,14%, +2,03%]** | 0,61 | -48,04% | -0,92% | 0,8461 | 15,4 |
+
+N por ticker en el holdout: BBAR 7, BMA 8, CAAP 6, CEPU 10, CRESY 8,
+EDN 10, GGAL 8, IRS 9, LOMA 11, PAM 9, SUPV 8, TEO 7, TGS 8, YPF 8.
+
+**Sobre el Max Drawdown de la cartera (peso igual, rebalanceo diario)**:
+los números de -91%/-99% en Completo/Desarrollo son reales, no un bug
+de cómputo — se verificó la fecha del peor día individual de la rama
+alcista (-16,24% en un solo día, 2026→recortado: **2019-08-12**) y
+corresponde al "Lunes Negro" posterior a las PASO de agosto 2019 en
+Argentina (devaluación/crisis real, verificado contra los propios
+datos: GGAL abrió esa rueda en USD 19,31 contra un cierre previo de
+USD 38,21 — una caída real de ~50% de un día para el otro). Dos
+señales de ruptura (GGAL, BMA) habían entrado el mismo día que
+coincidió con el inicio de esa crisis. **Esto es la razón concreta por
+la que el usuario pidió el bootstrap agrupado por fecha**: un shock
+macro/país pega a TODOS los tickers del panel el mismo día, y la regla
+de "peso igual, rebalanceo diario" no lo diversifica (si hay pocas
+posiciones abiertas ese día, cada una pesa mucho). Es una limitación
+real del panel (riesgo de cola correlacionado, no solo de las
+estrategias), declarada ahora, no un error de cómputo — no se investigó
+exhaustivamente cada drawdown individual, solo se verificó el peor caso
+de la rama alcista.
+
+### Filtro de régimen — primario (CCL implícito) y secundario (MERVAL), todo el período, solo contexto
+
+| Dirección | Régimen | Fuente | N | Expectancy | IC95% (cluster) |
+|---|---|---|---|---|---|
+| Alcista | Estrés (pctl>75) | CCL | 337 | -0,07% | [-1,88%, +1,85%] |
+| Alcista | Normal | CCL | 84 | +0,44% | [-3,38%, +5,15%] |
+| Alcista | Estrés (pctl>75) | MERVAL | 335 | -0,50% | [-2,31%, +1,42%] |
+| Alcista | Normal | MERVAL | 51 | +2,86% | [-3,13%, +10,01%] |
+| Bajista | Estrés (pctl>75) | CCL | 343 | -1,68% | [-3,97%, +0,64%] |
+| Bajista | Normal | CCL | 61 | -2,92% | [-6,56%, +1,47%] |
+| Bajista | Estrés (pctl>75) | MERVAL | 181 | -2,31% | [-4,50%, +0,04%] |
+| Bajista | Normal | MERVAL | 209 | -1,10% | [-4,51%, +2,37%] |
+
+DATA INSUFFICIENT (señales fuera de la cobertura real de cada serie —
+CCL hasta 2026-10-13, MERVAL recortado a 2026-10-15, mas el primer año
+sin ventana de 252 ruedas previas — nunca fabricado): alcista 252/673
+(CCL) y 287/673 (MERVAL); bajista 184/588 (CCL) y 198/588 (MERVAL). Sin
+conclusión fuerte en ninguna variante: todos los IC95% cruzan cero
+salvo el borde de MERVAL/bajista/estrés, que es solo marginal. Esto es
+contexto, nunca el veredicto (como se declaró de antemano).
+
+### GATE EXPLICITO — expresión en opciones de GGAL
+
+Holdout, rama alcista del panel: IC95% = [-4,04%, +5,67%] — **cruza
+cero → GATE NO PASA.** Por lo pre-registrado, la expresión en costos de
+opciones de GGAL (Gold/Black) **NO se ejecuta en esta ronda.**
+
+### Veredicto — aplicando el criterio pre-registrado (el holdout decide)
+
+**Alcista: RECHAZADA.** N=89 (≥30, la condición de muestra ya no es el
+problema — comparado con N=7 del pre-registro single-asset, pasar a 14
+tickers multiplicó por ~13 la muestra del holdout). Pero no se cumple
+(a) (IC95% cruza cero) ni (b) (p=0,4828, muy por encima de 0,05 —
+la señal real NO le gana de forma significativa a entradas aleatorias
+de mismo N/duración/ticker en el holdout).
+
+**Bajista: RECHAZADA.** N=117 (≥30). Tampoco se cumple (a) (IC95% cruza
+cero) ni (b) (p=0,8461).
+
+**Contexto honesto (no es el veredicto, el holdout ya decidió)**:
+en las ventanas Completo y Desarrollo, la rama alcista SÍ le gana a las
+entradas aleatorias de forma significativa (p≈0,03 en ambas, percentil
+~97) aunque su propio IC95% todavía roza el cero por el lado de abajo
+— es decir, hay algo de contenido direccional real en la señal de
+ruptura alcista a lo largo de toda la muestra, consistente con lo que
+ya se había visto en el pre-registro single-asset (percentiles
+~74-78%), ahora con muestra mucho mayor. La rama bajista, en cambio,
+tiene un IC95% completo y de desarrollo enteramente NEGATIVO
+(-3,44%/-0,42% y -3,49%/-0,24%) — es decir, hay evidencia
+estadísticamente significativa de que operar esta señal bajista
+PIERDE dinero de forma confiable neto de costos de acciones a lo largo
+de 16/14 años de panel, aunque tampoco le gana ni le pierde de forma
+significativa al azar (p≈0,41-0,51). **Pero el holdout —la ventana
+designada de antemano para decidir— no replica ninguna de esas dos
+lecturas con significancia estadística para ninguna dirección**: ni
+confirma el leve edge alcista de la muestra completa, ni confirma la
+pérdida significativa bajista. Es el resultado honesto de un panel con
+N real (no es un problema de muestra como en la ronda anterior) que,
+sobre el holdout de 2 años elegido de antemano, no muestra un edge neto
+de costos que sobreviva el bootstrap agrupado por fecha ni el
+benchmark aleatorio.
+
+**Consecuencia directa del gate pre-registrado**: dado que el panel
+alcista NO pasa el holdout, **no se hace la expresión en opciones de
+GGAL (Gold/Black) esta ronda** — ni siquiera para "ver el número": es
+exactamente la condición que el usuario pidió bloquear de antemano.
