@@ -1975,3 +1975,126 @@ Mismo criterio, aplicado de forma independiente, para la rama bajista
 **Nada de esto se corrió todavía** — este pre-registro se commitea
 ANTES de ejecutar una sola línea del backtest, a pedido explícito del
 usuario.
+
+## Resultados — Módulo B (rupturas) — 2026-10-27
+
+Corrido EXACTAMENTE con la metodología pre-registrada arriba (commit
+`b84b7eb`, antes de este resultado) — ningún parámetro se tocó después
+de ver un número. Script: `modulo_b_breakout.py` (scratchpad de esta
+sesión, no forma parte de `ggal_bot/` — es análisis offline, no código
+de producción).
+
+**Bug real encontrado y corregido ANTES de publicar ningún número**: la
+primera corrida tenía el retorno de la rama bajista (short) calculado
+como `entry/exit - 1` — exactamente al revés de cómo funciona un short
+real (esa fórmula deja la GANANCIA sin techo y la PÉRDIDA acotada a
+-100%, cuando en un short real es al revés: ganancia máxima 100% si el
+precio va a 0, pérdida sin techo si el precio sube sin límite). Se
+corrigió a `(entry-exit)/entry` — misma convención que la rama alcista,
+signo invertido — y se volvió a correr. El numero de la rama bajista
+cambió sustancialmente (expectancy completo: de +3,58% a +0,31%); el de
+la rama alcista no se tocó (no tenía el bug).
+
+### N de señales generadas (10 años completos, antes de cortar por holdout)
+
+Alcista: 38. Bajista: 37. (~3,7-3,8 señales/año cada rama — frecuencia
+razonable para un filtro de ruptura de 20 ruedas + volumen en un solo
+papel).
+
+### Rama ALCISTA (calls)
+
+| Ventana | N | Expectancy | IC95% | Profit factor | Max DD | Buy&hold (misma ventana) | Percentil vs. aleatorio |
+|---|---|---|---|---|---|---|---|
+| Completo (2017-01 a 2026-06) | 38 | +2,80% | [-1,82%, +7,73%] | 1,59 | -31,30% | +75,72% (6,19% anual) | 73,8 |
+| Desarrollo (2017-01 a 2024-09) | 31 | +3,73% | [-1,75%, +9,47%] | 1,74 | -31,30% | +48,46% (5,32% anual) | 78,2 |
+| **Holdout (2024-12 a 2026-06)** | **7** | -1,32% | [-6,48%, +4,95%] | 0,64 | -15,37% | -27,44% (-19,16% anual) | 46,2 |
+
+### Rama BAJISTA (puts) — SIEMPRE separada, nunca mezclada con la alcista
+
+| Ventana | N | Expectancy | IC95% | Profit factor | Max DD | Buy&hold (misma ventana) | Percentil vs. aleatorio |
+|---|---|---|---|---|---|---|---|
+| Completo (2017-06 a 2026-10) | 37 | +0,31% | [-4,88%, +5,74%] | 1,05 | -64,52% | -11,10% (-1,27% anual) | 73,9 |
+| Desarrollo (2017-06 a 2024-08) | 29 | -0,42% | [-6,36%, +5,93%] | 0,94 | -63,82% | -30,80% (-5,07% anual) | 61,5 |
+| **Holdout (2025-02 a 2026-10)** | **8** | +2,94% | [-6,63%, +12,35%] | 1,61 | -23,44% | -41,56% (-27,61% anual) | 61,4 |
+
+### Filtro de régimen opcional (CCL implícito, percentil >75 de 252 ruedas previas) — corte de robustez, todo el período
+
+| Dirección | Régimen | N | Expectancy | IC95% |
+|---|---|---|---|---|
+| Alcista | Estrés (CCL alto) | 28 | +3,02% | [-2,80%, +9,22%] |
+| Alcista | Normal | 6 | +1,20% | [-6,31%, +10,73%] |
+| Bajista | Estrés (CCL alto) | 33 | +0,42% | [-2,83%, +11,75%]* |
+| Bajista | Normal | 4 | -0,63% | [-12,48%, +11,23%] |
+
+*(nota: el expectancy de "bajista/estrés" en la tabla de arriba usa el
+mismo punto +0,42% calculado por el script — IC consistente con el
+resto, crece un poco porque son 33 de 37 trades, casi todo el período
+cae en el percentil alto de CCL de los últimos 2 años, ya que el CCL
+viene subiendo sostenidamente — ver limitación abajo)
+
+**Limitación del corte de régimen**: con solo 10 años de historia y un
+umbral de percentil 75 sobre una ventana de 252 ruedas, casi todas las
+señales bajistas (33/37) y la mayoría de las alcistas (28/38) caen en
+"estrés" — el CCL implícito de GGAL viene en tendencia alcista
+estructural casi todo el período, así que este corte separa MUY poca
+muestra en el grupo "normal" (4 y 6 trades) para decir algo con
+sentido. Dato de contexto, no una conclusión.
+
+### Expresión en opciones (aproximación, rama alcista, calls, Gold y Black)
+
+n=35 de 38 trades (3 sin fecha pareada en `ccl_implicito_diario.csv` o
+sin suficiente historia de 60 ruedas para la vol realizada — DATA
+INSUFFICIENT para esos 3, no se fabricó nada):
+
+| Escala | Movimiento requerido (mediana, % spot) | Movimiento realizado (mediana, 21 ruedas) | Cobertura |
+|---|---|---|---|
+| Gold | 0,19% | 10,05% | 24/35 (68,6%) |
+| Black | 0,08% | 10,05% | 24/35 (68,6%) |
+
+**Esta métrica es DÉBIL por diseño, declarado explícitamente ahora que
+se ve el número** (no se cambia el pre-registro, se explica por qué no
+alcanza sola): el "movimiento requerido" es solo la FRICCIÓN de
+operar (comisión+derecho+IVA sobre la prima, dividido por delta) — no
+el costo de la prima completa. Con la volatilidad real de GGAL
+(~35-65% anualizada), ese piso de friccion (0,08%-0,19% del spot) es
+tan chico que CASI CUALQUIER movimiento de un mes lo supera, señal real
+o puramente al azar. Por eso el criterio de verdicto pre-registrado
+nunca usó esto solo: es la condición (c) de tres, no decide nada por sí
+misma. La rama bajista no se expresó en opciones en esta ronda (fuera
+del pedido explícito del usuario para esta parte).
+
+### Veredicto — aplicando el criterio pre-registrado (holdout decide, nada se mira antes)
+
+**Alcista: DATA INSUFFICIENT.** N=7 en el holdout, por debajo del piso
+de 30 declarado antes de correr nada — no se puede aplicar ninguna de
+las tres condiciones de SOPORTADA/HIPÓTESIS/RECHAZADA con una muestra
+así de chica, sin importar que el punto caiga en -1,32%.
+
+**Bajista: DATA INSUFFICIENT.** N=8 en el holdout, mismo problema.
+
+**Contexto honesto (no es el veredicto, es información adicional
+pedida igual por el usuario)**: ni siquiera relajando al período
+completo (10 años, no el holdout designado) se cumple la condición (a)
+del criterio (IC95% enteramente >0) en NINGUNA de las dos direcciones
+— el IC95% cruza cero en alcista (+2,80%, [-1,82%,+7,73%]) y en
+bajista (+0,31%, [-4,88%,+5,74%]). La rama alcista sí bate al
+percentil ~74-78% de las entradas aleatorias de mismo N/duración en el
+período completo y en desarrollo (condición b, cerca pero no sobre el
+75 declarado) — la bajista también bate el azar en el período completo
+(73,9) y en desarrollo (61,5) pero mas debil. Es decir: **hay una señal
+con ALGO de contenido direccional (bate al azar mas seguido que no), en
+ninguna de las dos direcciones el bruto es estadísticamente
+significativo, y la muestra pre-registrada específicamente para decidir
+(el holdout de 2 años) es demasiado chica para decidir nada** — ni para
+confirmar ni para descartar. Esto no es un resultado "lindo", es el
+resultado honesto de haber fijado el umbral de N ANTES de mirar el
+dato: con una señal que dispara ~4 veces por año, 2 años de holdout
+nunca iban a dar mas de 7-8 observaciones.
+
+**Pendiente, si el usuario quiere seguir esta línea**: la unica forma
+de resolver el DATA INSUFFICIENT del holdout sin fabricar nada es (a)
+acumular mas años de holdout real esperando que pase el tiempo (no
+acelerable), o (b) que el usuario acepte relajar el piso de N=30 a algo
+mas chico A SABIENDAS de que eso reduce la confiabilidad estadistica
+del corte (una decision suya, no algo que se cambie en silencio
+despues de ver que 30 no se alcanzaba).
