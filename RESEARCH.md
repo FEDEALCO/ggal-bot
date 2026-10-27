@@ -511,7 +511,7 @@ hace 13 dias.
 
 | # | Hipotesis | Datos | Estado |
 |---|---|---|---|
-| 1 | Provision de liquidez | book local (ya logueado) | **Datos acumulándose** (ver 2026-10-14 abajo) |
+| 1 | Provision de liquidez | book local (ya logueado) | **Datos acumulándose** (ver 2026-10-14 abajo; actualizado 2026-10-27: 64.948 transiciones reales de `last_price` en 9 dias habiles desde 15/10, suficiente para exploratorio en los contratos mas liquidos, corto todavia para el test completo con holdout) |
 | 2 | Venta de vol riesgo definido (VRP) | opciones locales + ADR (vol historica) | **Datos acumulándose** (gate rehecho 2026-10-14; test definitivo 2026-10-15 con puts OTM reales y distribucion empirica 10y: edge negativo en los 6 escenarios de vol probados, se descarta en el regimen actual - ver corrección 2026-10-15 abajo) |
 | 3 | Paridad put-call vs. caucion | caucion historica | **DATA INSUFFICIENT** - backlog (logging intradia bloqueado, ver seccion 5) |
 | 4 | Lead-lag ADR x CCL -> opciones locales | ADR (ok) + CCL **ahora calculado** | **Testeable** (CCL historico resuelto, ver seccion 4) |
@@ -1065,6 +1065,36 @@ vivo cada lunes. Esto es exactamente el tipo de dato que la Tarea 4 (ver
 mas abajo) y el congelamiento de 3 semanas (Tarea 3) estan pensados para
 acumular.
 
+**Extension multi-dia (2026-10-27)**: ya hay 13 dias reales de
+`market_snapshots.csv` (via `.csv.gz` rotados, bajados del volumen de
+Northflank, 2026-10-09 a 10-26) con `bid`/`ask` reales. NO hay una serie
+semanal real cotizando en este chain durante esta ventana (lo mas corto
+disponible con liquidez es la serie de Octubre, agonizando hacia su
+vencimiento, con spreads que se disparan por tick minimo los ultimos 1-3
+dias - el mismo patron ya documentado arriba para ilustrar "por que un
+book a T-1 no sirve", no el caso de una entrada real). La serie
+MENSUAL 2026-12-18 (la misma usada en la medicion puntual del 15/10
+arriba) es la que se mantuvo liquida y consistente los 13 dias:
+
+| Moneyness objetivo | Mediana spread% | Media | Min | Max | N dias |
+|---|---|---|---|---|---|
+| ~5% OTM (strike ~5600, spot ~5600-6250) | 5.09% | 12.55% | 0.76% | 106.98% | 13 |
+| ~10% OTM (strike ~5200-5600) | 5.40% | 8.51% | 0.26% | 45.02% | 13 |
+
+Las medianas (5.09%/5.40%) son del mismo orden que la medicion puntual
+del 15/10 (2.60%/2.89% para strikes equivalentes esa fecha especifica) -
+mismo rango de magnitud, no una contradiccion. Dos dias (13/10 y 14/10)
+muestran spreads disparados (45-107%) que tienen toda la pinta de un
+book temporalmente roto/cruzado (mismo criterio de `is_valid_quote()`
+que ya se usa en el resto del proyecto para descartar estos casos) antes
+que un spread real de mercado - no se excluyen de la tabla (serian
+descartados a mano sin un criterio automatico, y el pedido fue extender
+la medicion con los dias reales que hay, no limpiarla primero) pero se
+marcan explicitamente como sospechosos. **Esta extension REFUERZA el
+veredicto de la seccion anterior (H2 DESCARTADA en el regimen actual) -
+el spread real medido en mas dias sigue en el mismo rango usado para esa
+conclusion, no lo cambia.**
+
 ## Pre-registro — Hipotesis 1: Provision de liquidez
 
 **Pre-registrado 2026-10-13, antes de ver ningun resultado.**
@@ -1096,6 +1126,46 @@ acumular.
 - **Variantes totales de esta hipotesis**: 3 (factor_captura) x a definir
   (limite de inventario) - a reportar el numero final exacto antes de ver
   resultados.
+
+**Acumulacion de datos (2026-10-27)**: el campo `last_price` existe en
+`market_snapshots.csv` desde el 2026-10-15 (confirmado por header: los
+archivos rotados del 9 al 14/10 tienen 17 columnas, SIN `last_price`/
+`last_volume`; desde el 15/10 tienen 19). Hay 13 dias calendario (9
+dias habiles) de ese campo poblado, 118 simbolos distintos, ~19M filas
+con el campo presente.
+
+**Correccion de metodo importante**: contar filas con `last_price>0`
+NO mide trades reales - el campo queda "pegado" al ultimo valor
+conocido entre ticks (verificado: una opcion con 17.958 filas en un
+solo dia tiene solo 214 valores DISTINTOS de `last_price` ese dia - el
+78.74% de filas con `last_price>0` en toda la ventana es, en su enorme
+mayoria, el mismo numero repetido mientras no hay trade nuevo, no 78.74%
+de probabilidad de trade por poll). La metrica correcta para "cuantos
+trades reales hay para validar un modelo de fill conservador" es el
+CONTEO DE CAMBIOS de `last_price` entre filas consecutivas de un mismo
+simbolo (cota inferior de trades reales - dos trades consecutivos al
+mismo precio cuentan como 1 cambio, no 2).
+
+Con esa metrica correcta: **64.948 transiciones de precio reales en
+total**, 118 simbolos, sobre los 9 dias habiles disponibles. Los 15
+contratos mas liquidos (todos de la serie `DI`/Diciembre) acumulan entre
+1.716 y 3.725 transiciones cada uno (datos en al menos 8 de los 9 dias
+habiles) - una densidad razonable para un PRIMER analisis exploratorio
+de esos contratos puntuales. 23 simbolos (de 118) tienen CERO
+transiciones en toda la ventana - estrikes sin ningun trade real, no
+testeables todavia.
+
+**Respuesta a "¿alcanza para un exploratorio sin tocar el holdout?"**:
+para los contratos mas liquidos, si, alcanza para mirar el patron sin
+tocar el holdout (no hace falta particionar estos 9 dias habiles - son
+muchos menos que el dataset completo de quotes, que arranca en
+septiembre; el holdout pre-registrado de H1 se define sobre ESE dataset
+mas largo, no sobre esta sub-ventana de last_price). Para el test
+PRE-REGISTRADO completo (con holdout propio, grilla de 3 variantes de
+factor_captura x limite de inventario, bootstrap CI) la ventana de solo
+9 dias habiles con datos de trades reales sigue siendo corta - se
+mantiene la clasificacion "Datos acumulandose" de la tabla de arriba,
+ahora con un numero concreto en vez de cero.
 
 (Hipotesis 2 y 5 se pre-registran de la misma forma antes de correrlas -
 secciones a agregar aca mismo cuando empiecen.)
