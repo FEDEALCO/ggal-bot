@@ -1777,3 +1777,201 @@ exacta (mensaje, hora, o captura) del "22 posiciones/$18M" para poder
 trazarlo en vez de descartarlo sin verificar.~~ **RESUELTO arriba: el
 usuario aclaro la fuente exacta de ambos numeros y se encontro, corrigio
 y verifico el bug real que explica el "22".**
+
+## Pre-registro — Módulo B: rupturas (breakout) del ADR GGAL, con/sin filtro de régimen CCL — 2026-10-27
+
+A pedido explicito del usuario: nueva linea de investigacion, 100%
+OFFLINE (no toca el bot, no cambia logica de produccion, permitido
+durante el freeze de 3 semanas - FREEZE.md), sobre una señal de
+ruptura/momentum distinta a todo lo ya evaluado (scalping - APAGADA,
+weekly_asymmetric, H1/H1b/H2 - todas sobre una señal de REVERSION, no de
+momentum). Metodologia COMPLETA fijada ANTES de correr una sola linea
+de backtest, con el mismo criterio de todo este documento: parametros
+FIJOS sin optimizar, holdout de los ultimos 2 años, comparacion contra
+buy&hold y contra entradas aleatorias, veredicto con el mismo criterio
+VERIFIED/SUPPORTED/HYPOTHESIS/DATA INSUFFICIENT/REJECTED.
+
+### Datos
+
+- **GGAL ADR (NYSE, USD), diario (OHLCV)**: `ggal_adr_daily_10y.csv`
+  (scratchpad de esta sesion), obtenido via
+  `mcp__invertironline__get_price_history` (API real de IOL, no
+  fabricado) — 2.499 ruedas, **2016-10-13 a 2026-10-12**. Columnas:
+  date, open, high, low, close, volume, log_return.
+- **GGAL local (BYMA, ARS), close diario**: columna `ggal_local_close_ars`
+  de `ccl_implicito_diario.csv` (scratchpad, ya usado y documentado en
+  este proyecto para el CCL implicito — mismo archivo, misma fuente) —
+  2.546 filas, 2016-01-04 a 2026-10-13. Se usa SOLO para (a) la
+  expresion en opciones (spot local real por fecha, nunca estimado) y
+  (b) el filtro de regimen opcional (CCL implicito = `ggal_local_close_ars
+  / ggal_adr_close_usd`, ya calculado en ese mismo archivo). Verificado:
+  2.361 fechas en comun entre ambos archivos, 0 discrepancias en el
+  close del ADR entre los dos (mismo dato, misma fuente).
+- **MERVAL**: DATA INSUFFICIENT — no se encontro ni se calculo en esta
+  sesion ninguna serie historica del indice MERVAL: el filtro de
+  regimen opcional se construye SOLO con CCL implicito (disponible y ya
+  validado), nunca con MERVAL. Declarado explicitamente, no fabricado.
+- **Caucion (tasa libre de riesgo historica)**: DATA INSUFFICIENT (ya
+  documentado en este archivo, seccion "Disponibilidad de datos:
+  caucion" — sin cambios). Para el Black-Scholes de la expresion en
+  opciones se usa `rate=0.0` como supuesto EXPLICITO (no fabricado como
+  dato real), igual que para dividend_yield=0.0.
+
+### Señal (alcista — reportada separado de la bajista, nunca mezclada)
+
+- Dia de señal T: `close[T] > max(close[T-20:T-1])` (maximo rolling de
+  las 20 ruedas PREVIAS, sin incluir T) Y `volume[T] > 1.5 *
+  mean(volume[T-50:T-1])` (promedio rolling de las 50 ruedas previas,
+  sin incluir T). Ambas condiciones sobre el ADR (USD), exactamente
+  como la pidio el usuario.
+- Entrada ejecutada en `open[T+1]` (la rueda SIGUIENTE a la señal, nunca
+  en el cierre de la propia señal — evita look-ahead).
+- Sin pirámide: si una nueva señal aparece mientras ya hay una posicion
+  abierta de una señal anterior (misma direccion), se descarta (no se
+  acumula, no se reemplaza).
+
+### Señal bajista (simetrica, SEPARADA — puts, nunca mezclada con la alcista)
+
+- Dia de señal T: `close[T] < min(close[T-20:T-1])` Y `volume[T] > 1.5 *
+  mean(volume[T-50:T-1])`. Entrada en `open[T+1]`. Misma regla de "sin
+  piramide".
+
+### Salida (identica logica para ambas direcciones, signo invertido)
+
+- `ATR(14)` (True Range diario, promedio simple de 14 ruedas) calculado
+  ÚNICAMENTE con datos hasta el dia de señal T (sin look-ahead) y
+  FIJADO para toda la vida del trade (no se recalcula dia a dia — una
+  decision de diseño declarada aca, no optimizada).
+- Alcista: stop inicial = `entry_price - 2*ATR14`. Trailing (estilo
+  chandelier): cada dia, `stop = max(stop_previo, max_close_desde_entrada
+  - 2*ATR14)` — el stop solo sube, nunca baja. Sale si `close[t] <=
+  stop` ese dia, ejecutado en `open[t+1]`.
+- Bajista: simetrico con signos invertidos (`entry_price + 2*ATR14`,
+  trailing sobre el minimo close desde entrada, sale si
+  `close[t] >= stop`).
+- Salida por tiempo: si ningun stop se disparo antes, se cierra en la
+  apertura de la rueda 21 despues de la entrada (20 ruedas habiles de
+  holding maximo — elegido para que el horizonte calce con la ventana
+  de ~30 dias corridos usada despues en la expresion de opciones).
+
+### Holdout y ventanas de reporte
+
+Rango total de datos: 2016-10-13 a 2026-10-12. **Holdout = ultimos 2
+años calendario** (2024-10-12 a 2026-10-12), nunca mirado para elegir
+ningun parametro de arriba (todos fijados por el enunciado del usuario
+o por una convencion estandar declarada, no por tanteo). Se reportan
+TRES vistas de las mismas metricas: periodo completo, desarrollo
+(2016-10-13 a 2024-10-11) y holdout (2024-10-12 a 2026-10-12) — el
+holdout es el que decide el veredicto final.
+
+### Métricas (por cada ventana, por cada direccion, reportadas separado)
+
+1. N (trades cerrados).
+2. Expectancy neta por trade (retorno % simple sobre el precio de
+   entrada del ADR, BRUTO de costos de opciones — eso se trata aparte
+   en la seccion de opciones) con IC95% via `bootstrap_ci` (proyecto,
+   `ggal_bot/backtest/metrics.py`, seed=1234 — mismo estandar que el
+   resto de este documento).
+3. Profit factor = suma de retornos positivos / |suma de retornos
+   negativos|.
+4. Max drawdown sobre la curva de equity compuesta de los trades
+   (producto de `(1+retorno_i)` en orden cronologico).
+5. Buy&hold de la misma ventana: retorno total y anualizado de comprar
+   el ADR al inicio y mantenerlo hasta el final de esa ventana (un solo
+   numero, no un benchmark con distribucion).
+6. Entradas aleatorias (Monte Carlo, **2.000 draws, seed=1234, fijado
+   ahora**): en cada draw, N fechas de entrada elegidas uniformemente al
+   azar dentro del rango valido de esa ventana, cada una emparejada 1:1
+   (shuffle) con la DURACION real (en ruedas) de uno de los N trades
+   reales de esa ventana/direccion — retorno de cada pata aleatoria =
+   `close[entry_random+duracion] / open[entry_random+1] - 1`. Se
+   reporta la expectancy promedio de cada uno de los 2.000 draws, y el
+   PERCENTIL donde cae la expectancy REAL dentro de esa distribucion
+   (ej. "percentil 82" = la señal real bate al 82% de los draws
+   aleatorios de mismo N y duracion).
+
+### Expresión en costos de opciones (aproximación declarada — Gold y Black)
+
+Para cada trade alcista con entrada real (no para la rama bajista en
+esta parte — ver limitacion abajo):
+
+1. Spot LOCAL real (ARS) en la fecha de entrada: `ggal_local_close_ars`
+   de `ccl_implicito_diario.csv` para esa fecha exacta (dato real, no
+   estimado desde el ADR).
+2. Call sintetico ATM (`strike = spot_local`, `days_calendar=30`,
+   `days_business=21`) via `ggal_bot/models/black_scholes.py`
+   (`BlackScholesGreeks`, ya existente en el proyecto, sin reinventar
+   la formula). `rate=0.0`, `dividend_yield=0.0` (ver DATA INSUFFICIENT
+   arriba). `sigma` = volatilidad realizada anualizada de los
+   **ULTIMOS 60 ruedas del GGAL LOCAL** terminando en la fecha de señal
+   (sin look-ahead, recalculada por cada trade — nunca un numero fijo
+   inventado).
+3. Costo de ida y vuelta: `round_trip_regulatory_cost_ars` de
+   `ggal_bot/backtest/costs.py` (comision + derecho de mercado + IVA,
+   **mismo modulo ya usado en todo el proyecto, sin reinventar
+   numeros**) en escala **Gold** y **Black** — las dos que pidio el
+   usuario. `spread_round_trip_pct=0` explicito (no hay dato real de
+   spread de opciones de 10 años — mismo DATA INSUFFICIENT ya declarado
+   en costs.py, no se fabrica).
+4. Movimiento de spot requerido para cubrir ese costo ≈
+   `costo_ars / (delta_BS * multiplicador)`, expresado como % del spot
+   local — el "breakeven" de friccion, nunca de prima completa (eso
+   seria otro numero, mas conservador; este es el piso minimo).
+5. Movimiento REAL realizado: el retorno LOCAL real (ARS, mismo
+   `ggal_local_close_ars`) entre la entrada y 21 ruedas habiles despues
+   (mismo horizonte que el call sintetico) — dato real, no el del ADR
+   (se tiene el dato local real pareado por fecha, no hace falta
+   aproximar con el USD).
+6. Se reporta, por escala (Gold/Black): mediana/media del movimiento
+   requerido vs. el realizado, y la fraccion de trades donde el
+   movimiento realizado CUBRE el requerido.
+
+**Limitacion declarada de antemano**: esto NO es una simulacion de
+comprar realmente esas calls (no hay 10 años de cadenas de opciones
+reales con estas fechas/estrikes exactos) — es una aproximacion
+Black-Scholes con volatilidad realizada contemporanea, exactamente la
+misma clase de aproximacion ya usada y etiquetada como tal en la
+seccion de Hipotesis 2 de este documento. La rama bajista (puts) NO se
+expresa en esta ronda en terminos de opciones (fuera del pedido
+explicito del usuario, que solo mencionó calls para esta parte) — si
+se pide despues, se pre-registra aparte antes de calcularla.
+
+### Filtro de régimen opcional (CCL implícito) — corte de robustez, NUNCA el veredicto principal
+
+- "Régimen de estrés cambiario" en la fecha de señal: CCL implícito en
+  el **percentil >75 de su propia distribución de las 252 ruedas
+  previas** (ventana móvil de 1 año, sin look-ahead, sin optimizar el
+  umbral — 75 es un punto de corte estandar de "cuartil superior", no
+  elegido mirando el resultado).
+- Se reportan las mismas métricas (N, expectancy+IC, profit factor)
+  separadas en "régimen de estrés" vs. "régimen normal", **solo para la
+  rama alcista** (simetria bajista fuera de alcance de este corte por
+  ahora) — un corte exploratorio adicional, declarado desde ya como
+  secundario: el veredicto final de Módulo B se basa en el resultado
+  SIN este filtro (la pregunta que el usuario hizo primero), este corte
+  es para contexto adicional, nunca para elegir a posteriori cual
+  resultado mostrar como veredicto.
+
+### Veredicto — criterio de éxito, declarado ANTES de correr nada
+
+Sobre el **holdout de 2 años** (2024-10-12 a 2026-10-12), rama alcista:
+
+- **SOPORTADA** si las TRES condiciones se cumplen a la vez: (a)
+  expectancy neta con IC95% enteramente > 0; (b) la expectancy real cae
+  en el percentil ≥75 de la distribución Monte Carlo de entradas
+  aleatorias de mismo N/duración; (c) en la expresión de opciones,
+  escala **Gold** (la más exigente), más del 50% de los trades cubren
+  el movimiento requerido.
+- **HIPÓTESIS** si se cumple (a) pero no (b) y/o (c) — señal con algo
+  de edge bruto pero sin verificar que supere al azar o que sobreviva
+  los costos reales de operarla con opciones.
+- **RECHAZADA** si (a) no se cumple (IC95% cruza cero o es negativo).
+- **DATA INSUFFICIENT** si N<30 en el holdout (muestra demasiado chica
+  para cualquier conclusión, sin importar el resultado puntual).
+
+Mismo criterio, aplicado de forma independiente, para la rama bajista
+(sin la parte de opciones, ver limitación arriba).
+
+**Nada de esto se corrió todavía** — este pre-registro se commitea
+ANTES de ejecutar una sola línea del backtest, a pedido explícito del
+usuario.
