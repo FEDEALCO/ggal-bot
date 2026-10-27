@@ -100,6 +100,92 @@ def test_section_trades_pnl_by_strategy_empty_journal_is_data_insufficient():
 
 
 # ---------------------------------------------------------------------------
+# BUG REAL 2026-10-27 (a pedido del usuario, investigando por que
+# weekly_review.py reporto "22 posiciones abiertas" el 2026-10-21 cuando la
+# reconciliacion real de produccion daba 0-1 - ver docstring de
+# wr._real_open_position_counts_by_strategy): reproduce los DOS sub-bugs
+# reales encontrados en reconstruct_lifecycle_trades (el conteo CRUDO que
+# section_trades_pnl_by_strategy ya NO debe mostrar):
+#   1) Filas REJECT con position_id literal "nan" (como las encontradas en
+#      el export real - un artefacto de un round-trip previo por pandas)
+#      nunca abrieron ninguna posicion, pero al no tener evento CLOSE/EXPIRY
+#      el conteo crudo las suma a "todavia abierta" igual.
+#   2) Un position_id "legacy" con una UNICA pata de ENTRY, cuya posicion en
+#      realidad se cerro mas tarde bajo OTRO position_id (reinventado en un
+#      restart - "BUG B" documentado en reconciliation.py) - el conteo
+#      crudo, que agrupa por position_id crudo, nunca ve el CLOSE del otro
+#      id y la cuenta como "todavia abierta" tambien.
+# La reconciliacion real (reconstruct_positions_from_event_journal, agrupa
+# por (symbol, strategy_tag) via FIFO cronologico, no por position_id) NO
+# tiene ninguno de los dos bugs: a las filas REJECT ni siquiera las agrupa
+# (quedan afuera del filtro de event_type), y el FIFO cierra el lote de
+# GFGC_LEGACY sin importar que el CLOSE llego con un position_id distinto.
+# ---------------------------------------------------------------------------
+
+def _bug_2026_10_27_fixture_rows():
+    return [
+        # Trade normal, cerrado limpio bajo un solo position_id (control).
+        _journal_row("ENTRY", "p_closed", symbol="GFGC_CLOSED", qty_delta=5.0, qty_after=5.0,
+                      price=100.0, ts="2026-10-01T10:00:00+00:00",
+                      contract_key="GGAL|GFGC_CLOSED|2026-11-20"),
+        _journal_row("CLOSE", "p_closed", symbol="GFGC_CLOSED", qty_delta=-5.0, qty_after=0.0,
+                      price=150.0, ts="2026-10-01T11:00:00+00:00", side="sell",
+                      contract_key="GGAL|GFGC_CLOSED|2026-11-20"),
+        # BUG #1: puro REJECT (kill switch), position_id literal "nan" -
+        # nunca hubo ENTRY, nunca deberia contar como posicion abierta.
+        _journal_row("REJECT", "nan", symbol="GFGC_REJECT", qty_delta=0.0, qty_after=0.0,
+                      price=0.0, ts="2026-10-05T09:00:00+00:00", reason="kill_switch",
+                      contract_key="GGAL|GFGC_REJECT|2026-11-20"),
+        _journal_row("REJECT", "nan", symbol="GFGC_REJECT", qty_delta=0.0, qty_after=0.0,
+                      price=0.0, ts="2026-10-05T09:05:00+00:00", reason="kill_switch",
+                      contract_key="GGAL|GFGC_REJECT|2026-11-20"),
+        # BUG #2: ENTRY "legacy" (position_id A) cerrado mas tarde bajo OTRO
+        # position_id (B) tras un restart - ya esta cerrada en la realidad.
+        _journal_row("ENTRY", "p_legacy_entry", symbol="GFGC_LEGACY", qty_delta=5.0, qty_after=5.0,
+                      price=90.0, ts="2026-09-10T09:00:00+00:00",
+                      contract_key="GGAL|GFGC_LEGACY|2026-11-20"),
+        _journal_row("CLOSE", "p_new_close", symbol="GFGC_LEGACY", qty_delta=-5.0, qty_after=0.0,
+                      price=120.0, ts="2026-10-20T09:00:00+00:00", side="sell",
+                      contract_key="GGAL|GFGC_LEGACY|2026-11-20"),
+        # Control positivo: posicion REALMENTE todavia abierta (sin CLOSE) -
+        # el fix no debe hacerla desaparecer.
+        _journal_row("ENTRY", "p_open_real", symbol="GFGC_OPEN", qty_delta=5.0, qty_after=5.0,
+                      price=95.0, ts="2026-10-25T09:00:00+00:00",
+                      contract_key="GGAL|GFGC_OPEN|2026-11-20"),
+    ]
+
+
+def test_real_open_position_counts_ignores_reject_phantom_and_merges_reinvented_id():
+    rows = _bug_2026_10_27_fixture_rows()
+    counts, note = wr._real_open_position_counts_by_strategy(rows)
+    if counts is None:
+        import pytest
+        pytest.skip(f"reconstruct_positions_from_event_journal no disponible en este entorno: {note}")
+    # Solo GFGC_OPEN esta realmente abierta - ni el REJECT "nan" ni el
+    # legacy GFGC_LEGACY (cerrado bajo otro position_id) deben contar.
+    assert counts == {"weekly_asymmetric": 1}
+
+
+def test_section_trades_pnl_by_strategy_shows_real_open_count_not_raw_inflated_count():
+    rows = _bug_2026_10_27_fixture_rows()
+    # Conteo CRUDO (el que tenia el bug, sigue existiendo internamente para
+    # el PnL excluido - no debe ser lo que el reporte termina mostrando):
+    # "nan" (REJECT) + p_legacy_entry + p_open_real = 3 "todavia abiertas".
+    _trades, raw_still_open, _incomplete = wr.reconstruct_lifecycle_trades(rows)
+    assert raw_still_open == 3
+
+    out = wr.section_trades_pnl_by_strategy(rows)
+    data_line = next(line for line in out.splitlines() if line.startswith("weekly_asymmetric"))
+    fields = data_line.split()
+    # fields = [tag, n_cerrados, abiertos, win%, net_pnl_ars, ...]
+    abiertos_shown = int(fields[2])
+    assert abiertos_shown == 1, (
+        f"'abiertos' deberia mostrar el conteo REAL (1, solo GFGC_OPEN), no el crudo "
+        f"inflado ({raw_still_open}) - linea completa: {data_line!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # section_invariant_violations
 # ---------------------------------------------------------------------------
 
@@ -358,6 +444,8 @@ ALL_TESTS = [
     test_load_position_events_rows_sorted_chronologically,
     test_section_trades_pnl_by_strategy_reports_closed_trade,
     test_section_trades_pnl_by_strategy_empty_journal_is_data_insufficient,
+    test_real_open_position_counts_ignores_reject_phantom_and_merges_reinvented_id,
+    test_section_trades_pnl_by_strategy_shows_real_open_count_not_raw_inflated_count,
     test_section_invariant_violations_ok_on_clean_journal,
     test_section_invariant_violations_flags_naked_short_long_only,
     test_section_invariant_violations_missing_file_is_data_insufficient,

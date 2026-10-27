@@ -1347,6 +1347,56 @@ condicionando el fill a una señal de momentum a favor en vez de solo
 tiempo) pero esa es una hipotesis DISTINTA, no probada aca, y el freeze
 de 3 semanas sigue vigente para cualquier implementacion real.
 
+**Correccion/ampliacion 2026-10-27 (pedido del usuario): el modelo de
+fill conservador sesga hacia seleccion adversa POR CONSTRUCCION, no solo
+por el resultado empirico de arriba.** Mecanismo (no es una medicion, es
+la logica misma de la señal + el mecanismo de orden):
+
+- La señal de scalping es de **reversion a la media de IV** - dispara
+  una compra cuando el precio esta "barato" relativo a su media reciente,
+  apostando a que el precio SUBA (revierta hacia arriba) despues de
+  entrar.
+- Una orden pasiva de COMPRA al mid solo se llena si el precio BAJA hasta
+  tocar (o cruzar) ese mid - es decir, exactamente lo contrario del
+  movimiento que la señal esta apostando que va a pasar.
+- Si la señal tiene razon (el precio sube despues de la entrada), la
+  orden pasiva de compra NUNCA se llena (el precio se aleja hacia arriba,
+  nunca vuelve a tocar el mid de entrada) - la oportunidad se escapa
+  intacta, sin registrar ni ganancia ni perdida.
+- Si la señal esta equivocada (el precio sigue bajando en vez de
+  revertir), la orden pasiva SI se llena - y precisamente ese es el
+  subconjunto de casos donde el trade iba a salir mal.
+- Conclusion: para una señal DIRECCIONAL (no neutral de inventario, como
+  si seria un market maker puro), pedir ejecucion pasiva en la MISMA
+  direccion de la apuesta es estructuralmente auto-derrotista - el
+  mecanismo de fill filtra sistematicamente a favor de los casos donde la
+  señal fallo. Esto no es un artefacto de la muestra chica (67 trades) ni
+  de la granularidad del polling (ver abajo) - es una propiedad logica
+  del diseño "señal direccional + orden pasiva en la direccion de la
+  apuesta + fill solo si el precio viene en contra". Confirma por que el
+  resultado empirico de arriba (filled=negativo, no-filled=positivo) no
+  es casualidad de esta muestra: es lo que el mecanismo predice que tiene
+  que pasar.
+
+**Granularidad real del polling de `last_price` (medido, no supuesto)**:
+sobre GFGC6400DI el 2026-10-22 (contrato liquido, primeros 20 timestamps
+del dia), intervalos entre filas consecutivas: mediana **~3,9 segundos**,
+media **~4,5 segundos**, minimo 3,28s, maximo 8,52s (n=19 intervalos, una
+muestra puntual de un solo contrato en un solo dia - no se valido que
+sea representativa de contratos menos liquidos ni de otros dias). Con
+N=30s de timeout eso da ~6-9 polls dentro de la ventana - suficiente
+resolucion para que el polling en si mismo no sea el cuello de botella
+principal (el sesgo de seleccion adversa de arriba domina, no la
+granularidad). Para N=10s (~2-3 polls) la resolucion es mas pobre y el
+resultado de esa fila especifica (n=13, el mas chico de los tres) es el
+menos confiable de los tres timeouts por este motivo, ademas del tamaño
+de muestra.
+
+**La medicion definitiva solo puede salir de ordenes reales (no shadow)
+- queda como decision del usuario**, consistente con que cualquier
+cambio de mecanismo de ejecucion sigue bloqueado por el freeze y
+requiere su aprobacion explicita antes de implementarse.
+
 ## Hipotesis 5 (scalping) — VEREDICTO 2026-10-27: APAGAR
 
 **Decision del usuario, 2026-10-27, en base a evidencia real (no una
@@ -1482,8 +1532,129 @@ posicion para diluir el costo regulatorio (ya cubierto arriba, IOL sin
 comision minima - todo proporcional, esta tabla ya lo refleja: ningun
 numero cambia en % si se escala la cantidad de contratos).
 
-## Pregunta ABIERTA (2026-10-27): "22 posiciones / delta $18M / kill
-switch disparado" del 21/10 — no se pudo trazar con los datos en mano
+## RESUELTO (2026-10-27): "22 posiciones / delta $18M / kill switch
+disparado" del 21/10 — fuente identificada, bug real encontrado en
+weekly_review.py, corregido con test, verificado contra los datos reales
+
+**Fuente de los dos numeros, segun el propio usuario**: el delta de
+"$18M" salio de sumar las filas `REJECT` del journal (kill switch,
+hasta las 14:01 UTC) - no es un delta de cartera en absoluto, es una
+suma de notional de ORDENES RECHAZADAS, nunca ejecutadas. Las "22
+abiertas" salieron de correr `weekly_review.py` ese dia. El usuario
+concluyo correctamente, antes de que se investigara nada: *"si la
+reconstruccion de hoy da 1 posicion, weekly_review.py cuenta mal las
+abiertas"* - y pidio encontrar el bug, corregirlo con test, y verificar
+que las dos vias (el reporte de `weekly_review.py` y la reconciliacion
+real) dieran el mismo numero para el 21/10 a las 19:34 UTC.
+
+**Bug real encontrado (dos sub-bugs distintos, ambos en el camino que
+usa `weekly_review.py`, NUNCA en el camino real de produccion que usa
+`run_bot.py` al arrancar)**:
+
+1. **Filas `REJECT` con `position_id` corrompido a la cadena literal
+   `"nan"`** (contaminacion de un round-trip previo por pandas en el
+   export, no del journal original): `reconstruct_lifecycle_trades`
+   (`ggal_bot/backtest/reconstruct.py`) agrupa por `position_id` CRUDO
+   via `pid = str(r.get("position_id") or "")`; como `"nan"` es una
+   cadena no vacia, el filtro `if not pid: continue` (pensado para
+   descartar exactamente las filas REJECT/CANCEL, que nunca tienen
+   `position_id`) no las excluye. El grupo resultante no tiene ningun
+   evento `CLOSE`/`EXPIRY` (son todas REJECT) -> se cuenta como
+   "todavia abierta" sin haber tenido NUNCA un `ENTRY`. Corregido en la
+   raiz, en el unico loader pandas compartido
+   (`dashboard/pnl_engine.py::load_position_events`): un campo vacio
+   leido por pandas como `float('nan')` ahora se normaliza a `""` con
+   `.fillna("")` antes de que cualquier consumidor lo vea.
+2. **`position_id` "reinventado" en cada restart del bot ("BUG B",
+   ya documentado en `reconciliation.py` para OTRO consumidor pero
+   nunca corregido en `reconstruct_lifecycle_trades`)**: una posicion
+   abierta con un `ENTRY` bajo un `position_id` legacy, cerrada MAS
+   TARDE con un `CLOSE` bajo un `position_id` distinto (el que el bot
+   le asigno tras un restart posterior), queda invisible para el
+   agrupamiento por `position_id` crudo: el grupo del id viejo nunca ve
+   su propio `CLOSE` (cuenta como "todavia abierta") y el grupo del id
+   nuevo nunca ve su propio `ENTRY` (cuenta como "datos incompletos",
+   pero en ningun caso como "cerrada"). La funcion ya existente
+   `reconstruct_positions_from_event_journal` (usada por
+   `run_bot.py` en produccion) no tiene este problema porque agrupa por
+   `(symbol, strategy_tag)` -no por `position_id`- y hace FIFO
+   cronologico sobre TODOS los eventos del grupo sin importar que el
+   `position_id` haya cambiado a mitad de camino.
+
+**Fix aplicado (3 archivos, sin tocar ninguna logica de trading, solo
+herramienta de reporte/medicion - permitido durante el freeze, ver
+FREEZE.md: bug de integridad de datos en una herramienta de
+reporte/reconciliacion)**:
+
+- `dashboard/pnl_engine.py::load_position_events`: normaliza
+  `position_id` vacio/`NaN` a `""` en el loader compartido.
+- `ggal_bot/portfolio/reconciliation.py::reconstruct_positions_from_event_journal`:
+  nuevo parametro opcional `rows=` para reconciliar directo sobre filas
+  ya cargadas en memoria (sin un segundo read de disco potencialmente
+  inconsistente).
+- `ggal_bot/ops/weekly_review.py::section_trades_pnl_by_strategy`: la
+  columna `"abiertos"` ahora muestra el conteo REAL (via
+  `reconstruct_positions_from_event_journal(rows=journal_rows)`,
+  agrupado por `strategy_tag`) en vez del conteo crudo de
+  `reconstruct_lifecycle_trades`. El conteo crudo (`n_still_open_excluded`)
+  sigue pasandose sin cambios a `build_strategy_report` (preserva el
+  invariante interno trades+still_open+incomplete==total position_id
+  que otros calculos dependen de el) - solo cambio lo que se IMPRIME.
+
+**Test de regresion**: `ggal_bot/validation/test_weekly_review.py` -
+`test_real_open_position_counts_ignores_reject_phantom_and_merges_reinvented_id`
+y `test_section_trades_pnl_by_strategy_shows_real_open_count_not_raw_inflated_count`.
+Reproducen los dos sub-bugs con un journal sintetico (REJECT con
+`position_id="nan"`, ENTRY bajo un id "legacy" cerrado bajo un id
+distinto, mas un control positivo de una posicion REALMENTE abierta
+que no debe desaparecer) y verifican que el conteo crudo sigue dando 3
+"todavia abiertas" (el bug, intacto, sigue existiendo internamente)
+mientras que lo que el reporte IMPRIME ahora es 1 (el numero correcto -
+solo la posicion de control). Suite completa corrida:
+`pytest ggal_bot/` -> 864 passed, 1 failed (una falla PREEXISTENTE,
+confirmada reproducible identica en el commit anterior a este fix, en
+`test_execution_pipeline.py::test_bootstrap_universe_classifies_by_underlying_field_without_symbol_prefix`
+- no relacionada con este cambio, no tocada).
+
+**Verificacion contra los datos REALES del 21/10 a las 19:34 UTC (el
+instante que el usuario pidio explicitamente)**, corriendo las dos
+vias sobre el MISMO journal real (`position_events.csv` del export
+`ggal_bot_export_2026-10-21_1633`, 2212 filas):
+
+| Via | Resultado |
+|---|---|
+| `reconstruct_lifecycle_trades` (conteo CRUDO, el que mostraba el bug) | **23** "todavia abiertas" (+ 15 "datos incompletos") |
+| `reconstruct_positions_from_event_journal` (reconciliacion REAL, la que usa `run_bot.py`) | **1** posicion abierta: GFGC6400DI, scalping, qty=2.0 |
+| `weekly_review.py::section_trades_pnl_by_strategy` **DESPUES del fix** (columna "abiertos" impresa) | scalping=**1**, weekly_asymmetric=**0** |
+
+Las dos vias ahora dan EXACTAMENTE el mismo numero (1), consistente con
+`bot_state.json` de ese mismo snapshot (`portfolio_greeks_total.delta`
+= 101.54 en unidades de delta de opcion, NO en ARS; `risk_breaches` =
+"Griegas dentro de limite") - una sola posicion chica, nada parecido a
+22 posiciones ni a una magnitud de "$18M". El "23 todavia abiertas"
+crudo esta ademas muy cerca del "22" que reporto originalmente
+`weekly_review.py` ese dia (la diferencia de 1 es compatible con el
+crecimiento normal del journal entre el momento exacto en que se corrio
+el reporte original y el snapshot de 19:34 usado aca) - es decir, el
+"22" del usuario SI es trazable: es el numero crudo y buggy, no un
+numero inventado ni de otra fuente.
+
+**El "$18M" sigue sin ser un delta de cartera real** (ni del shadow ni
+de ninguna cuenta real de IOL - el bot nunca coloca ordenes reales): es
+la suma de notional de ordenes RECHAZADAS por el kill switch hasta las
+14:01 UTC, un numero legitimo en si mismo (cuanto notional el kill
+switch evito que se intentara ejecutar) pero que nunca representó
+exposicion real de cartera. Con esto, la contradiccion original (22
+posiciones/$18M el 21/10 vs. 0-1 posiciones hoy) queda completamente
+explicada: ambos numeros del 21/10 eran reales y trazables, solo que
+el de "22" media con una herramienta que tenia un bug (ya corregido) y
+el de "$18M" nunca fue un delta de cartera.
+
+---
+
+### Investigacion original (2026-10-27, antes de que el usuario revelara
+la fuente de los numeros) - se conserva como registro de lo que se pudo
+trazar solo con los datos, sin la aclaracion del usuario
 
 El usuario pidio reconciliar un reporte previo (21/10: 22 posiciones
 abiertas, delta de cartera ~$18M, kill switch disparado) contra el
@@ -1519,6 +1690,8 @@ esta en shadow mode, no coloca ordenes reales); (b) un numero de un
 momento intermedio del 21/10 que no esta en ninguno de los dos exports
 disponibles (falta un snapshot entre 14:24 y 19:34, la ventana donde
 el kill switch realmente se disparo); o (c) un error de transcripcion en
-el momento en que se reporto. **Pendiente: el usuario indique la fuente
+el momento en que se reporto. ~~Pendiente: el usuario indique la fuente
 exacta (mensaje, hora, o captura) del "22 posiciones/$18M" para poder
-trazarlo en vez de descartarlo sin verificar.**
+trazarlo en vez de descartarlo sin verificar.~~ **RESUELTO arriba: el
+usuario aclaro la fuente exacta de ambos numeros y se encontro, corrigio
+y verifico el bug real que explica el "22".**

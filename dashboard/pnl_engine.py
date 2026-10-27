@@ -274,6 +274,31 @@ def load_position_events(csv_path: Optional[Path] = None) -> pd.DataFrame:
         return pd.DataFrame(columns=POSITION_EVENTS_COLUMNS)
 
     df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce", format="ISO8601")
+
+    # FIX 2026-10-27 (bug real encontrado a pedido del usuario, investigando
+    # por que weekly_review.py reportaba 22-23 posiciones "abiertas" el
+    # 2026-10-21 cuando la reconciliacion real (reconstruct_positions_from_
+    # event_journal, el camino que usa run_bot.py al arrancar) daba 0-1):
+    # las filas REJECT nunca tienen position_id (no se creo ninguna
+    # posicion - ver comentario ya existente en backtest/reconstruct.py:
+    # "REJECT/CANCEL: nunca tiene position_id, no es parte de ningun
+    # trade"), asi que ese campo queda VACIO en el CSV. pandas lee un campo
+    # vacio de una columna de texto como NaN (float), no como "" - y
+    # `bool(float("nan"))` es `True` en Python, asi que el patron
+    # `str(row.get("position_id") or "")`, usado en varios consumidores de
+    # este DataFrame para filtrar exactamente estas filas, nunca las
+    # excluye: `nan or ""` devuelve `nan` (es truthy), y `str(nan)` da el
+    # string "nan" (no vacio). Caso real detectado: 829 filas REJECT de
+    # GFGC7600OC (kill switch, 2026-09-07 a 2026-10-21 14:01 UTC) se
+    # agrupaban en backtest/reconstruct.py como una "posicion" fantasma con
+    # position_id literal "nan" - nunca con CLOSE/EXPIRY (son todas
+    # REJECT) - contando como "todavia abierta" e inflando el numero que
+    # reporta weekly_review.py. Se normaliza aca, en el unico loader
+    # compartido, para que NINGUN consumidor de este DataFrame tenga que
+    # lidiar con esto por separado.
+    if "position_id" in df.columns:
+        df["position_id"] = df["position_id"].fillna("")
+
     return df
 
 

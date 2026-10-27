@@ -78,6 +78,10 @@ from ggal_bot.backtest.metrics import build_strategy_report  # noqa: E402
 from ggal_bot.backtest.costs import CostAssumptions  # noqa: E402
 from ggal_bot.backtest.reconstruct import reconstruct_lifecycle_trades  # noqa: E402
 from ggal_bot.config import SETTINGS  # noqa: E402
+from ggal_bot.portfolio.reconciliation import (  # noqa: E402
+    ReconciliationUnavailable,
+    reconstruct_positions_from_event_journal,
+)
 from ggal_bot.market_hours import is_within_byma_session  # noqa: E402
 
 logger = logging.getLogger("ggal_bot.ops.weekly_review")
@@ -215,6 +219,46 @@ def parse_backstop_triggers(lines: List[str]) -> List[Tuple[str, str]]:
 # Secciones del reporte
 # ---------------------------------------------------------------------------
 
+def _real_open_position_counts_by_strategy(journal_rows: List[Dict]) -> Tuple[Optional[Dict[str, int]], str]:
+    """
+    BUG REAL CORREGIDO (2026-10-27, encontrado a pedido del usuario
+    investigando por que weekly_review.py reporto "22 posiciones abiertas"
+    el 2026-10-21 cuando la reconciliacion real de produccion (la que usa
+    run_bot.py al arrancar) daba 0-1): `reconstruct_lifecycle_trades`
+    agrupa por `position_id` CRUDO, sin la logica de
+    `reconstruct_positions_from_event_journal` (agrupar por (symbol,
+    strategy_tag), ver "ACTUALIZACION 2026-10-01" en reconciliation.py)
+    que existe especificamente para sobrevivir el BUG B (position_id se
+    reinventa en cada restart). El resultado: cada position_id "legacy"
+    huerfano (un ENTRY o PARTIAL_EXIT aislado, de ANTES del fix del
+    2026-10-01, que en realidad ya fue cerrado bajo OTRO position_id
+    posterior) se cuenta como "todavia abierto" - en el export real del
+    2026-10-21 14:24 UTC eso son 23 posiciones fantasma (22-23 de ellas
+    legacy pre-fix, una mas por un bug separado de NaN en position_id de
+    filas REJECT, ya corregido en dashboard/pnl_engine.py::
+    load_position_events) contra las 0 posiciones reales que la
+    reconciliacion verdadera encuentra para ese mismo instante (igual al
+    delta=0.0 real logueado en bot_state.json). Esta funcion devuelve el
+    conteo CORRECTO (mismo camino que produccion), para que el reporte no
+    siga mostrando el numero inflado.
+
+    Devuelve (conteo_por_tag o None, nota) - None si
+    reconstruct_positions_from_event_journal no esta disponible (falta
+    pandas/numpy), en cuyo caso el caller cae de nuevo al numero crudo de
+    reconstruct_lifecycle_trades, con una nota explicita (nunca en
+    silencio).
+    """
+    try:
+        positions, _warnings = reconstruct_positions_from_event_journal(rows=journal_rows)
+    except ReconciliationUnavailable as exc:
+        return None, f"(real no disponible: {exc})"
+    counts: Dict[str, int] = defaultdict(int)
+    for p in positions:
+        tag = getattr(p, "strategy_tag", None) or "weekly_asymmetric"
+        counts[tag] += 1
+    return dict(counts), ""
+
+
 def section_trades_pnl_by_strategy(journal_rows: List[Dict]) -> str:
     """
     Trades cerrados y PnL neto por estrategia, con intervalo de confianza
@@ -225,12 +269,21 @@ def section_trades_pnl_by_strategy(journal_rows: List[Dict]) -> str:
     aca la grilla completa de sensibilidad de Fase 0 (eso sigue siendo
     responsabilidad de run_fase0.py bajo pedido puntual, no de una
     revision semanal).
+
+    La columna "abiertos" usa el conteo REAL de produccion (ver
+    `_real_open_position_counts_by_strategy`), no el conteo crudo de
+    `reconstruct_lifecycle_trades` (que tiene el bug de legacy/position_id
+    documentado ahi) - ese conteo crudo (`n_still_open_excluded`) se sigue
+    pasando a `build_strategy_report` sin cambios (preserva el invariante
+    interno trades+still_open+incomplete==total position_id, usado en
+    otros lados) pero ya NO es lo que se imprime en el reporte final.
     """
     if not journal_rows:
         return "DATA INSUFFICIENT - logs/position_events.csv no existe o esta vacio."
 
     strategy_tags = sorted({(r.get("strategy_tag") or "weekly_asymmetric") for r in journal_rows})
     scenario = CostAssumptions()
+    real_open_counts, real_open_note = _real_open_position_counts_by_strategy(journal_rows)
     lines = [
         f"{'estrategia':<22}{'n_cerrados':>11}{'abiertos':>10}{'win%':>8}{'net_pnl_ars':>16}"
         f"{'IC95% net_pnl*':>18}{'expectancy/tr':>15}{'IC95% expectancy':>20}",
@@ -258,15 +311,27 @@ def section_trades_pnl_by_strategy(journal_rows: List[Dict]) -> str:
         )
         win_str = f"{report.win_rate_pct:.1f}" if report.win_rate_pct is not None else "n/d"
         exp_str = f"{report.expectancy_ars_per_trade:,.0f}" if report.expectancy_ars_per_trade is not None else "n/d"
+        abiertos_display = (
+            real_open_counts.get(tag, 0) if real_open_counts is not None else report.n_still_open_excluded
+        )
         lines.append(
-            f"{tag:<22}{report.n_trades:>11}{report.n_still_open_excluded:>10}{win_str:>8}"
+            f"{tag:<22}{report.n_trades:>11}{abiertos_display:>10}{win_str:>8}"
             f"{report.net_pnl_ars:>16,.0f}{net_ci_str:>18}{exp_str:>15}{exp_ci_str:>20}"
         )
     lines.append("")
+    nota_abiertos = (
+        "'abiertos' = posiciones REALMENTE abiertas ahora mismo (reconstruct_positions_from_event_journal, "
+        "el mismo camino que usa run_bot.py en produccion - agrupa por (symbol, strategy_tag), sobrevive "
+        "restarts). NO es el conteo crudo de reconstruct_lifecycle_trades (ese sigue existiendo internamente "
+        "para el PnL excluido, ver n_still_open_excluded en metrics.py, pero puede sobre-contar posiciones "
+        "legacy huerfanas - ver bug documentado en RESEARCH.md, 2026-10-27)."
+        if real_open_counts is not None else
+        f"'abiertos' = conteo CRUDO de reconstruct_lifecycle_trades {real_open_note} - puede sobre-contar "
+        "posiciones legacy huerfanas, ver bug documentado en RESEARCH.md (2026-10-27)."
+    )
     lines.append(
         "* IC95% net_pnl_ars es expectancy_ci * n_trades (aproximado, ver docstring) - no un bootstrap "
-        "directo sobre la suma. 'abiertos' = posiciones todavia abiertas al momento de esta corrida, "
-        "excluidas del PnL realizado (ver n_still_open_excluded en metrics.py)."
+        f"directo sobre la suma. {nota_abiertos}"
     )
     return "\n".join(lines)
 

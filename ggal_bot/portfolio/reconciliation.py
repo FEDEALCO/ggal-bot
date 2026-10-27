@@ -155,7 +155,7 @@ ALCANCE EXPLICITO - que NO resuelve este modulo:
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ggal_bot import paths
 from ggal_bot.config import SETTINGS
@@ -475,6 +475,7 @@ def reconstruct_positions_from_event_journal(
     csv_path=None,
     option_multiplier: Optional[float] = None,
     option_chain=None,
+    rows: Optional[List[Dict]] = None,
 ) -> Tuple[List[Position], List[str]]:
     """
     Reemplazo de `reconstruct_positions_from_shadow_log()` para el arranque
@@ -501,6 +502,19 @@ def reconstruct_positions_from_event_journal(
 
     Levanta ReconciliationUnavailable si dashboard.pnl_engine no se puede
     importar (misma dependencia opcional que la funcion que reemplaza).
+
+    `rows` (agregado 2026-10-27, a pedido del usuario - ver weekly_review.py::
+    section_trades_pnl_by_strategy, que la usa para reportar un conteo de
+    "abiertas" CONFIABLE, el mismo que usa run_bot.py en produccion, en vez
+    del conteo propio de reconstruct_lifecycle_trades/reconstruct_open_
+    positions que resulto tener el BUG A/B ya documentado arriba, nunca
+    corregido en ese modulo): si se pasa (no None), se usa DIRECTAMENTE en
+    vez de leer `csv_path` del disco - para el caso en que el caller ya
+    tiene las filas del journal cargadas en memoria (ej. desde
+    load_position_events_rows) y quiere garantizar que esta funcion
+    reconcilie exactamente SOBRE ESAS MISMAS filas, sin un segundo read
+    potencialmente inconsistente del archivo. `csv_path`/`rows` son
+    mutuamente excluyentes en la practica (si se pasan ambos, `rows` gana).
     """
     try:
         from dashboard.pnl_engine import _is_underlying_symbol, load_position_events
@@ -512,10 +526,18 @@ def reconstruct_positions_from_event_journal(
         ) from exc
 
     warnings: List[str] = []
-    path = csv_path if csv_path is not None else paths.POSITION_EVENTS_LOG
     mult = option_multiplier if option_multiplier is not None else SETTINGS.instruments.option_multiplier
 
-    df = load_position_events(path)
+    if rows is not None:
+        import pandas as pd  # import local, mismo criterio que el resto del modulo (dependencia opcional)
+        df = pd.DataFrame(rows)
+        if not df.empty and "timestamp_utc" in df.columns:
+            df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
+        if "position_id" in df.columns:
+            df["position_id"] = df["position_id"].fillna("")
+    else:
+        path = csv_path if csv_path is not None else paths.POSITION_EVENTS_LOG
+        df = load_position_events(path)
     if df.empty:
         return [], warnings
 
