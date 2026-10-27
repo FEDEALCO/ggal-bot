@@ -1095,6 +1095,48 @@ veredicto de la seccion anterior (H2 DESCARTADA en el regimen actual) -
 el spread real medido en mas dias sigue en el mismo rango usado para esa
 conclusion, no lo cambia.**
 
+**Credito REAL de mercado vs. costo esperado empirico (2026-10-27)**:
+la seccion anterior comparaba un credito ESTIMADO con Black-Scholes (a
+la IV real de un solo dia, 10/15) contra el costo esperado empirico. El
+usuario pidio reemplazar eso por el credito REAL observado (book en
+vivo, 13 dias, mismos `bid`/`ask`/`mid` ya usados arriba para el spread),
+contra la MISMA familia de costo esperado empirico (10 años de retornos
+log diarios del ADR, `ggal_adr_daily_10y.csv`, ventanas rolling de 42
+ruedas ~60 dias calendario, igual al horizonte real de estos quotes -
+mediana de dias_calendar observada: 60). Credito real (mediana de 13
+dias, mid/strike):
+
+| Moneyness | Mediana credito real (mid/strike) | Mediana dias_calendar |
+|---|---|---|
+| ~5% OTM | 3,924% | 60 |
+| ~10% OTM | 2,266% | 60 |
+
+Costo esperado empirico (mismos 13 dias/strikes reales, 3 regimenes de
+vol, payout naked `max(0, strike - spot*exp(r_42dias))` promediado sobre
+2.457 ventanas rolling historicas) y el edge resultante (credito real -
+costo empirico):
+
+| Regimen de vol | ~5% OTM: costo emp. (mediana) | ~5% OTM: edge | Dias con edge>0 | ~10% OTM: costo emp. (mediana) | ~10% OTM: edge | Dias con edge>0 |
+|---|---|---|---|---|---|---|
+| Sin escalar (cruda 10y, 64,93% anualizada) | 391,30 ARS | **-198,96 ARS** | 0/13 | 312,86 ARS | **-177,94 ARS** | 0/13 |
+| IV mensual real hoy (44%) | 248,21 ARS | **-57,96 ARS** | 3/13 | 182,66 ARS | **-52,64 ARS** | 2/13 |
+| Vol realizada reciente 60r (34,85%) | 181,64 ARS | +6,86 ARS | 9/13 | 124,20 ARS | +1,17 ARS | 8/13 |
+
+**Lectura**: en 2 de los 3 regimenes de vol ya usados en la seccion
+anterior (el crudo de 10 años y el de IV mensual real, los dos mas
+conservadores/realistas para un horizonte de 60 dias) el edge con
+credito REAL de mercado sigue siendo negativo, en el mismo orden de
+magnitud que ya se habia encontrado con el credito BS-estimado de un
+solo dia. Solo bajo el regimen MENOS conservador (vol realizada reciente
+de 60 ruedas, que ignora el riesgo de cola/regimen y typicamente
+subestima el riesgo a 2 meses) el edge se vuelve positivo, pero por un
+margen minusculo (+6,86 y +1,17 ARS - estadisticamente ruido, no una
+señal) y usando la estimacion de vol que menos captura el riesgo real
+de esta ventana. **No cambia el veredicto: H2 sigue DESCARTADA, ahora con
+credito real de mercado en vez de un estimado BS de un solo dia.**
+Hereda las mismas limitaciones ya documentadas (ADR como proxy de la
+local, ver seccion anterior) - no son nuevas de este agregado.
+
 ## Pre-registro — Hipotesis 1: Provision de liquidez
 
 **Pre-registrado 2026-10-13, antes de ver ningun resultado.**
@@ -1243,6 +1285,68 @@ tipico, ya flagueado en la seccion de Hipotesis 1 sin investigar a
 fondo) - se incluye en este analisis pero sus resultados se reportan
 por separado para poder detectar si el outlier distorsiona algo.
 
+**Limitacion ADICIONAL descubierta DESPUES de pre-registrar lo de arriba
+(hecho de disponibilidad de datos, no un resultado del test - se declara
+antes de calcular ninguna tasa de llenado ni PnL)**: el campo
+`last_price` (necesario para el modelo conservador de fill) solo existe
+en `market_snapshots.csv` desde el 2026-10-15 (schema de 17 a 19
+columnas, ya documentado en la seccion de Hipotesis 1 arriba) - los
+archivos del 10-08 al 10-14 NO tienen esa columna. De los 213 trades del
+universo de prueba, solo los de fechas 10-15 en adelante son testeables:
+**67 de 213** (10-15: 12, 10-16: 3, 10-21: 3, 10-22: 10, 10-23: 23,
+10-26: 16). Los 146 trades restantes (10-05 a 10-14) quedan como DATA
+INSUFFICIENT para este test especifico - se excluyen, no se fabrica un
+sustituto. 67 trades sigue siendo mas que el minimo de 30 pre-registrado,
+asi que el test es viable con la muestra reducida.
+
+**Resultados (2026-10-27, DESPUES del pre-registro de arriba)**:
+
+| Timeout N | Tasa llenado entrada | Tasa llenado AMBAS patas | PnL-al-mid: LLENADOS | PnL-al-mid: NO LLENADOS |
+|---|---|---|---|---|
+| 10s | 28/67 (41,8%) | 13/67 | -179,41 ARS/tr  IC95%[-974,2, 484,0] | +1.056,10 ARS/tr  IC95%[-238,2, 2.643,3] |
+| 30s | 33/67 (49,3%) | 21/67 | -139,03 ARS/tr  IC95%[-821,1, 432,8] | +1.198,61 ARS/tr  IC95%[-262,2, 2.972,9] |
+| 60s | 42/67 (62,7%) | 32/67 | -100,28 ARS/tr  IC95%[-988,5, 864,0] | **+1.615,05 ARS/tr  IC95%[264,7, 3.673,1]** |
+
+**Seleccion adversa: CONFIRMADA, y en la direccion mas desfavorable
+posible.** En los 3 timeouts, los trades que SI llenan pasivamente
+tienen PnL-al-mid promedio NEGATIVO, y los que NO llenan tienen PnL-al-mid
+promedio fuertemente POSITIVO (para N=60, con IC95% enteramente positivo
+- estadisticamente significativo). Interpretacion: el precio solo vuelve
+a tocar el limite propio (y por lo tanto solo se llena la orden pasiva)
+cuando el movimiento es DESFAVORABLE - las mejores oportunidades (el
+movimiento favorable grande que la señal detecta) nunca retroceden lo
+suficiente para llenar al mid, se escapan. Es el patron clasico de
+seleccion adversa contra un market maker/liquidity taker pasivo sin
+logica de cancelacion/reposicionamiento.
+
+**Neto por escala IOL, sobre los trades con AMBAS patas llenadas
+pasivamente (spread_cost=0 en ambas patas, solo costo regulatorio)**:
+
+| Timeout N | n | Gold | Platinum | Black |
+|---|---|---|---|---|
+| 10s | 13 | -1.775,74  IC95%[-3.328,9,-601,3] | -1.468,66  IC95%[-3.010,5,-291,1] | -1.161,58  IC95%[-2.692,1, 15,0] |
+| 30s | 21 | -1.535,61  IC95%[-2.502,6,-804,5] | -1.226,52  IC95%[-2.188,0,-499,2] | -917,43  IC95%[-1.875,4,-193,1] |
+| 60s | 32 | -1.384,06  IC95%[-2.493,2,-194,7] | -1.068,42  IC95%[-2.177,1, 121,3] | -752,78  IC95%[-1.857,6, 436,5] |
+
+**Respuesta al criterio de exito pre-registrado: H1b NO SOPORTADA en
+ninguna combinacion de timeout x escala.** Ninguna celda tiene IC95%
+bootstrap enteramente positivo en Black (el requisito minimo
+pre-registrado) - la mas cercana (N=60, Black, n=32>=30) sigue negativa
+en el punto central (-752,78) y su IC95% todavia cruza cero. La seleccion
+adversa (ver arriba) explica por que: la submuestra de trades que llenan
+pasivamente es, por construccion, la peor parte de la distribucion de
+PnL-al-mid, no una muestra representativa del edge de +607 ARS/trade
+medido sobre el universo completo.
+
+**VEREDICTO H1b: NO IMPLEMENTAR tal como esta pre-registrada.** Una orden
+limite simple al mid con timeout fijo no captura el edge de la señal -
+lo pierde por seleccion adversa antes de llegar a ahorrar el costo de
+spread. No descarta la idea de ejecucion pasiva en general (podria
+funcionar con logica de cancelacion dinamica, reposicionamiento, o
+condicionando el fill a una señal de momentum a favor en vez de solo
+tiempo) pero esa es una hipotesis DISTINTA, no probada aca, y el freeze
+de 3 semanas sigue vigente para cualquier implementacion real.
+
 ## Hipotesis 5 (scalping) — VEREDICTO 2026-10-27: APAGAR
 
 **Decision del usuario, 2026-10-27, en base a evidencia real (no una
@@ -1341,3 +1445,80 @@ en `config.py`). Al momento de esta decision el portfolio esta flat en
 scalping (0 posiciones abiertas, ver verificacion de vencimientos de
 octubre mas abajo), asi que apagar el flag no deja ninguna posicion sin
 gestion de salida.
+
+**Cuenta completa del usuario (2026-10-27): ejecucion pasiva sola no
+alcanza.** El usuario hizo la cuenta: +607 (edge al mid) - 1.221
+(regulatorio Gold) = -614 ARS/trade, aun con fills PERFECTOS al mid (sin
+pagar nada de spread). Se recalculo exacto (`bootstrap_ci` oficial de
+`backtest/metrics.py`, 10.000 resamples, semilla 1234, sobre los mismos
+213 trades) por escala de comision IOL (Gold 0.50% / Platinum 0.30% /
+Black 0.10%, `BROKER_COMMISSION_TIERS_PCT`) x 3 escenarios de ejecucion,
+con el derecho de mercado RE-VERIFICADO (ver `costs.py`, sigue en 0.20%,
+sin cambio):
+
+| Escala IOL | (a) Cruzando spread (actual) | (b) Al mid (spread=0) | (c) Capturando 25% del spread a favor* |
+|---|---|---|---|
+| Gold (0.50%) | -2.961,52 ARS/tr  IC95%[-3.520,6, -2.376,8] | -618,54 ARS/tr  IC95%[-1.148,1, -34,5] | -32,80 ARS/tr  IC95%[-570,4, 563,3] |
+| Platinum (0.30%) | -2.611,39 ARS/tr  IC95%[-3.169,5, -2.025,6] | -268,41 ARS/tr  IC95%[-799,8, 318,4] | +317,34 ARS/tr  IC95%[-221,8, 914,3] |
+| Black (0.10%) | -2.261,25 ARS/tr  IC95%[-2.818,5, -1.676,2] | +81,73 ARS/tr  IC95%[-450,9, 670,3] | **+667,48 ARS/tr  IC95%[126,7, 1.266,9]** |
+
+\* "Capturando 25% del spread a favor" = precio de ejecucion mejora un
+25% del costo de spread que cruzar hubiera significado (no es al mid
+puro ni cruce completo - un punto intermedio, modelado como
+`pnl_mid + 0.25*spread_cost_medido`, nunca validado contra un mecanismo
+real de ejecucion, ver Hipotesis 1b abajo para eso).
+
+**Confirma exactamente lo que dijo el usuario**: ni "al mid" solo (columna
+b) alcanza en Gold o Platinum (sigue negativo, aunque Platinum ya no es
+significativo - el IC95% cruza cero). La UNICA celda con IC95%
+enteramente positivo es Black + capturando 25% del spread - necesita
+AMBAS cosas (la escala de comision mas barata Y una mejora real de
+ejecucion, no solo pasividad), no una sola. Esto motiva directamente el
+pre-registro de Hipotesis 1b (ejecucion pasiva real, no un supuesto de
+"25% a favor") que sigue abajo.
+
+**Descartado por el propio usuario, verificado**: escalar el tamaño de
+posicion para diluir el costo regulatorio (ya cubierto arriba, IOL sin
+comision minima - todo proporcional, esta tabla ya lo refleja: ningun
+numero cambia en % si se escala la cantidad de contratos).
+
+## Pregunta ABIERTA (2026-10-27): "22 posiciones / delta $18M / kill
+switch disparado" del 21/10 — no se pudo trazar con los datos en mano
+
+El usuario pidio reconciliar un reporte previo (21/10: 22 posiciones
+abiertas, delta de cartera ~$18M, kill switch disparado) contra el
+estado de hoy (0 posiciones, delta $0, sin eventos `EXPIRY`). Se
+investigo con TODO el dato real disponible de ese dia:
+
+- `bot_state.json` de dos exports reales del 21/10 (14:24 UTC y 19:34
+  UTC): delta de cartera = **0.0** (14:24) y **101.54** (19:34) - en
+  unidades de delta de opcion (griega), NO en ARS, y en ningun caso
+  cercano a 22 ni a una magnitud de "$18M". `risk_breaches` dice
+  "Griegas dentro de limite" en AMBOS snapshots (no un breach activo en
+  ese instante). `open_orders`=0 y `active_signals`=[] en los dos.
+- `reconstruct_positions_from_event_journal()` (la funcion real del
+  proyecto) corrida contra el journal real tal como estaba a las 19:34
+  UTC del 21/10 devuelve **1 sola posicion abierta** (GFGC6400DI,
+  scalping, qty=2) - no 22.
+- `kill_switch.json` en el volumen real de Northflank tiene mtime
+  `2026-10-21 19:32 UTC` - ~2 minutos antes del snapshot de 19:34 y
+  coincide con la entrada real de GFGC6400DI (19:32:48 UTC, ya
+  investigado en una sesion anterior) - consistente con que el kill
+  switch SI se disparo en algun momento ANTES de las 19:32 ese dia (no
+  capturado en ninguno de los dos snapshots que se tienen, que son de
+  14:24 y 19:34) y se reseteo manualmente justo antes de esa entrada -
+  pero no hay un numero de "22 posiciones"/"$18M" en ningun dato real
+  revisado para ese dia.
+
+**No se fabrica una explicacion**: no se encontro soporte para "22
+posiciones"/"$18M" en bot_state.json, en el journal reconstruido, ni en
+RESEARCH.md (no hay ninguna mencion previa de esos numeros en este
+documento). Puede ser: (a) un reporte sobre la cartera REAL de IOL del
+usuario, no sobre el shadow del bot (serian cosas distintas - el bot
+esta en shadow mode, no coloca ordenes reales); (b) un numero de un
+momento intermedio del 21/10 que no esta en ninguno de los dos exports
+disponibles (falta un snapshot entre 14:24 y 19:34, la ventana donde
+el kill switch realmente se disparo); o (c) un error de transcripcion en
+el momento en que se reporto. **Pendiente: el usuario indique la fuente
+exacta (mensaje, hora, o captura) del "22 posiciones/$18M" para poder
+trazarlo en vez de descartarlo sin verificar.**

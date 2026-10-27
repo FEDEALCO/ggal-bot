@@ -39,6 +39,20 @@ FUENTES (relevadas por busqueda web el 2026-09-29, ver conversacion):
        privado) y el mas CONSERVADOR (mayor costo) de los dos aplicables a
        activos privados - un supuesto explicito, no un hecho verificado con
        el broker/BYMA directamente.
+
+       RE-VERIFICADO 2026-10-27 (pedido explicito del usuario: "derecho de
+       mercado verificado contra el tarifario vigente de BYMA para
+       opciones, no el bucket Privados asumido"): se volvio a bajar el
+       mismo PDF publico de BYMA de forma independiente. La tabla de
+       Opciones sigue sin tener una fila separada "Privados - Acciones"
+       distinta de "Privados - CEDEAR" - las unicas filas de opciones son
+       CEDEAR, Publicos e Indices (S&P MERVAL/M.AR, 0.20%, misma tasa que
+       CEDEAR). La ambiguedad NO se resolvio (sigue sin existir ese dato en
+       la fuente publica) y el supuesto NO CAMBIA: se mantiene 0.20%
+       (bucket "Privados - CEDEAR", el mas conservador de los aplicables a
+       emisor privado). Declarado explicitamente otra vez para que quede
+       claro que esto se volvio a chequear y no es un numero viejo sin
+       revisar.
     3. IVA: 21% (alicuota general vigente en Argentina), segun el propio
        PDF de BYMA ("a los valores... se les debe agregar el IVA") y el
        tarifario de IOL ("para todas las comisiones aplica el cobro de
