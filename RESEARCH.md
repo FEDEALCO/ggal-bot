@@ -2098,3 +2098,294 @@ acelerable), o (b) que el usuario acepte relajar el piso de N=30 a algo
 mas chico A SABIENDAS de que eso reduce la confiabilidad estadistica
 del corte (una decision suya, no algo que se cambie en silencio
 despues de ver que 30 no se alcanzaba).
+
+El usuario acepto el DATA INSUFFICIENT de arriba y diagnostico el
+motivo el mismo: diseño de un solo activo con ~4 señales/año no da
+muestra suficiente en 2 años de holdout. Pedido explicito, mismo rigor:
+generalizar la señal a un PANEL de ADRs argentinos para juntar N real
+sin tocar ningun parametro de la señal. Eso es lo que sigue.
+
+## Pre-registro — Módulo B PANEL: misma señal sobre 14 ADRs argentinos — 2026-10-27
+
+Pedido explicito del usuario, mismo criterio de rigor que arriba:
+pre-registrar (commitear ANTES de correr) la generalizacion de Módulo B
+a un PANEL de ADRs argentinos que cotizan en NYSE/NASDAQ via IOL, para
+resolver el problema de muestra chica del pre-registro anterior (señal
+de ~4/año en un solo activo). **Señal, entrada, salida y parametros de
+riesgo son EXACTAMENTE los mismos ya fijados y commiteados en el
+pre-registro single-asset de arriba (commit `b84b7eb`) — nada se
+reoptimiza ni se ajusta por activo.** Analisis 100% OFFLINE (scratchpad
+de esta sesion, no toca `ggal_bot/`), permitido durante el freeze de 3
+semanas (FREEZE.md) por la misma razon que el pre-registro anterior.
+
+### Universo y disponibilidad de datos
+
+Pedido: GGAL, BMA, SUPV, BBAR, YPF, PAM, TGS, CEPU, EDN, LOMA, CRESY,
+IRS, TEO, CAAP — "usar los que esten disponibles y listar cuales no".
+**Resultado: las 14 estan disponibles** (ninguna ausente), obtenidas
+via `mcp__invertironline__get_price_history` (API real de IOL, mismo
+tool ya usado y documentado arriba) en el mercado NYSE para todas
+excepto CRESY (NASDAQ). 4 de las 14 tienen menos de 10 años de
+historia por cotizar en NYSE/NASDAQ desde una fecha posterior (listado
+mas reciente del ADR) — se usan igual, con la fecha real de inicio
+declarada, nunca rellenada hacia atras:
+
+| Ticker | Mercado | Primera fecha | Última fecha | N limpio | Dropped | Repaired |
+|---|---|---|---|---|---|---|
+| GGAL  | NYSE   | 2016-10-13 | 2026-10-26 | 2.509 | 0  | 3   |
+| YPF   | NYSE   | 2016-10-27 | 2026-10-26 | 2.500 | 0  | 18  |
+| BMA   | NYSE   | 2010-01-04 | 2026-10-26 | 4.183 | 7  | 24  |
+| BBAR  | NYSE   | 2010-01-04 | 2026-10-26 | 4.176 | 4  | 13  |
+| PAM   | NYSE   | 2010-01-04 | 2026-10-26 | 4.156 | 12 | 26  |
+| TGS   | NYSE   | 2010-01-04 | 2026-10-26 | 4.149 | 18 | 168 |
+| EDN   | NYSE   | 2010-01-04 | 2026-10-26 | 3.949 | 12 | 223 |
+| CRESY | NASDAQ | 2010-01-04 | 2026-10-26 | 4.156 | 4  | 14  |
+| IRS   | NYSE   | 2010-01-04 | 2026-10-26 | 4.083 | 8  | 112 |
+| TEO   | NYSE   | 2010-01-04 | 2026-10-26 | 4.151 | 7  | 57  |
+| SUPV  | NYSE   | 2018-07-26 | 2026-10-26 | 2.067 | 2  | 59  |
+| CEPU  | NYSE   | 2018-03-01 | 2026-10-26 | 2.169 | 1  | 11  |
+| LOMA  | NYSE   | 2018-10-26 | 2026-10-26 | 2.000 | 2  | 15  |
+| CAAP  | NYSE   | 2020-04-07 | 2026-10-26 | 1.578 | 1  | 53  |
+
+**4 tickers con historia mas corta que 10 años (SUPV, CEPU, LOMA,
+CAAP)**: cotizan en NYSE desde una fecha posterior a 2016 (listado del
+ADR), no es un problema de la API — se usan con su rango real completo,
+declarado en la tabla. No se excluye ningun ticker del panel.
+
+**Limpieza de datos (regla declarada, aplicada igual a los 14,
+incluyendo GGAL retroactivamente sobre la copia usada en este panel —
+el archivo del pre-registro single-asset anterior NO se tocó)**: cada
+fuente de `get_price_history` trae ocasionalmente barras con `open`,
+`high`, `low` o `close` en `0` literal (artefacto de campo
+faltante/placeholder, visto en las 14 series, 0,03%-4,5% de las filas
+segun el ticker). Regla, sin excepciones y sin mirar el resultado antes
+de fijarla: si `close<=0` o `open<=0` → **DROP** (dato realmente
+invalido/faltante, no se puede reconstruir sin fabricar). Si solo
+`high<=0` o `low<=0` (con open/close validos) → **REPAIR** usando SOLO
+datos de la misma fila: `high=max(open,close)` si high era 0,
+`low=min(open,close)` si low era 0 (nunca se inventa un numero nuevo,
+solo se corrige un campo obviamente erroneo con otro campo real de la
+MISMA barra). Conteos exactos por ticker en la tabla de arriba — ningun
+resultado de abajo usa una fila dropeada, y toda fila reparada queda
+marcada como tal en el CSV limpio de scratchpad.
+
+### Señal, entrada, salida — SIN CAMBIOS respecto del pre-registro anterior
+
+Exactamente las reglas ya fijadas arriba ("Señal (alcista...)", "Señal
+bajista...", "Salida..."), aplicadas de forma IDENTICA a cada uno de
+los 14 tickers de forma independiente (rolling de 20 ruedas, volumen
+1.5x del promedio de 50 ruedas previas, ATR14 fijado al momento de la
+señal, trailing chandelier 2xATR14, salida por tiempo a 21 ruedas). Sin
+piramide DENTRO de cada ticker/direccion (igual que antes). Entre
+tickers no hay restriccion: dos señales de tickers distintos el mismo
+dia son dos trades independientes del panel (eso es precisamente lo
+que da la muestra que faltaba).
+
+### Costos de acciones (NO los de opciones — modelo nuevo, especifico de este pre-registro)
+
+El modulo `ggal_bot/backtest/costs.py` (comision Gold/Platinum/Black +
+derecho de mercado BYMA + IVA) es especifico de **opciones sobre
+acciones LOCALES en BYMA** y no aplica a este panel, que opera los
+**ADRs mismos en NYSE/NASDAQ** via IOL — un producto y mercado
+distinto, con tarifario propio. Se investigo el tarifario real de IOL
+para operaciones en EEUU (no se reusa el de BYMA por conveniencia):
+
+**FUENTES (relevadas por WebFetch el 2026-10-27, ver conversacion)**:
+   1. `https://www.invertironline.com/tarifas` — confirma que las
+      escalas Gold/Platinum/Black (0.50/0.30/0.10%) aplican
+      explicitamente a "acciones, bonos, cedears, letras, obligaciones
+      negociables y opciones, **en Argentina**" — NO a operaciones en
+      el mercado de EEUU. Remite a una pagina separada para EEUU.
+   2. `https://www.invertironline.com/tarifas-estados-unidos` —
+      tarifario real para "Compra y venta de acciones, ETFs, ADR y
+      REITs": **comision variable 0,35% + IVA**, **minimo US$ 2 +
+      IVA**, por operacion (se aplica a cada pata: compra Y venta por
+      separado, igual logica que el "ida y vuelta" ya usado en
+      `costs.py` para opciones). Nota al pie: clientes vinculados a
+      AP/AAG/Cuenta Empresas/Otros pueden pagar hasta 1% — no aplica a
+      este caso (no hay informacion de que la cuenta real sea de ese
+      tipo, se usa la tarifa estandar 0,35%).
+
+**Formula de costo de ida y vuelta (declarada ahora, se usa sin
+cambios al correr)**:
+```
+comision_por_pata = max(0.0035 * monto_pata, 2.00_USD)
+comision_por_pata_con_iva = comision_por_pata * 1.21
+costo_total_ida_y_vuelta = comision_por_pata_con_iva(entrada) + comision_por_pata_con_iva(salida)
+```
+`monto_pata` = precio de fill (open de la rueda de entrada/salida, sin
+look-ahead, igual que el resto del backtest) × tamaño de posicion
+nominal asumido (1 ADR por trade, consistente con el enfoque de
+"retorno % por trade" ya usado en el pre-registro single-asset — el
+costo se expresa como % del notional de esa pata, no cambia con el
+tamaño de posicion). El minimo de US$2+IVA por pata es material para
+posiciones chicas; se declara ahora para que no se "descubra" como
+excusa despues de ver el resultado.
+
+**DATA INSUFFICIENT declarado, NO fabricado, excluido del modelo base**:
+la misma pagina de EEUU lista un "ADR Fee*: 2%" con la nota "costo
+estimado por valor nominal a la fecha de posicion", sin aclarar
+periodicidad (¿anual? ¿por operacion? ¿se cobra solo a quien mantiene
+la posicion en una fecha de corte, como el "record date" tipico de los
+depositary fees de ADRs en EEUU, que normalmente son centavos por ADR
+y no un %?). No se encontro una aclaracion mas especifica en la pagina.
+**Decision**: se EXCLUYE este cargo del modelo de costos base (no se
+fabrica un supuesto sobre su periodicidad), y se declara explicitamente
+que esto hace que los costos reportados sean un **piso** (podrian ser
+mayores si ese cargo aplica por operacion o por posicion abierta en
+alguna fecha de corte dentro del holding period de 21 ruedas) — nunca
+un techo. No se encontro tampoco ningun cargo regulatorio equivalente
+al SEC fee (existe en el mercado real de EEUU pero es de fracciones de
+basis point, inmaterial frente al 0,35%+IVA ya modelado; no cambia
+ningun veredicto, se omite por ser no-material, no por falta de
+busqueda).
+
+### Bootstrap agrupado por fecha (cluster bootstrap) — pedido explicito del usuario
+
+El bootstrap i.i.d. ya existente en el proyecto (`bootstrap_ci` de
+`ggal_bot/backtest/metrics.py`, remuestreo por TRADE individual) no
+sirve aca sin modificacion: señales de distintos tickers el mismo dia
+estan correlacionadas (mismo shock macro/FX/dia de mercado argentino),
+tratarlas como independientes infla artificialmente la confianza del
+IC. Metodo declarado (implementacion nueva en el script de scratchpad,
+no se toca `metrics.py` del proyecto):
+
+1. Agrupar los trades (de la ventana y direccion en cuestion) por
+   **fecha de señal** (no fecha de entrada — la correlacion nace el
+   dia que dispara la señal en todos los tickers a la vez). Cada fecha
+   de señal es un "cluster" que puede contener 1 o varios trades (de
+   distintos tickers).
+2. Remuestreo: `n_resamples=10.000`, `seed=1234` (misma semilla fija
+   que el resto del proyecto, por reproducibilidad — no es una fuente
+   de aleatoriedad de mercado). En cada resample, elegir con reemplazo
+   tantas fechas-cluster como clusters distintos existan en la muestra
+   real; juntar TODOS los trades de las fechas elegidas (si una fecha
+   sale sorteada 2 veces, sus trades entran 2 veces); calcular la
+   expectancy promedio (media simple de retornos) sobre ese pool.
+3. IC95% = percentil 2.5/97.5 de las 10.000 expectancies resampleadas
+   (misma convencion de percentiles que `bootstrap_ci`). Punto central
+   = expectancy real (media simple de todos los trades de la ventana,
+   sin resamplear).
+4. Aplicado por separado para alcista y bajista, y por separado para
+   cada ventana de reporte (completo/desarrollo/holdout).
+
+### Construcción de la cartera de señales (portfolio) — regla declarada, una sola, sin optimizar
+
+Para el drawdown y la curva de equity de "la cartera de señales"
+(pedido explicito), con trades de distintos tickers que pueden
+solaparse en el tiempo:
+
+- **Peso igual por trade abierto, rebalanceado diariamente**: si en un
+  dia dado hay `M` trades abiertos (de cualquier ticker/direccion de
+  esa rama), cada uno recibe peso `1/M` del capital de esa rama ese
+  dia. El retorno diario de la cartera = suma ponderada de los
+  retornos diarios (close-to-close, con open-to-close en el dia de
+  entrada y close-to-open-de-salida en el dia de cierre) de cada trade
+  abierto ese dia.
+- Curva de equity = producto acumulado de `(1+retorno_diario_cartera)`.
+- **Max drawdown** = maximo retroceso pico-a-valle de esa curva (igual
+  definicion que el resto del documento).
+- **Profit factor** se reporta a nivel trade (no de la curva diaria,
+  mas simple y sin ambiguedad): suma de retornos de trades positivos /
+  |suma de retornos de trades negativos|, pooleando todos los trades de
+  esa ventana/direccion (igual formula que el pre-registro anterior).
+- Esta regla (peso igual, rebalanceo diario) es una convencion simple y
+  declarada ANTES de ver el resultado — no es la unica regla posible
+  (podria pesarse por volatilidad, por ejemplo), pero es la mas simple
+  que no requiere ningun parametro adicional que optimizar.
+
+### Comparación contra entradas aleatorias — mismo N, duración Y tickers, con p-valor
+
+Generalizacion directa del benchmark Monte Carlo ya usado arriba,
+ahora emparejado tambien por TICKER (no solo por duracion):
+
+1. `n_draws=2.000`, `seed=1234` (misma convencion que el pre-registro
+   anterior).
+2. En cada draw, para CADA trade real `i` (de ticker `t_i`, duracion
+   `d_i` ruedas) se sortea una fecha de entrada aleatoria dentro del
+   rango valido de ESE MISMO ticker `t_i` en esa ventana (nunca se
+   cambia de ticker) — asi el draw tiene exactamente el mismo N, la
+   misma duracion por trade y el mismo ticker por trade que la muestra
+   real, solo cambia CUANDO se entro.
+3. Retorno de cada pata aleatoria = `close[entry_random+d_i] /
+   open[entry_random+1] - 1` (misma formula que el pre-registro
+   anterior).
+4. Estadistico de cada draw = expectancy promedio (media simple) del
+   pool de N retornos aleatorios de ese draw.
+5. **p-valor** (one-sided, direccion = "la señal real le gana al
+   azar"): `p = (1 + #draws con estadistico >= expectancy_real) /
+   (1 + 2.000)` para la rama alcista y bajista por separado (formula
+   estandar de test de permutacion, nunca puede dar exactamente 0).
+   Se reporta tambien el percentil (igual que antes) como lectura
+   complementaria mas intuitiva, pero el p-valor es el numero que
+   decide.
+
+### Filtro de régimen — DOS variantes declaradas de antemano, nunca el veredicto principal
+
+- **Variante primaria: CCL implícito** (`ccl_implicito_diario.csv`, ya
+  validado en este proyecto) — misma regla ya usada arriba (percentil
+  >75 de la ventana movil de 252 ruedas previas, sin look-ahead, sin
+  optimizar el umbral). Cobertura real: 2016-01-04 a 2026-10-13 — las
+  señales con fecha posterior a 2026-10-13 (ultimas ~2 semanas del
+  panel) quedan DATA INSUFFICIENT para este corte especifico
+  (declarado ahora, afecta a muy pocos trades, no al resto del
+  resultado).
+- **Variante secundaria: MERVAL** — **DEFECTO DE DATOS REAL
+  encontrado y declarado ahora, ANTES de usar la serie**: la serie de
+  10 años de MERVAL/BCBA obtenida via `get_price_history` tiene un
+  valor identico congelado del 2026-10-16 al 2026-10-21 (stale quote)
+  seguido de una caida de ~29x el 2026-10-22 (de 2.841.556,46 a
+  98.228,57) que no corresponde a ninguna redenominacion conocida —
+  un defecto de la fuente, no un evento real de mercado. **Decision**:
+  la serie de MERVAL se **recorta en 2026-10-15** (ultimo valor
+  confiable antes del tramo defectuoso) para esta variante — cualquier
+  señal con fecha de régimen posterior a esa fecha queda DATA
+  INSUFFICIENT para el corte de MERVAL especificamente (igual
+  tratamiento que el gap de CCL arriba). Misma regla de percentil >75
+  de 252 ruedas previas, aplicada sobre el nivel del indice (no hay
+  OHLC de indice, solo close).
+- Ambas variantes se reportan como corte de robustez adicional (N,
+  expectancy, IC agrupado por fecha) separadas en
+  "regimen de estres" vs. "regimen normal", **solo para contexto**: el
+  veredicto principal de esta ronda se basa SIEMPRE en el resultado SIN
+  filtro de regimen (la pregunta que pidio el usuario primero).
+
+### Veredicto — criterio de éxito del PANEL, declarado ANTES de correr nada
+
+Sobre el holdout (**últimos 2 años de TODO el panel**: toda señal con
+fecha de entrada dentro de los ultimos 2 años calendario del rango
+total de datos del panel, 2024-10-26 a 2026-10-26, sin importar el
+ticker — no hay un holdout distinto por ticker), separado por
+direccion:
+
+- **SOPORTADA** si las TRES condiciones se cumplen a la vez: (a)
+  expectancy neta del panel (ya neta de costos de acciones) con IC95%
+  por bootstrap agrupado por fecha enteramente > 0; (b) p-valor < 0.05
+  contra el benchmark de entradas aleatorias de mismo N/duracion/
+  ticker; (c) N(holdout, esa direccion, panel completo) ≥ 30.
+- **HIPÓTESIS** si se cumple (a) y/o (b) pero no las tres juntas, Y
+  N≥30 — hay algo de señal pero no pasa el estandar completo.
+- **RECHAZADA** si N≥30 pero el IC95% de (a) cruza cero o es negativo
+  Y el p-valor de (b) no es significativo.
+- **DATA INSUFFICIENT** si N<30 en el holdout del panel para esa
+  direccion (mismo piso que el pre-registro anterior) — con 14
+  tickers en vez de 1 esto debería ser mucho mas dificil de alcanzar
+  que en la ronda anterior, pero se declara igual por si algun ticker
+  aporta muy pocas señales en esa ventana especifica.
+
+**GATE EXPLICITO, pedido por el usuario — condicion de bloqueo, no de
+sugerencia**: la expresion en costos de opciones de GGAL (escalas Gold
+y Black, misma metodologia ya usada arriba) **SOLO se ejecuta si la
+rama ALCISTA del panel (la que corresponde a calls, unica direccion
+que este proyecto expresa en opciones hasta ahora) resulta SOPORTADA o
+al menos cumple la condicion (a) con IC95% enteramente > 0 en el
+holdout** — si el panel no llega a eso, la expresion en opciones de
+GGAL NO se hace en esta ronda, sin excepcion y sin pedir permiso para
+"probar igual". (La rama bajista no tiene expresion en opciones en
+este proyecto todavia — ver limitacion ya declarada arriba — por lo
+que el gate no aplica a esa rama hasta que exista esa expresion, y si
+se pide, se pre-registrara ese gate aparte antes de calcularla.)
+
+**Nada de esto se corrió todavía** — este pre-registro se commitea
+ANTES de ejecutar una sola línea del backtest del panel, a pedido
+explícito del usuario, igual que la ronda anterior.
