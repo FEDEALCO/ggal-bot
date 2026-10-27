@@ -516,11 +516,13 @@ hace 13 dias.
 | 3 | Paridad put-call vs. caucion | caucion historica | **DATA INSUFFICIENT** - backlog (logging intradia bloqueado, ver seccion 5) |
 | 4 | Lead-lag ADR x CCL -> opciones locales | ADR (ok) + CCL **ahora calculado** | **Testeable** (CCL historico resuelto, ver seccion 4) |
 | 5 | scalping / weekly_asymmetric (sin privilegio) | ya logueado | scalping: **APAGAR** (veredicto 2026-10-27, ver seccion dedicada abajo - PnL neto negativo, IC95% nunca cruza cero, historico y ventana reciente consistentes); weekly_asymmetric: **Testeable**, con filtro de quotes + respaldo aplicados |
+| 6 | Divergencia MACD/RSI + Fibonacci intradia (estilo Trullas), señal spot GGAL -> ejecucion opciones diciembre | spot intradia GGAL (historico) | **DATA INSUFFICIENT - backlog, NO pre-registrada** (bloqueo de datos en dos frentes + 14 grados de libertad sin fijar, ver seccion dedicada abajo, 2026-10-27) |
 
-Backlog explicito (3): queda pre-registrada en texto para no perderse,
+Backlog explicito (3, 6): queda pre-registrada en texto para no perderse,
 pero no se testea hasta tener caucion historica o forward logging
-(bloqueado, ver seccion 5). El item 4 se desbloqueo esta sesion (CCL
-historico resuelto por calculo propio).
+(bloqueado, ver seccion 5) para el item 3, y suficiente historia real de
+spot intradia (ver seccion dedicada) para el item 6. El item 4 se
+desbloqueo esta sesion (CCL historico resuelto por calculo propio).
 
 ### Hipotesis 1 — actualizacion 2026-10-14: "datos acumulándose"
 
@@ -2554,3 +2556,203 @@ benchmark aleatorio.
 alcista NO pasa el holdout, **no se hace la expresión en opciones de
 GGAL (Gold/Black) esta ronda** — ni siquiera para "ver el número": es
 exactamente la condición que el usuario pidió bloquear de antemano.
+
+## Hipótesis 6 (backlog) — Divergencia MACD/RSI + Fibonacci intradía (estilo Trullás) — 2026-10-27
+
+Pedido explícito del usuario: agregar al backlog, **sin testear
+todavía**, la hipótesis de divergencia MACD/RSI + Fibonacci intradía
+(estilo Trullás), señal sobre el spot de GGAL, ejecución en opciones de
+diciembre. Antes de pre-registrar nada, el usuario pidió contestar 3
+preguntas — eso es lo que sigue. **Nada de esto se corrió. No hay
+pre-registro todavía — es exactamente lo que el usuario pidió evitar
+hasta resolver lo de abajo.**
+
+### 1. Disponibilidad real de datos intradía — BLOQUEADO en dos frentes
+
+**(a) `market_snapshots` en este sandbox: 0 días reales, verificado, no
+supuesto.** `logs/` está en `.gitignore` (confirmado con `git
+check-ignore`) — nunca se versiona. Los 9 archivos que existen
+localmente (8 `.gz` archivados + el vivo, 2026-09-28 a hoy) tienen
+TODOS únicamente el header, 0 filas de datos: son artefactos de tests
+viejos de este sandbox (`test_market_snapshot_log.py` genera archivos
+con este mismo nombre), no un sync de producción. El propio
+`dashboard/data/market_data.py` ya lo documentaba en su docstring
+desde el 2026-09-30: *"en este sandbox el archivo local es solo header
+(0 filas) - artefacto de prueba, no dato sincronizado de Northflank...
+el estado real en producción está sin confirmar"*.
+
+**(b) SÍ existe un export real — encontrado, pero la medición quedó
+incompleta por un corte de conexión.** Via el bridge a tu computadora
+(sesión linkeada activa al momento de esta corrida) confirmé que en la
+carpeta `GGAL BOT` de tu escritorio existe:
+- `ggal_bot_snapshot_history_2026-10-27_1225\logs\` — los archivos
+  diarios REALES de producción, `market_snapshots-2026-10-08.csv.gz` a
+  `market_snapshots-2026-10-26.csv.gz` (**19 días calendario**,
+  tamaños comprimidos entre ~5,6 MB y ~113 MB/día — el de 10-08 es el
+  grande, consistente con la acumulación pre-rotación ya documentada
+  en `config.py`).
+- `market_snapshots.txt` (carpeta raíz) — el volcado monolítico
+  completo, **4,32 GB**.
+- Esta misma carpeta ya tiene una subcarpeta `analysis_scripts` con
+  CSVs de resultados de H1/H2 (`h1_lastprice_summary.csv`,
+  `h1_transiciones_por_dia.csv`, `h2_otm_put_spread_summary.csv`) — es
+  decir, este es el mismo dataset real que ya se usó para los
+  resultados de H1/H2 ya citados en este documento (las 64.948
+  transiciones de `last_price`, etc.).
+
+**La conexión al dispositivo se cortó justo antes de poder leer el
+schema/contenido real de esos archivos** (confirmado: un segundo intento
+y un `get_device_info` de verificación también fallaron con "device not
+connected") — así que **no pude completar el conteo real de días/filas
+de spot intradía, ni la medición de spread/volumen por vencimiento
+pedida aparte**. Esto queda pendiente de que reconectes tu compu; la
+ubicación exacta del archivo ya está confirmada arriba, así que la
+proxima vez que vuelva a tener el bridge esto se resuelve en un
+chequeo, no en una nueva búsqueda.
+
+**Aun si recupero ese archivo completo, hay un techo estructural que no
+cambia**: `spot_ref` se graba una vez por CICLO de poll (se repite
+idéntico en cada fila de la cadena de opciones de ese ciclo, no es una
+serie independiente), con `poll_interval_seconds=5` segundos
+(`GGAL_BOT_SHADOW_POLL_SECONDS`, el único valor que existe en
+`config.py` — el bot corre siempre en modo shadow) — granularidad real
+~5s, solo durante el horario en que el bot efectivamente corre
+(gateado por `enforce_market_hours_gate`), y solo desde que el logger
+se activó el **2026-09-28**. Es decir, el TECHO de historia real
+disponible hoy, en el mejor caso, es de **~1 mes** — insuficiente para
+calibrar con alguna potencia estadística una señal de Fibonacci/
+MACD/RSI intradía, que necesita muchos swings/pivotes históricos para
+tener algo que decir. Esto no se resuelve leyendo el archivo — se
+resuelve con tiempo (el dato sigue acumulándose en producción).
+
+**(c) IOL `get_intraday_prices` — probado empíricamente esta sesión, no
+asumido.** El tool mismo declara: *"Only the latest sessions are kept
+upstream"*. Confirmado con pruebas reales (no solo leído):
+- **GGAL/NYSE (ADR)**: datos tick-by-tick disponibles únicamente para
+  **hoy y ayer** (2026-10-27, 2026-10-26, ~400-600 trades/día). Una
+  consulta a una semana atrás (2026-10-15 a 2026-10-19) ya devuelve
+  `intraday_unavailable` completo. Una consulta de 2026-10-20 a
+  2026-10-27 devuelve `dates_without_intraday: [10-20, 10-21, 10-22,
+  10-23]` y solo trae sesiones para 10-26/10-27 — **ventana real de
+  retención: 2 ruedas**.
+- **GGAL/BCBA (local, ARS — el subyacente REAL de las opciones de
+  diciembre que ejecutaría esta hipótesis)**: disponible únicamente
+  para la sesión de **hoy** (ni siquiera ayer+hoy juntos funcionó: esa
+  consulta de 2 días dio `intraday_unavailable`). **Cero profundidad
+  histórica.**
+- Formato: son TICKS (timestamp + precio + volumen por operación
+  real), no velas de intervalo fijo — habría que agregarlas a barras
+  manualmente, pero es irrelevante frente al problema de retención.
+
+**Conclusión de la pregunta 1**: no hay, hoy, ninguna fuente con
+suficiente profundidad histórica intradía para calibrar ni testear H6
+con el mismo rigor que el resto de este documento. El único dato real
+que existe (`market_snapshots` de producción) tiene un techo de ~1 mes
+incluso en el mejor caso. **H6 queda en backlog hasta que se acumule
+suficiente historia real** — declarado de antemano para no ajustarlo
+después de ver un número: mi estimación es "varios meses" de
+`market_snapshots` real como mínimo, salvo que se consiga acceso a un
+proveedor de velas intradía históricas que hoy el proyecto no tiene.
+
+### 2. Codificación sin look-ahead del "tramo mayor" (propuesta, no corrida)
+
+- **Pivote confirmado (fractal de orden k)**: la barra `i` es un PIVOTE
+  DE MÁXIMO confirmado si `high[i] > high[j]` para todo `j` en
+  `[i-k, i-1]` Y para todo `j` en `[i+1, i+k]` (simétrico para PIVOTE
+  DE MÍNIMO con `low`). `k` es un parámetro fijo a declarar (ej. k=3,
+  k=5 — no se elige mirando el resultado).
+- **Retraso real de confirmación = k barras, nunca cero**: en el
+  momento `i` el pivote NO existe todavía para la estrategia — recién
+  es utilizable desde la barra `i+k` en adelante. Esto es lo que hay
+  que respetar en la simulación: nunca "retroactivar" un pivote
+  confirmado a barras anteriores a `i+k` (ese es el look-ahead clásico
+  de este tipo de análisis — un humano mirando el gráfico completo ve
+  el pivote "ya puesto" desde el día `i`, un backtest honesto no puede).
+- **Selección del tramo "mayor"**: de los pivotes CONFIRMADOS (ya con
+  su retraso aplicado) dentro de una ventana móvil de `W` barras
+  previas a la barra actual, tomar el ÚLTIMO par de pivotes alternados
+  en el tiempo (un máximo y un mínimo consecutivos, sin otro pivote del
+  mismo signo entre ambos) con la MAYOR distancia de precio absoluta —
+  ese par define el 0%-100% del retroceso de Fibonacci vigente desde
+  ese momento, hasta que un pivote confirmado nuevo lo reemplace.
+- Esto es una propuesta mecánica entre varias posibles (alternativas:
+  tomar siempre el par más reciente sin importar el tamaño, o ponderar
+  por tiempo transcurrido) — declarada ahora para discutir, **no
+  corrida ni elegida por resultado**.
+
+### 3. Grados de libertad de la versión mínima (cada uno es una variante para el ajuste por tests múltiples)
+
+Contados explícitamente, 14 en la versión mínima:
+
+1. Timeframe de la vela intradía (1min/5min/etc.).
+2. Precio usado para detectar pivotes (close vs. high/low).
+3. Orden del fractal `k` (barras de confirmación a cada lado).
+4. Ventana móvil `W` de búsqueda de pivotes candidatos.
+5. Regla de selección del tramo "mayor" entre candidatos (mayor
+   distancia vs. más reciente vs. ponderado por tiempo).
+6. Parámetros de MACD (fast/slow/signal — ej. 12/26/9 u otros).
+7. Parámetro de RSI (período, ej. 14).
+8. Regla de divergencia (cuántos swings atrás compara, tolerancia para
+   considerar "divergencia").
+9. Subset de niveles de retroceso de Fibonacci usados como zona de
+   entrada (38,2/50/61,8/78,6 — cuáles).
+10. Nivel de extensión de Fibonacci usado como objetivo del tramo mayor
+    (100/127,2/161,8 — cuál, y debe ademas cumplir R neto≥3 post-costos
+    Gold para contar como señal válida, ver más abajo).
+11. Regla de disparo de entrada (qué confirma el toque del nivel: cierre
+    de vela, patrón de reversión, etc.) y su propio retraso de
+    confirmación.
+12. Regla de stop (buffer más allá del extremo del swing).
+13. Definición exacta de "R" (unidad de riesgo: distancia entrada-stop)
+    usada para el filtro de R≥3.
+14. Selección de strike/vencimiento de diciembre para la ejecución en
+    opciones (moneyness) — convierte el R del spot en un R de la
+    opción, con sensibilidad propia a IV/delta, más el filtro de
+    horario (si aplica a toda la rueda o excluye apertura/cierre).
+
+**14 grados de libertad es mucho para cualquier dataset**, y mucho más
+para uno con un techo real de ~1 mes de historia (ver pregunta 1). Toda
+corrida futura necesita, declarado ANTES de ver un resultado, una
+corrección por tests múltiples (ej. Bonferroni/FDR sobre la grilla de
+variantes efectivamente probadas) — mismo estándar que ya exige el
+resto de este documento.
+
+**Objetivo declarado por el usuario** ("solo objetivos de tramo mayor
+con R neto ≥ 3 después de costos Gold"): se incorpora como parte de la
+definición del ítem 10 — la extensión de Fibonacci elegida como
+objetivo debe, ADEMÁS de ser tocada, rendir un R neto de costos Gold
+(ídem metodología de `costs.py`, escala Gold) de al menos 3 contra el
+riesgo definido en el ítem 13; los tramos que no lo cumplan se
+descartan ANTES de contar N, no se filtran después de ver el resultado.
+
+### Estado: BACKLOG — NO pre-registrada, NO testeada
+
+Pendiente de: (a) que se resuelva el bloqueo de datos de la pregunta 1
+(reconectar para completar el inventario real, y/o esperar que
+`market_snapshots` acumule más historia en producción), y (b) que el
+usuario decida si acepta los 14 grados de libertad declarados arriba o
+prefiere fijar de antemano algunos de ellos para reducirlos antes de
+pre-registrar. No se pre-registra ni se corre nada de esto hasta
+entonces, tal como pidió el usuario.
+
+## Spread y volumen por vencimiento (semanal vs. diciembre), cerca del dinero — PENDIENTE (corte de conexión)
+
+Pedido explícito del usuario, aparte de H6: medir spread y volumen por
+vencimiento (semanal vs. mensual de diciembre) cerca del dinero con
+`market_snapshots`, y si la liquidez se concentra en el mensual,
+proponer restringir `weekly_asymmetric` a esa serie — como cambio para
+DESPUÉS del freeze (`FREEZE.md`, vigente hasta 2026-11-05), nunca
+durante.
+
+**No se pudo completar esta sesión** — mismo motivo que el punto 1(b)
+de arriba: encontré el archivo real
+(`ggal_bot_snapshot_history_2026-10-27_1225\logs\` en la carpeta `GGAL
+BOT` de tu escritorio, 19 días de datos reales 2026-10-08 a 2026-10-26)
+vía el bridge a tu computadora, pero la conexión se cortó antes de
+poder leer una sola fila. **No fabrico este número sin el dato real** —
+apenas reconectes, esto es lo primero que corro (ya sé exactamente qué
+archivo y qué comando). Hasta entonces, **no hay propuesta de
+restringir `weekly_asymmetric`** (seria inventar una conclusión sin
+evidencia) — eso se decide con el resultado real, nunca antes, y en
+cualquier caso solo se implementaría como cambio posterior al freeze,
+nunca durante.
