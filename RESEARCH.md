@@ -1640,15 +1640,97 @@ el reporte original y el snapshot de 19:34 usado aca) - es decir, el
 numero inventado ni de otra fuente.
 
 **El "$18M" sigue sin ser un delta de cartera real** (ni del shadow ni
-de ninguna cuenta real de IOL - el bot nunca coloca ordenes reales): es
-la suma de notional de ordenes RECHAZADAS por el kill switch hasta las
-14:01 UTC, un numero legitimo en si mismo (cuanto notional el kill
-switch evito que se intentara ejecutar) pero que nunca representó
-exposicion real de cartera. Con esto, la contradiccion original (22
-posiciones/$18M el 21/10 vs. 0-1 posiciones hoy) queda completamente
-explicada: ambos numeros del 21/10 eran reales y trazables, solo que
-el de "22" media con una herramienta que tenia un bug (ya corregido) y
-el de "$18M" nunca fue un delta de cartera.
+de ninguna cuenta real de IOL - el bot nunca coloca ordenes reales).
+**CORRECCION 2026-10-27 (version mas precisa que la de mas abajo)**:
+re-leyendo el campo `reason` real de las filas REJECT (antes solo se
+habia inferido, sin citarlo textualmente) - NO es una suma de notional
+de varias ordenes rechazadas. Es el texto LITERAL que el propio kill
+switch escribio la ULTIMA vez que se disparo (2026-10-16T17:55:06 UTC,
+ver subseccion siguiente), y que `run_bot.py::_act_on_entry_signal`
+despues copia tal cual (`state_ks.reason`, nunca recalculado) en cada
+REJECT subsiguiente mientras el switch sigue disparado:
+
+> `kill_switch_tripped: Exposicion direccional agregada del portfolio
+> (delta=3,115.95 acciones equiv. x spot=$5,797.50 = $18,064,705.27)
+> supera el limite configurado ($12,000,000.00).`
+
+Es decir: SI fue un delta de cartera real en algun momento (el momento
+en que `evaluate()` lo calculo y disparo el switch, 2026-10-16 17:55
+UTC) - pero es una foto CONGELADA de ESE instante, no el estado actual
+del portfolio en cada rechazo posterior. Los otros 173 REJECT con esta
+misma reason, repartidos entre el 2026-10-16 17:55 UTC y el 2026-10-21
+18:46 UTC, todos citan el MISMO numero textual - no es que la
+exposicion real se haya quedado quieta 5 dias, es que nadie volvio a
+calcularla hasta el proximo reset. Con esto, la contradiccion original
+(22 posiciones/$18M el 21/10 vs. 0-1 posiciones hoy) queda completamente
+explicada: el "22" media con una herramienta que tenia un bug (ya
+corregido, ver arriba) y el "$18M" es el texto congelado de un trip de
+hace 5 dias, repetido en cada rechazo, nunca una medicion en vivo de la
+cartera a las 21/10.
+
+### Investigacion adicional (2026-10-27): ¿quien/que reseteo el kill
+switch a las 19:32 UTC del 21/10? - mandato explicito del usuario
+
+**Verificado en el codigo (busqueda exhaustiva, sin ningun llamado
+automatico encontrado)**: `KillSwitch.reset()` (`ggal_bot/risk/
+kill_switch.py`) es, por diseño explicito (ver docstring del modulo,
+linea 31: *"RESET: deliberadamente manual (no hay auto-recuperacion por
+tiempo ni por ningun criterio automatico)"*), la UNICA forma de volver
+a `tripped=False`. Se grepeo TODO el codigo de produccion (`grep -rn
+"\.reset(" --include="*.py"` sobre todo el repo) y los UNICOS llamados
+a `KillSwitch().reset(...)` que existen son: (a) el propio CLI de este
+modulo (`python -m ggal_bot.risk.kill_switch --reset "motivo"`,
+linea ~231), y (b) los fixtures `autouse` de la suite de tests
+(`ggal_bot/validation/conftest.py`), que operan sobre un
+`KILL_SWITCH_STATE_FILE` de test, nunca el de produccion. `dashboard/
+app.py` SOLO lee el estado (`KillSwitch().status()`) para mostrarlo -
+no tiene ningun boton ni endpoint que llame a `.reset()`; el texto que
+el propio dashboard le muestra al operador le dice que lo resetee a
+mano con ese mismo comando de CLI. `run_bot.py` llama a `evaluate()`
+(que SOLO puede *disparar*, nunca resetear - linea 1220: `if not
+self.kill_switch.is_tripped(): self.kill_switch.evaluate(...)`) pero
+JAMAS llama a `.reset()` en ningun punto.
+
+**Verificado en los datos reales**: entre el primer trip (2026-09-07
+17:44 UTC, por integridad de portfolio) y el ultimo REJECT del 21/10
+(18:46 UTC, por exposicion), el journal muestra TRES reasons distintas
+de `kill_switch_tripped` (ver tabla), cada una con su propio rango de
+fechas - y como `evaluate()` solo corre cuando el switch NO esta
+disparado (ver arriba), la UNICA forma de que aparezca una reason
+nueva es que algo lo haya reseteado entre una y la siguiente. Esto
+quiere decir que el reset de las 19:32 UTC del 21/10 (el que pregunta
+el usuario) **no fue el primero** - hubo, como minimo, otros DOS
+resets manuales antes, uno entre el 07/09 y el 02/10, y otro entre el
+05/10 y el 16/10:
+
+| Reason (resumida) | Primera vez vista | Ultima vez vista |
+|---|---|---|
+| Integridad de portfolio (5 bases con Position duplicada) | 2026-09-07 17:44 UTC | 2026-09-07 18:43 UTC |
+| Exposicion delta=-5.300 x spot=$5.915 = $31.349.500 (limite $12M) | 2026-10-02 13:33 UTC | 2026-10-05 18:57 UTC |
+| Exposicion delta=3.115,95 x spot=$5.797,50 = **$18.064.705** (limite $12M) | 2026-10-16 17:55 UTC | 2026-10-21 18:46 UTC |
+
+`kill_switch.json` en el volumen real de Northflank tiene mtime
+`2026-10-21 19:32 UTC` (confirmado via `ls -la /app/logs` sobre el
+contenedor real), y la siguiente fila del journal despues de ese
+instante es un `ENTRY` normal (GFGC6400DI, scalping, razon de señal
+IV, no relacionada al kill switch) a las **19:32:48 UTC** - 48 segundos
+despues, consistente con: reset -> el siguiente ciclo de
+`_act_on_entry_signal` encuentra `is_tripped()==False` -> la señal ya
+pendiente entra sin flag.
+
+**VEREDICTO (SUPPORTED por el codigo, no se puede cerrar 100% sin el
+dato que falta)**: no existe NINGUN camino automatico en el codigo que
+pueda haber reseteado el kill switch - tiene que haber sido una accion
+humana deliberada (CLI o una llamada directa a `.reset()` desde una
+shell contra el contenedor real de Northflank). Esta sesion no tiene
+acceso al log de auditoria/historial de shell de Northflank, asi que
+no se puede confirmar DESDE ACA quien especificamente lo corrio - eso
+queda pendiente de que el usuario lo confirme (si fue el mismo) o lo
+investigue del lado de Northflank (si no lo fue). Dato adicional para
+esa confirmacion: dado que hubo al menos 2 resets previos
+(07/09->02/10 y 05/10->16/10) de los que no habia registro en este
+documento hasta ahora, vale la pena confirmar los TRES, no solo el del
+21/10.
 
 ---
 
