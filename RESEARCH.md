@@ -2213,14 +2213,38 @@ comision_por_pata = max(0.0035 * monto_pata, 2.00_USD)
 comision_por_pata_con_iva = comision_por_pata * 1.21
 costo_total_ida_y_vuelta = comision_por_pata_con_iva(entrada) + comision_por_pata_con_iva(salida)
 ```
-`monto_pata` = precio de fill (open de la rueda de entrada/salida, sin
-look-ahead, igual que el resto del backtest) × tamaño de posicion
-nominal asumido (1 ADR por trade, consistente con el enfoque de
-"retorno % por trade" ya usado en el pre-registro single-asset — el
-costo se expresa como % del notional de esa pata, no cambia con el
-tamaño de posicion). El minimo de US$2+IVA por pata es material para
-posiciones chicas; se declara ahora para que no se "descubra" como
-excusa despues de ver el resultado.
+**Correccion de un bug real, ANTES de publicar ningun numero** (se
+detecto al ver que la primera corrida daba expectancies de -50%/-60%
+por trade, numero sin sentido economico para un stop de 2xATR con
+holding maximo de 20 ruedas): la version original de esta formula no
+declaraba el tamaño de posicion (`monto_pata`), y la implementacion
+inicial asumio 1 ADR por trade "por default" — eso hace que el minimo
+de US$2+IVA por pata (≈US$4,84 de ida y vuelta) se compare contra un
+notional de ~US$10-40 (precio tipico de los ADRs del panel), un
+~12%-48% de costo de ida y vuelta por trade, un artefacto de unidades
+(nadie opera 1 ADR real; el minimo de orden existe precisamente para
+que sea irrelevante en cualquier operacion de tamaño normal), no un
+costo real. **Formula corregida y la que se usa**: para cualquier
+orden con notional por pata mayor a US$2/0,35% ≈ US$571,43 (el punto
+donde el minimo deja de aplicar — cualquier posicion real, sea de
+varios cientos o miles de dolares, supera eso con margen), el costo
+converge al termino puramente porcentual:
+```
+costo_total_ida_y_vuelta_pct = 2 * 0.0035 * 1.21 = 0,8470% del notional de entrada
+```
+Se usa este numero FIJO (no depende del precio de fill ni de un
+tamaño de posicion asumido) como el costo de ida y vuelta para TODOS
+los trades del panel — es el costo real para cualquier operacion de
+tamaño institucional o retail razonable (no para 1 ADR), y es
+levemente CONSERVADOR (ligeramente mas caro) que una operacion mas
+grande donde el minimo nunca aplicaria de todas formas. El minimo de
+US$2+IVA por pata sigue siendo real y relevante solo para una cuenta
+que efectivamente opere con notionales de pocos cientos de dolares por
+pata — fuera de alcance de este backtest (no hay un supuesto de
+tamaño de cuenta real documentado en el proyecto para la pata de
+acciones, a diferencia de `max_capital_ars` que es especifico de la
+pata de opciones — ver `ggal_bot/config.py`), declarado aca
+explicitamente para que conste.
 
 **DATA INSUFFICIENT declarado, NO fabricado, excluido del modelo base**:
 la misma pagina de EEUU lista un "ADR Fee*: 2%" con la nota "costo
