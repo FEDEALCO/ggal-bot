@@ -3118,3 +3118,164 @@ de esto, el kill switch y su historial de disparos (Sept 7, Oct 2, Oct
 probablemente ya conoce (es quien lo resetea), pero se deja constancia
 acá por si no se había notado que `weekly_asymmetric` específicamente
 quedó sin ninguna señal desde el 14/10.
+
+## Propuesta post-freeze (NO implementar todavía) — rolleo automático por liquidez y operar 5-7 semanas a vencimiento
+
+**Pedido explícito del usuario, diseño/análisis únicamente** — nada de
+esta sección se codifica ni se despliega antes del 2026-11-05. Dos
+partes: (a) una regla de selección automática de serie por liquidez en
+vez de `GGAL_BOT_FORCE_EXPIRY` fijo, y (b) qué cambia en el perfil de
+riesgo de `weekly_asymmetric` al operar 5-7 semanas a vencimiento en vez
+de 1-2, con foco en `weekend_theta_guard`.
+
+### (a) Selección automática de serie por liquidez, con rolleo
+
+**Problema que resuelve, con evidencia ya reunida en este documento**:
+`GGAL_BOT_FORCE_EXPIRY` fijo (la propuesta de la sección "Spread y
+volumen por vencimiento" arriba) resuelve el síntoma del freeze actual
+(diciembre es, HOY, la serie líquida) pero es una foto fija - el
+hallazgo de la sección anterior (`weekly_asymmetric` sin ninguna señal
+desde el 14/10) muestra el costo real de quedarse atado a una serie que
+deja de tener mercado: no es "peor ejecución", es **cero operación**.
+Diciembre eventualmente va a dejar de ser la serie líquida (a medida
+que se acerque su propio vencimiento) exactamente como le pasó a
+octubre - sin una regla de rolleo, el día de ese cambio hay que
+acordarse de tocar la env var a mano.
+
+**Métricas (reusa exactamente lo ya medido/calculado para la sección de
+arriba, sin inventar nada nuevo)**:
+- **Spread mediano relativo cerca del dinero** (moneyness `|strike/spot
+  - 1| <= 5%`, igual que `spread_depth_by_expiry.awk` usado arriba) -
+  MEDIANA, no promedio, para no dejar que outliers de iliquidez extrema
+  (ej. el 132% de spread del próximo vencimiento en su peor momento)
+  dominen la métrica de un día cualquiera.
+- **Volumen/profundidad ATM**: `bid_size + ask_size` promedio en el
+  strike mas cercano al spot (no `last_volume` - ver el bug ya corregido
+  arriba; aunque esté corregido, `bid_size+ask_size` sigue siendo mejor
+  proxy de liquidez EJECUTABLE AHORA que un volumen ya operado).
+
+**Mecanismo propuesto (mismo patrón ya validado en este proyecto para
+multi-fuente de datos, `ShadowConfig.source_priority()` -
+`source_failure_threshold`/`source_reprobe_interval_seconds` en
+`ggal_bot/data/live_shadow_feed.py`/`config.py` - reusar el patrón, no
+inventar uno nuevo)**:
+
+1. Cada N minutos (ej. cada ciclo de refresco de puntas cercanas al
+   dinero, `BrokerRestSource._refresh_near_the_money_quotes`, que ya
+   corre en un throttle propio), calcular las dos métricas de arriba
+   para la serie ACTUALMENTE activa y para la(s) siguiente(s) serie(s)
+   disponible(s).
+2. **Rolleo** (cambiar la serie activa de `weekly_asymmetric`) solo si
+   la siguiente serie SUPERA a la activa en AMBAS métricas por un
+   margen, no apenas empatando (ej. spread mediano de la siguiente <=
+   80% del de la activa, Y profundidad ATM de la siguiente >= 120% de
+   la activa) - el margen evita "flapping" entre dos series con
+   liquidez similar, mismo criterio que ya se uso para
+   `source_reprobe_interval_seconds` (no conmutar por una mejora
+   marginal y volátil de un solo poll).
+3. **Histeresis temporal**: igual que `source_reprobe_interval_seconds`,
+   exigir que la condicion de rolleo se sostenga durante una ventana
+   (ej. 2-3 ruedas consecutivas, no un solo poll) antes de efectivizar
+   el cambio - una serie puede tener un poll puntual mejor por una
+   cotización vieja, no por una mejora real y sostenida.
+4. **Posiciones abiertas**: el rolleo cambia la serie para ENTRADAS
+   NUEVAS únicamente (mismo criterio que el propio kill switch -
+   "bloquea solo entradas nuevas, nunca salidas" - y que
+   `forced_expiry` ya tiene documentado: solo filtra en
+   `scan_entry_signals`, nunca fuerza el cierre de lo ya abierto). Una
+   posición abierta en la serie vieja se gestiona con sus reglas de
+   salida normales hasta que cierre sola.
+5. **Implementación concreta (para cuando se autorice, NO ahora)**: un
+   método nuevo tipo `InstrumentsConfig.resolve_active_expiry()` (o una
+   clase pequeña `ExpirySelector`, análoga a `LiveShadowFeed` pero para
+   vencimientos en vez de fuentes de datos) que calcula la serie activa
+   con el mecanismo de arriba y la expone donde hoy se lee
+   `forced_expiry_date` (`weekly_asymmetric.py` línea ~830) - cambio
+   acotado, reusa el punto de integración que ya existe, no requiere
+   tocar el resto de `scan_entry_signals`.
+6. **Opt-in, no reemplaza `forced_expiry`**: si el usuario fija
+   `GGAL_BOT_FORCE_EXPIRY` explícitamente, esa sigue siendo la decisión
+   final (override manual) - el rolleo automático solo actúa cuando
+   `forced_expiry` NO está fijada, mismo patrón de "selector legado vs.
+   prioridad explícita" que ya usa `ShadowConfig.source_priority()`
+   frente a `GGAL_BOT_SHADOW_SOURCE`.
+
+### (b) Operar con 5-7 semanas a vencimiento en vez de 1-2: qué cambia
+
+**Theta**: el riesgo de decay que motivó originalmente
+`weekend_theta_guard_enabled` (caso real documentado 2026-09-01,
+-$133.568 de decay de fin de semana no capturado) es estructuralmente
+MENOR en magnitud de ARS/día a 5-7 semanas que a 1-2: theta (para una
+opción ATM, aproximación de Black-Scholes) escala aproximadamente con
+`1/√T` - una posición con 5-7 semanas de vida tiene, por construcción,
+un theta diario mas chico que la misma posición con 1-2 semanas. El
+PELIGRO especifico que dio origen al guard (un fin de semana entero de
+decay no capturado) pesa menos en pesos cuanto mas lejos esta el
+vencimiento.
+
+**Gamma**: mismo sentido que theta - gamma ATM tambien escala
+aproximadamente con `1/√T`, mas chico a 5-7 semanas. El riesgo de
+re-cobertura de delta por un gap de fin de semana (el precio de GGAL se
+mueve de golpe el lunes) es menor con mas tiempo a vencimiento.
+
+**Vega**: al REVES que theta/gamma - vega ATM escala aproximadamente
+con `√T`, **mas grande** a 5-7 semanas que a 1-2. Esto es la asimetria
+clave para esta propuesta: el riesgo dominante de un fin de semana para
+una posicion de 5-7 semanas NO es el mismo que el guard fue diseñado
+para cortar (theta) - es la exposicion a un shock de IV (ej. una
+sorpresa macro/politica durante el fin de semana que mueva la vol
+implicita de GGAL) sobre una posicion con vega mucho mayor. El propio
+proyecto ya tiene una guardia de compresion de vega en otro lado
+(mencionada en comentarios de `black_scholes.py` como consumidora de
+theta/vega) que seria mas relevante para este riesgo especifico que
+`weekend_theta_guard` tal como esta.
+
+**Que implica esto para `weekend_theta_guard` en el regimen de 5-7
+semanas (el "sentido" que pidio el usuario)**:
+
+`weekend_theta_guard_enabled` tal como esta HOY (default True, sin
+excepcion salvo que se fije `weekend_theta_guard_max_holding_business_
+days`) cierra **cualquier posicion abierta, todos los viernes, sin
+importar cuan lejos este su vencimiento** (confirmado por lectura de
+`risk_manager.py::evaluate_position_exit` y documentado explicitamente
+en el comentario de `config.py` linea ~1206: "dispara todos los
+viernes para CUALQUIER posicion cuyo vencimiento no haya llegado
+todavia ... podria ser Octubre"). Aplicado sin cambios a una posicion
+de 5-7 semanas, esto la fuerza a cerrar y (si la señal todavia aplica)
+reabrir **cada viernes durante potencialmente 5 a 7 ciclos semanales
+seguidos** - multiplicando el costo regulatorio de round-trip (comision
++ derechos + IVA, el mismo costo que ya devasto 97.5% de las entradas
+Fase 0 segun el comentario de `config.py` linea ~1252, aunque por un
+mecanismo distinto) por ese mismo factor de 5 a 7, exactamente en
+contra del motivo por el que se alargaria el horizonte (evitar la
+iliquidez/el costo de operar seguido en una serie cercana - ver secciones
+de arriba).
+
+**Esto NO significa que haya que desactivar el guard sin mas** (el
+riesgo real de 2026-09-01 que lo motivo sigue siendo real, solo que
+mas chico en magnitud a mayor DTE, no inexistente) - el proyecto YA
+tiene el mecanismo para acotarlo sin eliminarlo:
+`weekend_theta_guard_max_holding_business_days` (hoy en `None`,
+osea sin excepcion). Fijarlo a un valor ligado al mismo concepto que
+`tiered_stop_loss_stage3_business_day` (default 4 dias habiles - el
+punto en el que el stop mas angosto ya protege la posicion, segun el
+propio razonamiento ya escrito en `config.py` para ESTE flag) evitaria
+el cierre forzado semanal una vez que la posicion ya esta bajo el stop
+mas angosto, dejando el guard activo SOLO para los primeros dias de
+vida de la posicion (donde el caso real de 2026-09-01 efectivamente
+ocurrio: un fin de semana con la posicion todavia con el stop ancho).
+Para una posicion de 5-7 semanas, esto reduciria los cierres forzados de
+"todos los viernes de su vida" a "como mucho el primer viernes, si
+cae dentro de los primeros ~4 dias habiles" - alineado con el riesgo
+real (theta/gamma de una posicion recien abierta) en vez de con un
+limite calendario que no distingue DTE.
+
+**Alternativa a considerar (no excluyente, mas disruptiva, NO
+diseñada en detalle aca por alcance del pedido)**: reemplazar/
+complementar el criterio de "todos los viernes" por un limite basado en
+VEGA absoluta de la posicion (dado que ese es el riesgo que realmente
+crece a 5-7 semanas) en vez de, o adicional a, un limite calendario -
+quedaria como una hipotesis de diseño separada si el usuario quiere
+profundizarla despues del freeze, no se desarrolla mas aca para no
+exceder el pedido de "analizar que cambia", que es lo pedido
+explicitamente.
