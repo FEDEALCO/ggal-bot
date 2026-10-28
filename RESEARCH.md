@@ -2998,3 +2998,123 @@ para H1b arriba, y la sección de spread/volumen por vencimiento ya
 declaraba que no usa `last_volume` (ver arriba, "no se usa `last_volume`
 para nada en el analisis de abajo"). El bug estaba contenido al propio
 campo, sin contaminar ninguna conclusión ya publicada.
+
+## weekly_asymmetric desde el freeze (2026-10-15) — hallazgo: la estrategia no operó
+
+**Pedido explícito del usuario**: por trade cerrado desde el inicio del
+freeze (15/10 17:00 en adelante), reportar vencimiento operado, spread
+relativo en la entrada y en la salida, costo de spread pagado y PnL al
+mid; calcular qué % de los trades y del PnL perdido viene de la serie
+cercana; y, si la mayoría viene de ahí, recomendar si cortar el freeze
+ya.
+
+**Supuesto declarado (no hay forma de confirmarlo sin el `.env` real de
+producción, que esta sesión no tiene ni pide)**: se usa
+**2026-10-15T17:00:00 UTC** como ancla del freeze, por ser el horario
+mas consistente con el commit real que agrego `FREEZE.md`
+(`f1d355b`, 2026-10-15T17:13:21 UTC — 13 minutos después de las "17:00"
+que menciona el pedido original). Si en realidad el usuario se refería a
+17:00 ART (=20:00 UTC), la conclusión de esta sección NO cambia: como se
+ve abajo, no hay NINGÚN trade cerrado de `weekly_asymmetric` en todo el
+rango 2026-10-14 a 2026-10-26 disponible, así que correr el límite 3
+horas no agrega ni quita ningún trade.
+
+### Resultado: CERO trades cerrados de weekly_asymmetric desde el freeze
+
+**No se fabricó ninguna tabla de "spread relativo/costo/PnL por trade"
+porque no hay un solo trade que reportar.** Fuente: `position_events.csv`
+real de producción (export `2026-10-27_1112`, 2.316 filas, rango
+2026-09-07 a 2026-10-26 — el journal estructurado que ya registra
+ENTRY/CLOSE/PARTIAL_EXIT/REJECT con `strategy_tag` explícito, más
+confiable que inferir la estrategia por símbolo). Filtrado a
+`strategy_tag == "weekly_asymmetric"`:
+
+- **El último evento de CUALQUIER tipo de `weekly_asymmetric` en todo el
+  archivo es del 2026-10-14T13:31:59 UTC** — un `CLOSE` por
+  `quote_gap_backstop` (guarda de integridad de datos, `RiskConfig.
+  enable_quote_gap_backstop`, default ON, cierra posiciones cuando el
+  book de ESE contrato lleva mucho tiempo sin una punta válida) sobre
+  `GFGV6400OC`, junto con dos CLOSE mas del mismo tipo sobre
+  `GFGV6000OC` y `GFGV5400OC` en los minutos previos — liquidando TODAS
+  las posiciones de `weekly_asymmetric` que quedaban abiertas, un día
+  **antes** de que arrancara el freeze.
+- **Desde ese momento hasta el final de los datos disponibles
+  (2026-10-26), no hay NINGÚN evento mas de `weekly_asymmetric`**: ni
+  ENTRY, ni CLOSE, ni PARTIAL_EXIT, ni siquiera un REJECT (que sí se
+  siguen viendo, 75 veces, para `scalping` en el mismo período — ver
+  abajo). La estrategia no abrió una posición nueva, no tuvo una
+  posición que cerrar, y ni siquiera intentó una señal que fuera
+  rechazada - silencio total.
+
+**Por qué (investigado, no solo observado)**: dos causas, una que
+explica el final del período anterior y otra que explica el silencio
+posterior:
+
+1. **Kill switch por exposición direccional** (`max_portfolio_delta_ars`,
+   límite $12.000.000) se disparó el **2026-10-16T14:40:52 UTC**
+   (`ggal_bot.log`: *"KILL SWITCH DISPARADO (max_portfolio_delta_ars):
+   ... delta=3.115,95 acciones equiv. x spot=$5.797,50 =
+   $18.064.705,27 supera el limite ... ($12.000.000,00)"*) y bloqueó
+   TODA entrada nueva (de cualquier estrategia - el kill switch es
+   centralizado, ver `run_bot.py` linea ~2979, "bloquea SOLO entradas
+   nuevas, nunca salidas") hasta su reset manual. `scalping` siguió
+   intentando entrar y fue rechazado por este motivo **75 veces entre
+   el 2026-10-16 y el 2026-10-21** (último rechazo logueado:
+   2026-10-21T18:46:18 UTC) - confirma que el kill switch estuvo
+   disparado la mayor parte de esa ventana. `weekly_asymmetric`, en
+   cambio, no tiene NINGÚN intento rechazado por kill switch después
+   del 2026-10-14 - no llegó siquiera a esa altura del código.
+2. **Causa de que `weekly_asymmetric` no generara NINGUNA señal nueva
+   (ni para ser rechazada por el kill switch) desde el 2026-10-14**:
+   consistente con el hallazgo YA documentado arriba en "Spread y
+   volumen por vencimiento" - el vencimiento cercano vigente en esa
+   ventana (2026-11-20) prácticamente no tuvo mercado de dos puntas
+   (132% de spread relativo promedio, ausente por completo 3 de 6
+   ruedas). Si el filtro de liquidez de entrada
+   (`RiskConfig.enforce_entry_spread_gate`, ver `run_bot.py` linea
+   ~2960) descarta la señal ANTES de llegar al chequeo de kill switch
+   (como indica el orden del código: el gate de spread se evalúa
+   primero), eso explicaría por qué no hay ni un REJECT de
+   `weekly_asymmetric` en este período - no es que no se intentara
+   nada, es que no había ninguna cotización operable sobre la que
+   intentar nada. (No se confirmó con un log explícito de
+   `spread_not_tradeable` para `weekly_asymmetric` en esta ventana
+   especifica - el patrón es consistente con la hipótesis pero esto
+   queda como **HYPOTHESIS**, no VERIFIED, para no sobre-afirmar sin
+   un log que lo diga literalmente.)
+3. **Estado actual (2026-10-27T14:14:13, snapshot mas reciente
+   disponible, `bot_state.json`)**: portfolio totalmente plano (delta/
+   gamma/vega/theta = 0 en todos los vencimientos), `active_signals: []`,
+   `risk_breaches: "Griegas dentro de limite."` - consistente con que
+   el kill switch terminó reseteado (por el usuario, nunca por esta
+   sesión) en algún momento entre el 2026-10-21 y el 2026-10-27, pero
+   `weekly_asymmetric` sigue sin posiciones ni señales activas.
+
+### Respuesta a la pregunta del usuario
+
+**No se puede calcular "% de trades y de PnL perdido que viene de la
+serie cercana" porque el denominador es cero** - no hubo trades de
+`weekly_asymmetric` de ningún vencimiento durante el freeze, ni cercano
+ni de diciembre. Esto hace que la pregunta original (¿la serie cercana
+está destruyendo el PnL vía costo de ejecución?) quede **DATA
+INSUFFICIENT**, pero reemplazada por un hallazgo mas urgente: la
+estrategia lleva ~2 de las 3 semanas del freeze completamente inactiva.
+
+**Recomendación: NO cortar el freeze por este motivo.** Cortar el
+freeze no resuelve nada de lo encontrado acá - el freeze es sobre NO
+tocar la lógica de decisión, y el problema real no es un costo de
+ejecución que el freeze esté generando (no hay ejecuciones), es que el
+universo de instrumentos actual (vencimiento cercano) no tiene mercado
+operable. Terminar el freeze antes no le da liquidez al vencimiento
+cercano. Lo que SÍ es información nueva y relevante: este hallazgo es
+**evidencia adicional, independiente, a favor de la propuesta de la
+sección anterior** (restringir/rotar `weekly_asymmetric` hacia la serie
+de diciembre por liquidez) y de la propuesta de rolleo automático de la
+sección siguiente - el costo de quedarse en una serie cercana sin
+mercado no es "peor ejecución", es **cero operación durante semanas**,
+un costo de oportunidad mucho mayor que cualquier spread. Independiente
+de esto, el kill switch y su historial de disparos (Sept 7, Oct 2, Oct
+16) durante el freeze es informacion operativa que el usuario
+probablemente ya conoce (es quien lo resetea), pero se deja constancia
+acá por si no se había notado que `weekly_asymmetric` específicamente
+quedó sin ninguna señal desde el 14/10.
