@@ -2610,19 +2610,19 @@ pendiente). Esto no se resuelve leyendo mas archivo — se resuelve con
 tiempo (el dato sigue acumulándose en producción desde el 2026-09-28).
 
 **Hallazgo real adicional, no pedido, encontrado al leer el archivo
-(declarado, no corregido en silencio)**: la columna `last_volume` del
-log de producción tiene valores absurdos para volumen de UN contrato de
-opción (cientos de millones, con decimales — ej. `493.528.444,3` para
-`GFGC6000DI` un dia dado) mientras `last_price` de esa misma fila es un
-numero de prima plausible (~500-670). Esto no es volumen de contratos
-operados de esa opcion especifica - probablemente el pipeline esta
-poblando ese campo con algo del SUBYACENTE (monto operado de la accion
-GGAL, que en pesos devaluados de 2026 si tiene ese orden de magnitud) en
-vez de volumen propio del contrato. **No se usa `last_volume` para nada
-en el analisis de abajo** por este motivo (ver seccion de spread/
-volumen por vencimiento) - queda documentado aca como un bug candidato
-para que el equipo lo revise aparte, nunca silenciado ni "corregido" sin
-avisar.
+(declarado, no corregido en silencio) — RESUELTO 2026-10-28, ver
+`### Bug de integridad de datos: last_volume (RESUELTO 2026-10-28)`
+mas abajo para el diagnostico completo, la verificacion de `last_price`
+y el commit del fix.** La columna `last_volume` del log de producción
+tenía valores absurdos para volumen de UN contrato de opción (cientos de
+millones, con decimales — ej. `493.528.444,3` para `GFGC6000DI` un dia
+dado) mientras `last_price` de esa misma fila era un numero de prima
+plausible (~500-670). Causa raíz confirmada: el pipeline usaba
+`montoOperado` (monto OPERADO EN PESOS del broker IOL, no una cantidad de
+unidades) en vez de `volumenNominal` (la cantidad real). **No se usa
+`last_volume` para nada en el analisis de abajo** (ver seccion de spread/
+volumen por vencimiento) - la conclusión de H6 arriba no depende de este
+campo.
 
 **(c) IOL `get_intraday_prices` — probado empíricamente esta sesión, no
 asumido.** El tool mismo declara: *"Only the latest sessions are kept
@@ -2841,3 +2841,160 @@ cae exactamente en lo que `FREEZE.md` prohíbe durante la ventana
 propuesta AHORA (permitido, es research/documentación), pero la
 decisión de fijar la env var queda para el usuario, y su aplicación
 para después del 2026-11-05.
+
+## Bug de integridad de datos: last_volume (RESUELTO 2026-10-28)
+
+**Pedido explícito del usuario, URGENTE**: investigar el hallazgo de
+`last_volume` en cientos de millones (ver sección de H6 arriba),
+encontrar el campo de origen exacto, y verificar con la misma
+rigurosidad que `last_price` SÍ sea el último precio operado real de
+cada opción (comparado contra el bid/ask de ESE contrato en el MISMO
+timestamp).
+
+### 1. Qué fuente estaba activa en producción (verificado, no asumido)
+
+El proyecto tiene 4 fuentes posibles para el modo Shadow
+(`ShadowConfig.source_priority()`, `ggal_bot/data/live_shadow_feed.py`):
+`primary_ws` (PrimaryMarketDataSource/pyRofex), `data912`
+(Data912RestSource, REST público sin auth), `broker_rest`
+(BrokerRestSource, REST autenticado de IOL/InvertirOnline) y `mock`
+(generador sintético). Cuál estuvo REALMENTE activa durante la ventana
+de `market_snapshots` analizada (2026-09-28 a 2026-10-26) no se asumió:
+se leyó el log real de producción `logs/market_data_source_log.csv`
+(que registra `active_source_name` en cada evento de trading) más su
+copia más completa en `ggal_bot_export_2026-10-27_1112/`, combinadas y
+ordenadas por timestamp (1.763 eventos, 2026-10-02 a 2026-10-26):
+
+- Del 2026-10-02 al 2026-10-07 hubo "flapping" entre `BrokerRestSource`,
+  `Data912RestSource` y `MockReplaySource` (consistente con el mecanismo
+  de reprueba periódica de `source_reprobe_interval_seconds` mientras
+  `BrokerRestSource` todavía no estaba completamente estable).
+- **Desde 2026-10-07T19:34:17 UTC en adelante, y hasta el final de los
+  datos disponibles (2026-10-26), la fuente activa es ÚNICAMENTE
+  `BrokerRestSource` — cero transiciones, 1.234 de 1.763 eventos
+  totales del log.** Esto cubre prácticamente toda la ventana real de
+  `market_snapshots` usada en el análisis de H6 y de spread/volumen por
+  vencimiento de arriba.
+
+**Conclusión: `BrokerRestSource` (el conector autenticado de IOL) es la
+fuente real que generó los datos analizados**, no `data912` como
+hubiera sido el default sin un `GGAL_BOT_SHADOW_SOURCE_PRIORITY`
+explícito (el `.env` de producción debe tener `broker_rest` en esa
+lista; esta sesión no tiene ni necesita ver el `.env` real para esta
+conclusión, el log de `active_source_name` ya lo confirma
+directamente).
+
+### 2. Campo de origen del bug (confirmado, no solo hipotetizado)
+
+`BrokerRestSource._parse_quote_record` (línea ~815, antes del fix)
+poblaba `last_volume` así:
+
+```python
+last_volume=_to_float(rec.get("montoOperado") or rec.get("volumenNominal")),
+```
+
+`montoOperado` es terminología estándar de brokers argentinos para
+"monto operado **en pesos**" (moneda, no una cantidad de
+unidades/contratos); `volumenNominal` es la cantidad real de
+unidades/nominales operados — el campo semánticamente correcto para
+"volumen". El propio test ya existente en el repo
+(`test_broker_rest_source_parse_quote_record_matches_confirmed_iol_schema`,
+esquema confirmado contra una cuenta real) ya tenía la prueba de esto
+sin que nadie lo marcara como sospechoso: para la cotización del
+subyacente GGAL, `montoOperado=13.320.723.130,0` — **13.320 millones de
+pesos**, consistente con el monto en PESOS operado de una acción
+líquida (GGAL a ~7.000 ARS/acción × ~1,9M acciones/día), pero
+imposible como "cantidad de unidades". Como `montoOperado` se evaluaba
+PRIMERO en el `or`, cualquier registro (de la acción o de una opción)
+que tuviera ese campo poblado con un monto en pesos terminaba
+guardando ese monto como si fuera "volumen" — exactamente el patrón
+real observado (cientos de millones, con decimales, para una opción
+individual).
+
+### 3. Verificación de last_price (la misma rigurosidad pedida)
+
+**Método, exactamente como lo pidió el usuario**: para cada fila válida
+(bid>0, ask>0, last_price>0) de `market_snapshots` real, se comparó
+`last_price` contra `[bid, ask]` del MISMO contrato en el MISMO
+`timestamp_utc`, y por separado contra `spot_ref` (el spot de GGAL en
+esa fila) — un `last_price` sistemáticamente fuera de rango o pegado al
+spot delataría el mismo tipo de bug que `last_volume`.
+
+Corrido sobre los 11 días reales con columna `last_price` disponibles y
+sin error de script (2026-10-{15,16,17,19,20,21,22,23,24,26} — se
+excluyen 10-18 y 10-25 por un error de división del script de
+verificación sobre una fila puntual, no por un problema de los datos;
+no cambia la conclusión, que es consistente en los 11 días restantes),
+**>350.000 filas válidas en total**:
+
+- **`last_price` nunca está cerca del spot de GGAL**: 0 de >350.000
+  filas tienen `|last_price - spot_ref| / spot_ref < 2%`, en NINGÚN día
+  — descarta por completo la firma de bug que el usuario pidió chequear
+  ("igual al spot de GGAL delata el bug").
+- **Dentro de `[bid, ask]` del mismo contrato/timestamp**: entre 45,7% y
+  77,2% de las filas según el día (promedio ~power del orden de
+  60-70%).
+- **Cuando cae afuera del rango** (resto de las filas), la desviación
+  es chica en la enorme mayoría de los casos: típicamente 60-75% de las
+  filas "fuera de rango" se desvían ≤2% del mid, y 90%+ se desvían ≤10%.
+  Solo una cola chica (0,3%-1,25% del total de filas válidas según el
+  día, máximo observado en la muestra: 2,9% en 2026-10-26) se desvía
+  más de 25% — y el máximo absoluto observado en toda la muestra fue
+  ~98% (nunca "fuera de rango por un orden de magnitud", a diferencia
+  del bug de `last_volume`).
+- **Patrón de la cola**: inspección directa de los casos con mayor
+  desviación muestra `last_price` CONGELADO (mismo valor exacto,
+  ej. `1100.00`) durante 10+ minutos y decenas de polls consecutivos,
+  mientras `bid`/`ask` de ESE contrato sí se mueven — consistente con
+  una opción poco líquida donde el último trade real quedó viejo
+  ("stale") frente a puntas que siguen cotizando, NO con una confusión
+  de campo/unidad. Ejemplo real (GFGV8000DI/GFGV8300DI, puts profundas
+  in-the-money, 2026-10-26): `last_price=1100,00` fijo en 10+ polls
+  mientras `bid` sube de 1665 a valores mayores.
+
+**Conclusión: `last_price` NO está afectado por el mismo bug que
+`last_volume`.** Su comportamiento es el esperado de un "último precio
+operado" legítimo en un mercado con trading esporádico (BYMA, opciones
+de GGAL) — se desactualiza frente a cotizaciones en vivo cuando no hay
+trades nuevos, pero nunca muestra el patrón de magnitud/unidad
+incorrecta que sí mostraba `last_volume`. **Por lo tanto, el resultado
+de H1b (arriba) NO se marca como INVALIDADO** — su modelo de fill
+depende de cruces de `last_price` contra un límite, no de su magnitud
+absoluta relativa al spot, y el campo verificó sano en ese sentido. Sí
+queda como una limitación ya reconocida (y ya declarada en el propio
+pre-registro de H1b) que una fracción chica de las filas tiene un
+`last_price` desactualizado — relevante para la sensibilidad del
+modelo de fill, no para su validez.
+
+### 4. Fix aplicado
+
+Commit `3e60488` (separado de esta documentación, antes del freeze no
+aplicaría pero esto es un bug de integridad de datos — permitido por
+`FREEZE.md`):
+
+- `BrokerRestSource._parse_quote_record` ahora usa únicamente
+  `rec.get("volumenNominal")` para `last_volume`. Si no viene en el
+  registro, `last_volume=0.0` (mismo criterio ya usado en esta función
+  para `puntas` vacías: no fabricar un valor de otro campo con
+  semántica distinta).
+- Test existente (`test_broker_rest_source_parse_quote_record_matches_confirmed_iol_schema`)
+  corregido — antes afirmaba el comportamiento con bug (`last_volume`
+  igual a `montoOperado`).
+- Test nuevo dedicado
+  (`test_broker_rest_source_parse_quote_record_ignores_montooperado_for_volume`)
+  con el valor real que originó el hallazgo (`493.528.444,3`), probando
+  que NUNCA se usa `montoOperado` como volumen.
+- Suite completa de `ggal_bot/validation/` corrida después del fix:
+  56/57 módulos OK (el módulo restante,
+  `test_exit_execution_quality.py`, falla por un fixture `caplog` de
+  pytest no disponible al correrlo como script suelto — pre-existente,
+  no relacionado con este cambio, no toca `live_shadow_feed.py` ni
+  `BrokerRestSource`).
+
+**Impacto en resultados ya publicados**: ninguno de los hallazgos ya
+documentados en este archivo (H1, H1b, H2, H5, spread/volumen por
+vencimiento) usaba `last_volume` como insumo — se verificó explícitamente
+para H1b arriba, y la sección de spread/volumen por vencimiento ya
+declaraba que no usa `last_volume` (ver arriba, "no se usa `last_volume`
+para nada en el analisis de abajo"). El bug estaba contenido al propio
+campo, sin contaminar ninguna conclusión ya publicada.
