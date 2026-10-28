@@ -795,6 +795,50 @@ class BrokerRestSource(ShadowDataSource):
         valor: el resto del pipeline (option_chain/filtros de liquidez) ya
         sabe descartar puntas en cero, el mismo criterio que con cualquier
         otra fuente cuando un simbolo no tiene mercado vigente.
+
+        FIX 2026-10-28 (bug de integridad de datos, hallado via inspeccion
+        directa de `market_snapshots` reales de produccion - `last_volume`
+        aparecia en cientos de millones, con fraccion decimal, para opciones
+        individuales de GGAL - fisicamente imposible como cantidad de
+        contratos/dia de UN strike). Causa raiz: esta funcion usaba
+        `rec.get("montoOperado") or rec.get("volumenNominal")`, con
+        `montoOperado` evaluado PRIMERO. `montoOperado` es el MONTO
+        OPERADO EN PESOS (moneda, no cantidad de unidades/contratos) -
+        terminologia estandar de brokers argentinos ("monto" = importe en
+        ARS, "volumen nominal" = cantidad de unidades/nominales). Prueba
+        directa en el propio esquema confirmado (ver
+        test_broker_rest_source_parse_quote_record_matches_confirmed_iol_schema,
+        caso de la cotizacion de GGAL subyacente): `montoOperado=13.320.723.130,0`
+        para GGAL - 13.320 MILLONES de pesos, consistente con el volumen
+        operado en PESOS de una accion liquida (GGAL a ~7.000 ARS/accion x
+        ~1,9M acciones), pero NUNCA una cantidad de unidades/contratos. El
+        mismo campo, cuando viene presente en el registro de UNA opcion
+        (no del subyacente), explica el patron real observado: montos de
+        cientos de millones de ARS que SE GUARDABAN como si fueran
+        "cantidad de contratos operados" en `last_volume`, exactamente el
+        mismo tipo de magnitud que este test ya probaba sin que nadie lo
+        marcara como sospechoso.
+
+        Se verifico, con la MISMA rigurosidad pedida para `last_volume`,
+        que `last_price` (`ultimoPrecio`) NO esta afectado por un bug
+        analogo: sobre >350.000 filas reales de `market_snapshots`
+        (2026-10-15 a 2026-10-26, los dias con la columna `last_price`),
+        `last_price` jamas quedo cerca (<2%) del spot de GGAL en NINGUNA
+        fila, y cuando cae fuera de [bid, ask] del mismo contrato en el
+        mismo timestamp (29-55% de las filas segun el dia) la desviacion es
+        chica en la enorme mayoria de los casos (tipicamente <2-10% del
+        mid) y concentrada en opciones ITM/OTM profundas con MUY poca
+        actividad, consistente con un ultimo precio operado legitimo que
+        quedo desactualizado frente a puntas que se siguen moviendo (`last
+        trade` stale vs. quote en vivo) - NO con una confusion de unidades
+        o de campo como la de `last_volume`. Por eso H1b (RESEARCH.md) NO
+        se marca como invalidada: su resultado no depende de `last_volume`.
+
+        Fix: usar UNICAMENTE `volumenNominal` (cantidad real de
+        unidades/nominales operados, la semantica correcta de "volumen").
+        Si no viene en el registro, se deja `last_volume=0.0` - mismo
+        criterio que con `puntas` arriba: no fabricar un valor de otro
+        campo con semantica distinta.
         """
         if not isinstance(rec, dict):
             return RawQuote(symbol=symbol, bid=0.0, ask=0.0, bid_size=0.0, ask_size=0.0)
@@ -812,7 +856,7 @@ class BrokerRestSource(ShadowDataSource):
             bid_size=_to_float(level.get("cantidadCompra")),
             ask_size=_to_float(level.get("cantidadVenta")),
             last_price=_to_float(rec.get("ultimoPrecio")),
-            last_volume=_to_float(rec.get("montoOperado") or rec.get("volumenNominal")),
+            last_volume=_to_float(rec.get("volumenNominal")),
         )
 
     @staticmethod

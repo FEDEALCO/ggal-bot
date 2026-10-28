@@ -428,27 +428,60 @@ def test_broker_rest_source_parse_quote_record_matches_confirmed_iol_schema():
     raiz, 'puntas' como lista de niveles (se toma el mejor, puntas[0]).
     'puntas' vacia/None (visto en la corrida de referencia, fuera de rueda)
     debe degradar a bid=ask=0, no fabricar un valor de otro campo.
+
+    'last_volume' debe venir de 'volumenNominal' (cantidad real de
+    unidades/nominales operados) - NUNCA de 'montoOperado' (fix 2026-10-28,
+    ver docstring de _parse_quote_record: 'montoOperado' es el MONTO EN
+    PESOS, no una cantidad de unidades, y quedaba guardado como si fuera
+    volumen por un bug de este parser).
     """
     rec_with_puntas = {
         "ultimoPrecio": 180.0,
         "puntas": [{"precioCompra": 178.022, "cantidadCompra": 56, "precioVenta": 199.98, "cantidadVenta": 10}],
         "montoOperado": 10493.0,
+        "volumenNominal": 55,
     }
     raw = BrokerRestSource._parse_quote_record("GFGV6800AG", rec_with_puntas)
     assert raw.bid == 178.022 and raw.ask == 199.98
     assert raw.bid_size == 56 and raw.ask_size == 10
     assert raw.last_price == 180.0
-    assert raw.last_volume == 10493.0
+    assert raw.last_volume == 55  # viene de volumenNominal, NO de montoOperado (10493.0)
 
-    rec_sin_puntas = {"ultimoPrecio": 7070.0, "puntas": [], "montoOperado": 13320723130.0}
+    rec_sin_puntas = {"ultimoPrecio": 7070.0, "puntas": [], "montoOperado": 13320723130.0, "volumenNominal": 1900000}
     raw2 = BrokerRestSource._parse_quote_record("GGAL", rec_sin_puntas)
     assert raw2.bid == 0.0 and raw2.ask == 0.0
     assert raw2.last_price == 7070.0
+    assert raw2.last_volume == 1900000  # NO los 13.320.723.130 de montoOperado
 
     rec_puntas_null = {"ultimoPrecio": 0.45, "puntas": None}
     raw3 = BrokerRestSource._parse_quote_record("GFGV4200SE", rec_puntas_null)
     assert raw3.bid == 0.0 and raw3.ask == 0.0
     assert raw3.last_price == 0.45
+
+
+def test_broker_rest_source_parse_quote_record_ignores_montooperado_for_volume():
+    """
+    Regresion dedicada al bug de integridad de datos del 2026-10-28:
+    'montoOperado' (monto EN PESOS) NUNCA debe usarse como 'last_volume',
+    ni siquiera cuando 'volumenNominal' esta ausente del registro - a
+    diferencia de 'puntas' (que SI tiene un fallback explicito documentado
+    a bid=ask=0), un monto en pesos no es una "mejor nada que una cantidad
+    de unidades equivocada" - mismo criterio de "no fabricar un valor de
+    otro campo" que ya aplica a 'puntas' arriba.
+
+    Caso real que origino el hallazgo (valores de la magnitud vista en
+    `market_snapshots` de produccion para una opcion individual de GGAL,
+    cientos de millones de ARS en 'montoOperado' sin 'volumenNominal' en
+    el registro): el resultado correcto es last_volume=0.0, NUNCA el monto.
+    """
+    rec_solo_montooperado = {
+        "ultimoPrecio": 650.0,
+        "puntas": [{"precioCompra": 648.0, "cantidadCompra": 2, "precioVenta": 666.0, "cantidadVenta": 3}],
+        "montoOperado": 493528444.3,
+    }
+    raw = BrokerRestSource._parse_quote_record("GFGC6000DI", rec_solo_montooperado)
+    assert raw.last_price == 650.0
+    assert raw.last_volume == 0.0  # NUNCA 493528444.3
 
 
 def test_broker_rest_source_fetch_snapshot_refreshes_whole_chain_in_one_request():
@@ -1523,6 +1556,7 @@ ALL_TESTS = [
     test_broker_rest_source_parse_option_record_falls_back_to_symbol_when_semantic_fields_missing,
     test_broker_rest_source_parse_option_record_rejects_record_without_symbol,
     test_broker_rest_source_parse_quote_record_matches_confirmed_iol_schema,
+    test_broker_rest_source_parse_quote_record_ignores_montooperado_for_volume,
     test_broker_rest_source_fetch_snapshot_refreshes_whole_chain_in_one_request,
     test_broker_rest_source_refreshes_near_the_money_quotes_individually,
     test_broker_rest_source_near_the_money_refresh_is_throttled,
