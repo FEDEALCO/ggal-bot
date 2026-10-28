@@ -2581,49 +2581,48 @@ desde el 2026-09-30: *"en este sandbox el archivo local es solo header
 (0 filas) - artefacto de prueba, no dato sincronizado de Northflank...
 el estado real en producción está sin confirmar"*.
 
-**(b) SÍ existe un export real — encontrado, pero la medición quedó
-incompleta por un corte de conexión.** Via el bridge a tu computadora
-(sesión linkeada activa al momento de esta corrida) confirmé que en la
-carpeta `GGAL BOT` de tu escritorio existe:
-- `ggal_bot_snapshot_history_2026-10-27_1225\logs\` — los archivos
-  diarios REALES de producción, `market_snapshots-2026-10-08.csv.gz` a
-  `market_snapshots-2026-10-26.csv.gz` (**19 días calendario**,
-  tamaños comprimidos entre ~5,6 MB y ~113 MB/día — el de 10-08 es el
-  grande, consistente con la acumulación pre-rotación ya documentada
-  en `config.py`).
-- `market_snapshots.txt` (carpeta raíz) — el volcado monolítico
-  completo, **4,32 GB**.
-- Esta misma carpeta ya tiene una subcarpeta `analysis_scripts` con
-  CSVs de resultados de H1/H2 (`h1_lastprice_summary.csv`,
-  `h1_transiciones_por_dia.csv`, `h2_otm_put_spread_summary.csv`) — es
-  decir, este es el mismo dataset real que ya se usó para los
-  resultados de H1/H2 ya citados en este documento (las 64.948
-  transiciones de `last_price`, etc.).
+**(b) SÍ existe un export real — leído completo en la sesión siguiente,
+cuando el bridge reconectó.** En la carpeta `GGAL BOT` de tu escritorio,
+`ggal_bot_snapshot_history_2026-10-27_1225\` tiene los archivos diarios
+REALES de producción (no en una subcarpeta `logs\`, están en la raíz de
+esa carpeta): `market_snapshots-2026-10-08.csv.gz` (113,6 MB — ESTE
+ARCHIVO SOLO, verificado por su propio timestamp interno, contiene
+**2026-09-28 a 2026-10-08 enteros**, 21.515.625 filas — la acumulación
+completa de antes de que se desplegara la rotación diaria) hasta
+`market_snapshots-2026-10-26.csv.gz` (7,2 MB, un día normal ya
+rotado, ~1,28 millones de filas). **Cobertura real total: 2026-09-28 a
+2026-10-26, 29 días calendario (~20 ruedas, con huecos correctos en los
+domingos 10-11/10-18/10-25)** — confirma con precisión la estimación
+"~1 mes" ya declarada antes de leer el archivo. `spot_ref` se graba una
+vez por CICLO de poll (se repite idéntico en cada fila de la cadena de
+opciones de ese ciclo, no es una serie independiente), con
+`poll_interval_seconds=5` (`GGAL_BOT_SHADOW_POLL_SECONDS` — el bot
+corre siempre en shadow): ~19.300 timestamps de ciclo distintos en un
+solo día (2026-10-26), consistente con 5s durante toda la rueda.
 
-**La conexión al dispositivo se cortó justo antes de poder leer el
-schema/contenido real de esos archivos** (confirmado: un segundo intento
-y un `get_device_info` de verificación también fallaron con "device not
-connected") — así que **no pude completar el conteo real de días/filas
-de spot intradía, ni la medición de spread/volumen por vencimiento
-pedida aparte**. Esto queda pendiente de que reconectes tu compu; la
-ubicación exacta del archivo ya está confirmada arriba, así que la
-proxima vez que vuelva a tener el bridge esto se resuelve en un
-chequeo, no en una nueva búsqueda.
+**Conclusión de la pregunta 1 (ya definitiva, no estimada)**: 29 días
+calendario reales es, con el mismo criterio de todo este documento, una
+muestra demasiado chica para calibrar o testear una señal de
+Fibonacci/MACD/RSI intradía con algo de potencia estadística — **H6
+sigue en backlog**, sin cambios respecto de la conclusión ya escrita
+abajo (14 grados de libertad, corrección por tests múltiples
+pendiente). Esto no se resuelve leyendo mas archivo — se resuelve con
+tiempo (el dato sigue acumulándose en producción desde el 2026-09-28).
 
-**Aun si recupero ese archivo completo, hay un techo estructural que no
-cambia**: `spot_ref` se graba una vez por CICLO de poll (se repite
-idéntico en cada fila de la cadena de opciones de ese ciclo, no es una
-serie independiente), con `poll_interval_seconds=5` segundos
-(`GGAL_BOT_SHADOW_POLL_SECONDS`, el único valor que existe en
-`config.py` — el bot corre siempre en modo shadow) — granularidad real
-~5s, solo durante el horario en que el bot efectivamente corre
-(gateado por `enforce_market_hours_gate`), y solo desde que el logger
-se activó el **2026-09-28**. Es decir, el TECHO de historia real
-disponible hoy, en el mejor caso, es de **~1 mes** — insuficiente para
-calibrar con alguna potencia estadística una señal de Fibonacci/
-MACD/RSI intradía, que necesita muchos swings/pivotes históricos para
-tener algo que decir. Esto no se resuelve leyendo el archivo — se
-resuelve con tiempo (el dato sigue acumulándose en producción).
+**Hallazgo real adicional, no pedido, encontrado al leer el archivo
+(declarado, no corregido en silencio)**: la columna `last_volume` del
+log de producción tiene valores absurdos para volumen de UN contrato de
+opción (cientos de millones, con decimales — ej. `493.528.444,3` para
+`GFGC6000DI` un dia dado) mientras `last_price` de esa misma fila es un
+numero de prima plausible (~500-670). Esto no es volumen de contratos
+operados de esa opcion especifica - probablemente el pipeline esta
+poblando ese campo con algo del SUBYACENTE (monto operado de la accion
+GGAL, que en pesos devaluados de 2026 si tiene ese orden de magnitud) en
+vez de volumen propio del contrato. **No se usa `last_volume` para nada
+en el analisis de abajo** por este motivo (ver seccion de spread/
+volumen por vencimiento) - queda documentado aca como un bug candidato
+para que el equipo lo revise aparte, nunca silenciado ni "corregido" sin
+avisar.
 
 **(c) IOL `get_intraday_prices` — probado empíricamente esta sesión, no
 asumido.** El tool mismo declara: *"Only the latest sessions are kept
@@ -2735,24 +2734,110 @@ prefiere fijar de antemano algunos de ellos para reducirlos antes de
 pre-registrar. No se pre-registra ni se corre nada de esto hasta
 entonces, tal como pidió el usuario.
 
-## Spread y volumen por vencimiento (semanal vs. diciembre), cerca del dinero — PENDIENTE (corte de conexión)
+## Spread y volumen por vencimiento (semanal vs. diciembre), cerca del dinero — 2026-10-28
 
 Pedido explícito del usuario, aparte de H6: medir spread y volumen por
 vencimiento (semanal vs. mensual de diciembre) cerca del dinero con
 `market_snapshots`, y si la liquidez se concentra en el mensual,
 proponer restringir `weekly_asymmetric` a esa serie — como cambio para
 DESPUÉS del freeze (`FREEZE.md`, vigente hasta 2026-11-05), nunca
-durante.
+durante. Completado contra el export REAL de producción (ver punto
+1(b) arriba), vía el bridge a la computadora del usuario, con
+`device_bash` (awk/zcat sobre cada archivo diario, nunca Python
+cargando el archivo completo en memoria — algunos días superan el
+millón de filas).
 
-**No se pudo completar esta sesión** — mismo motivo que el punto 1(b)
-de arriba: encontré el archivo real
-(`ggal_bot_snapshot_history_2026-10-27_1225\logs\` en la carpeta `GGAL
-BOT` de tu escritorio, 19 días de datos reales 2026-10-08 a 2026-10-26)
-vía el bridge a tu computadora, pero la conexión se cortó antes de
-poder leer una sola fila. **No fabrico este número sin el dato real** —
-apenas reconectes, esto es lo primero que corro (ya sé exactamente qué
-archivo y qué comando). Hasta entonces, **no hay propuesta de
-restringir `weekly_asymmetric`** (seria inventar una conclusión sin
-evidencia) — eso se decide con el resultado real, nunca antes, y en
-cualquier caso solo se implementaría como cambio posterior al freeze,
-nunca durante.
+### Aclaración de terminología (dato real, no supuesto)
+
+El proyecto **no tiene una serie "semanal" literal** — el universo de
+`GGAL_BOT` sostiene normalmente 2 vencimientos vivos a la vez: el mas
+cercano (que va rotando, ej. `2026-10-16` -> `2026-11-20` cuando el
+anterior expira) y uno "de diciembre" (`2026-12-18`, estable durante
+toda la ventana observada). Lo que el usuario pide como "semanal" se
+interpreta aca como **el vencimiento mas cercano vigente en cada
+momento** (el equivalente funcional mas cercano a "semanal" que existe
+en los datos reales), comparado contra el de diciembre.
+
+### Metodología
+
+Por cada archivo diario, filtro filas con cotización válida (`spot_ref`,
+`bid`, `ask` > 0) y moneyness `|strike/spot_ref - 1| <= 5%` (cerca del
+dinero), agrupo por `expiry`, y calculo: N de cotizaciones válidas,
+spread relativo promedio `(ask-bid)/mid`, y profundidad promedio
+`bid_size+ask_size` (NO uso `last_volume` — ver el hallazgo de bug en
+el punto 1(b) arriba; `bid_size`/`ask_size` sí son creíbles, enteros
+chicos consistentes con un book real de opciones).
+
+### Período A — vencimiento cercano real ("2026-10-16") vs. diciembre, mientras ambos cotizaban activamente (2026-09-28 a 2026-10-15)
+
+| Vencimiento | N cotizaciones ATM±5% | Spread relativo prom. (ponderado) | Profundidad prom. (bid+ask size) |
+|---|---|---|---|
+| Cercano (2026-10-16) | 145.869 | **19,6%** | 67,2 |
+| Diciembre (2026-12-18) | 139.226 | **11,1%** | 37,0 |
+
+Resultado mixto en este período: el vencimiento cercano tenía algo MÁS
+de tamaño cotizado en punta, pero con spreads casi el doble de anchos
+que diciembre — dos mercados activos, pero diciembre bastante mejor
+cotizado en precio.
+
+### Período B — próximo vencimiento ("2026-11-20") vs. diciembre, después de que expiró el anterior (2026-10-19 a 2026-10-26)
+
+| Vencimiento | N cotizaciones ATM±5% | Spread relativo prom. (ponderado) | Profundidad prom. (bid+ask size) |
+|---|---|---|---|
+| Próximo (2026-11-20) | 7.540 (solo apareció 3 de 6 ruedas) | **132,4%** | 6,5 |
+| Diciembre (2026-12-18) | 69.148 (todas las ruedas) | **4,3%** | 31,2 |
+
+**Este período es el que realmente responde la pregunta, sin ambigüedad.**
+El próximo vencimiento (2026-11-20) prácticamente NO tiene mercado de
+dos puntas cerca del dinero: un spread relativo promedio de 132% del
+mid es, en la práctica, "no hay precio" (bid y ask casi no se tocan), y
+solo aparece cotizando ATM en 3 de las 6 ruedas del período — las otras
+3 no tuvo ninguna cotización válida dentro del 5% de moneyness.
+Diciembre, en cambio, cotiza con 2 puntas reales TODOS los días, spread
+~4,3% (bastante mas angosto que en el Período A, mejorando con el
+tiempo) y profundidad razonable (~31 contratos en punta).
+
+**Hallazgo adicional (artefacto de datos, no de mercado)**: los días
+2026-10-16/17 (el día de vencimiento del cercano y el siguiente)
+muestran filas con `expiry=2026-10-16` y spreads de 46%-55% — cotizaciones
+viejas/stale de un contrato ya vencido que el feed sigue devolviendo un
+día o dos después de expirar. No se contaron como parte del Período A
+(que corta en 10-15, el último día con mercado real) para no mezclar
+liquidez real con ruido post-vencimiento.
+
+### Conclusión — liquidez se concentra en diciembre
+
+**Sí, la liquidez se concentra en la serie de diciembre**, con más
+fuerza mientras mas lejos está el vencimiento cercano de expirar
+(Período B, el estado mas reciente y representativo, es inequívoco:
+132% vs 4,3% de spread, y el cercano ni siquiera cotiza 2 puntas la
+mitad de los días). El Período A (vencimiento cercano recién emitido,
+todavía con algo de interés) es menos extremo pero va en la misma
+dirección en precio (spread casi 2x mas ancho que diciembre).
+
+### Propuesta — restringir `weekly_asymmetric` a la serie de diciembre, DESPUÉS del freeze
+
+El proyecto ya tiene el mecanismo necesario, sin escribir código nuevo:
+`InstrumentsConfig.forced_expiry` (`GGAL_BOT_FORCE_EXPIRY`, env var,
+ver `ggal_bot/config.py` linea 281 — agregado 2026-09-01 a pedido
+explícito del usuario) fuerza a `weekly_asymmetric` a operar SOLO el
+vencimiento indicado, descartando cualquier otro en `scan_entry_signals`
+(ver uso en `weekly_asymmetric.py` linea 830). **Propuesta concreta**:
+fijar `GGAL_BOT_FORCE_EXPIRY=2026-12-18` (y renovarlo manualmente al
+rollover de cada mensual de diciembre-equivalente, no hay lógica de
+"siempre el más lejano" automática todavía - quedaría para otra mejora
+si se quiere) — opt-in vía env var, default sigue siendo el
+comportamiento actual (ambos vencimientos) si no se fija, consistente
+con el criterio del proyecto de que una restricción de riesgo/calidad
+de ejecución puede ir default ON, pero esto es una restricción de
+UNIVERSO de trading, no una guardia de riesgo, así que se deja opt-in
+explícito y a decisión del usuario.
+
+**Por qué DESPUÉS del freeze, no antes**: esto es un cambio de
+comportamiento de trading real (reduce el universo de
+`weekly_asymmetric`), no un bug de integridad de datos ni de riesgo —
+cae exactamente en lo que `FREEZE.md` prohíbe durante la ventana
+2026-10-15 a 2026-11-05. Esta sección documenta el hallazgo y la
+propuesta AHORA (permitido, es research/documentación), pero la
+decisión de fijar la env var queda para el usuario, y su aplicación
+para después del 2026-11-05.
