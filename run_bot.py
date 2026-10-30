@@ -1310,6 +1310,17 @@ class GgalOptionsBot:
             env_flags=list_ggal_bot_env_vars(),
             deployed_git_sha=get_deployed_git_sha(),
             shadow_mode_enabled=SETTINGS.shadow.enabled,
+            # MEJORA 2026-10-30 (pedido explicito del usuario, ver
+            # state_writer.py::StateWriter.write docstring del campo para
+            # el motivo completo): valores YA RESUELTOS por este proceso,
+            # no placeholders ni algo que el dashboard deba re-derivar.
+            strategies_enabled={
+                "active_strategy": self.active_strategy_name,
+                "weekly_asymmetric_enabled": self.active_strategy_name == "weekly_asymmetric",
+                "vol_arbitrage_enabled": self.active_strategy_name == "vol_arbitrage",
+                "scalping_exclusive_enabled": self.active_strategy_name == "scalping",
+                "scalping_additive_enabled": self.scalping_enabled,
+            },
         )
 
     def _check_vol_arbitrage_exits(self, spot: float) -> None:

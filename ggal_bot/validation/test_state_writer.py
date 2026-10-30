@@ -94,10 +94,61 @@ def test_write_persists_shadow_mode_enabled_true_and_false_explicitly():
         path.with_suffix(".tmp").unlink(missing_ok=True)
 
 
+def test_write_defaults_strategies_enabled_none_when_not_passed():
+    """
+    MEJORA 2026-10-30 (pedido explicito del usuario, "URGENTE" - ver
+    RESEARCH.md): strategies_enabled debe persistir None (nunca un dict
+    fabricado) cuando el llamador no lo pasa, igual que shadow_mode_enabled.
+    """
+    path = _temp_path()
+    try:
+        writer = StateWriter(path=path)
+        writer.write(
+            portfolio_greeks_total={}, portfolio_greeks_by_expiry={},
+            active_signals=[], risk_breaches="",
+        )
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["strategies_enabled"] is None
+    finally:
+        path.unlink(missing_ok=True)
+        path.with_suffix(".tmp").unlink(missing_ok=True)
+
+
+def test_write_persists_strategies_enabled_dict_when_passed():
+    """
+    Regresion de la MEJORA 2026-10-30: el dict ya RESUELTO por run_bot.py
+    (self.active_strategy_name/self.scalping_enabled) debe persistir tal
+    cual, incluyendo valores False (no confundir con "no pasado").
+    """
+    path = _temp_path()
+    try:
+        writer = StateWriter(path=path)
+        strategies = {
+            "active_strategy": "weekly_asymmetric",
+            "weekly_asymmetric_enabled": True,
+            "vol_arbitrage_enabled": False,
+            "scalping_exclusive_enabled": False,
+            "scalping_additive_enabled": True,
+        }
+        writer.write(
+            portfolio_greeks_total={}, portfolio_greeks_by_expiry={},
+            active_signals=[], risk_breaches="", strategies_enabled=strategies,
+        )
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["strategies_enabled"] == strategies
+        assert data["strategies_enabled"]["scalping_additive_enabled"] is True
+        assert data["strategies_enabled"]["vol_arbitrage_enabled"] is False
+    finally:
+        path.unlink(missing_ok=True)
+        path.with_suffix(".tmp").unlink(missing_ok=True)
+
+
 ALL_TESTS = [
     test_write_defaults_env_flags_empty_and_git_sha_unknown_when_not_passed,
     test_write_persists_env_flags_and_git_sha_when_passed,
     test_write_persists_shadow_mode_enabled_true_and_false_explicitly,
+    test_write_defaults_strategies_enabled_none_when_not_passed,
+    test_write_persists_strategies_enabled_dict_when_passed,
 ]
 
 

@@ -39,6 +39,7 @@ class StateWriter:
         env_flags: Optional[Dict[str, str]] = None,
         deployed_git_sha: Optional[str] = None,
         shadow_mode_enabled: Optional[bool] = None,
+        strategies_enabled: Optional[Dict[str, Any]] = None,
     ) -> None:
         payload = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -79,6 +80,31 @@ class StateWriter:
             # nunca asumir un modo por default. Misma logica de "no
             # compartir proceso/env vars con el dashboard" que env_flags.
             "shadow_mode_enabled": shadow_mode_enabled,
+            # MEJORA 2026-10-30 (pedido explicito del usuario, "URGENTE" -
+            # ver RESEARCH.md: confusion real sobre si GGAL_BOT_ENABLE_
+            # SCALPING estaba true o false en produccion, solo verificable
+            # leyendo logs crudos). Mismo motivo y mismo patron que
+            # shadow_mode_enabled arriba: se publica el valor YA RESUELTO
+            # por el propio proceso del bot (self.active_strategy_name/
+            # self.scalping_enabled en run_bot.py), nunca re-derivado de
+            # env_flags en el dashboard - una env var que se apoya en su
+            # default de Python (ej. GGAL_BOT_ENABLE_SCALPING sin setear,
+            # default False) no aparece en env_flags, lo que dejaria el
+            # dato ausente en vez de explicito. None (-> null) si no se
+            # pasa (ej. en tests viejos que no conocen este campo todavia):
+            # el dashboard debe mostrar "SIN DATOS", nunca asumir un estado
+            # por default.
+            #
+            # Forma esperada (ver run_bot.py, punto de llamada):
+            #   {"active_strategy": "weekly_asymmetric" | "vol_arbitrage" | "scalping",
+            #    "weekly_asymmetric_enabled": bool,  # True solo si es la activa (seleccion excluyente)
+            #    "vol_arbitrage_enabled": bool,       # idem
+            #    "scalping_exclusive_enabled": bool,  # idem (GGAL_BOT_ACTIVE_STRATEGY=scalping)
+            #    "scalping_additive_enabled": bool}   # GGAL_BOT_ENABLE_SCALPING resuelto - el que
+            #                                          # genero la confusion real: INDEPENDIENTE del
+            #                                          # active_strategy, puede estar prendido con
+            #                                          # cualquier estrategia principal activa.
+            "strategies_enabled": strategies_enabled,
         }
         tmp_path = self.path.with_suffix(".tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:

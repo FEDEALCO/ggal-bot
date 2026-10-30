@@ -678,6 +678,66 @@ def test_bot_scalping_enabled_wires_independent_strategy_and_sizer():
         SETTINGS.scalping.enabled = original_enabled
 
 
+def test_bot_scalping_disabled_recompute_cycle_never_calls_scalping_cycle_and_emits_no_scalping_order():
+    """
+    Regresion "URGENTE" (2026-10-30, a pedido explicito del usuario tras
+    detectar 18+7+5 trades de scalping en 3 dias cuando crefa haberla
+    apagado - ver RESEARCH.md para la investigacion completa: la
+    confusion real fue operativa, GGAL_BOT_ENABLE_SCALPING seguia en
+    true en el contenedor corriendo, el gate de codigo en si nunca tuvo
+    un bypass). Este test es el guardrail que el usuario pidio
+    explicitamente ("test que verifique que con la variable en false no
+    se emite ninguna orden de scalping"): con GGAL_BOT_ENABLE_SCALPING en
+    false (default) y GGAL_BOT_ACTIVE_STRATEGY=weekly_asymmetric
+    (default), recompute_cycle() NUNCA debe invocar
+    self._run_scalping_cycle - el unico gate que existe hoy (run_bot.py,
+    "if self.scalping_enabled: all_signals.extend(...)") - y por lo
+    tanto ninguna señal/orden con origen scalping puede emitirse, sin
+    importar que haga el resto del ciclo.
+
+    _run_weekly_asymmetric_cycle se reemplaza por un stub que devuelve []
+    (no es lo que este test audita) para no requerir un chain/feed real;
+    el gate de horario de rueda se desactiva por el mismo motivo que en
+    test_strategy_selector.py: corre a la hora real del sandbox y no debe
+    afectar lo que este test mide (el dispatch de scalping, no el reloj).
+    """
+    original_strategy = SETTINGS.strategy.active
+    original_scalping_enabled = SETTINGS.scalping.enabled
+    original_gate = SETTINGS.risk.enforce_market_hours_gate
+    SETTINGS.strategy.active = "weekly_asymmetric"
+    SETTINGS.scalping.enabled = False  # GGAL_BOT_ENABLE_SCALPING=false (o sin setear, mismo default)
+    SETTINGS.risk.enforce_market_hours_gate = False
+    try:
+        bot = GgalOptionsBot()
+        assert bot.scalping_enabled is False
+        assert bot.scalping_strategy is None  # nada que ejecutar ni aunque el gate fallara
+
+        bot.market_feed.poll = lambda *_a, **_kw: None
+        bot._spot_book = OrderBookSnapshot(
+            SETTINGS.instruments.contado_ticker, bid=6999.0, ask=7001.0, bid_size=100, ask_size=100,
+        )
+        bot._run_weekly_asymmetric_cycle = lambda spot: []
+
+        def _boom(*_a, **_kw):
+            raise AssertionError(
+                "no debia llamarse con GGAL_BOT_ENABLE_SCALPING=false - "
+                "cualquier orden de scalping emitida aca seria exactamente el bug reportado"
+            )
+
+        bot._run_scalping_cycle = _boom
+
+        bot.recompute_cycle()  # no debe levantar AssertionError desde _boom
+
+        state_path = bot.state_writer.path
+        data = __import__("json").loads(state_path.read_text(encoding="utf-8"))
+        assert data["active_signals"] == []
+        assert data["strategies_enabled"]["scalping_additive_enabled"] is False
+    finally:
+        SETTINGS.strategy.active = original_strategy
+        SETTINGS.scalping.enabled = original_scalping_enabled
+        SETTINGS.risk.enforce_market_hours_gate = original_gate
+
+
 def test_bot_capital_available_ars_pools_are_independent():
     original_enabled = SETTINGS.scalping.enabled
     SETTINGS.scalping.enabled = True
@@ -1048,6 +1108,7 @@ ALL_TESTS = [
     test_position_default_strategy_tag_is_none_backward_compatible,
     test_bot_scalping_disabled_by_default_wires_nothing,
     test_bot_scalping_enabled_wires_independent_strategy_and_sizer,
+    test_bot_scalping_disabled_recompute_cycle_never_calls_scalping_cycle_and_emits_no_scalping_order,
     test_bot_capital_available_ars_pools_are_independent,
     test_portfolio_greeks_for_strategy_tag_isolates_vega_by_tag,
     test_bot_scalping_has_own_risk_manager_isolated_from_primary,

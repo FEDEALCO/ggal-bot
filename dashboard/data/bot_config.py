@@ -99,6 +99,35 @@ def get_shadow_mode_from_state(state: Optional[Dict[str, Any]]) -> Optional[bool
     return value
 
 
+def get_strategies_enabled_from_state(state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Valores RESUELTOS de que estrategias estan habilitadas, publicados por
+    el bot en este snapshot (ver run_bot.py, llamado a state_writer.write(),
+    y StateWriter.write::strategies_enabled - MEJORA 2026-10-30, a pedido
+    explicito del usuario tras confundir el estado real de
+    GGAL_BOT_ENABLE_SCALPING leyendo logs crudos). Mismo criterio que
+    get_shadow_mode_from_state arriba: None (nunca se fabrica un dict) si
+    el state es None, no trae la clave (bot_state.json de un deploy
+    anterior a esta mejora), o el valor no es un dict - el llamador debe
+    mostrar "SIN DATOS" en esos casos, jamas asumir que una estrategia
+    esta prendida o apagada por default.
+
+    Claves esperadas cuando no es None: "active_strategy",
+    "weekly_asymmetric_enabled", "vol_arbitrage_enabled",
+    "scalping_exclusive_enabled", "scalping_additive_enabled" - ver
+    docstring completo en state_writer.py para la diferencia entre
+    "scalping_exclusive" (GGAL_BOT_ACTIVE_STRATEGY=scalping) y
+    "scalping_additive" (GGAL_BOT_ENABLE_SCALPING, el flag que genero la
+    confusion real).
+    """
+    if not state:
+        return None
+    value = state.get("strategies_enabled")
+    if not isinstance(value, dict):
+        return None
+    return value
+
+
 def get_deployed_git_sha_from_state(state: Optional[Dict[str, Any]]) -> Optional[str]:
     """
     SHA de git publicado por el bot en este snapshot (ver

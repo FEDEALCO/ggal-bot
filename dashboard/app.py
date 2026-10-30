@@ -392,6 +392,52 @@ if _ks_state.tripped:
         "posiciones ya abiertas NO estan bloqueadas por este mecanismo."
     )
 
+# ---------------------------------------------------------------------------
+# Panel de salud - estrategias habilitadas (MEJORA 2026-10-30, pedido
+# explicito del usuario: confundio el estado real de GGAL_BOT_ENABLE_
+# SCALPING porque solo era verificable leyendo logs crudos del contenedor
+# linea por linea). Misma fuente unica de verdad que el banner SHADOW/VIVO
+# de arriba: valores YA RESUELTOS por el propio bot en este ciclo (ver
+# state_writer.py::StateWriter.write::strategies_enabled), nunca re-
+# derivados de env_flags ni asumidos - ver dashboard/data/bot_config.py::
+# get_strategies_enabled_from_state para el motivo completo.
+# ---------------------------------------------------------------------------
+_strategies = bc.get_strategies_enabled_from_state(bot_state)
+st.subheader("🩺 Panel de salud — estrategias habilitadas")
+if _strategies is None:
+    st.warning(
+        "⚠️ **SIN DATOS**: `bot_state.json` no publica `strategies_enabled` todavia "
+        "(deploy anterior a esta mejora, o el archivo no existe/esta vacio). No asumir "
+        "ninguna estrategia prendida ni apagada - verificar manualmente antes de operar "
+        "sobre esta informacion."
+    )
+else:
+    _active = _strategies.get("active_strategy", "?")
+    _health_cols = st.columns(4)
+    _health_cols[0].metric(
+        "weekly_asymmetric", "🟢 ACTIVA" if _strategies.get("weekly_asymmetric_enabled") else "⚪ apagada",
+        delta="seleccion excluyente" if _active == "weekly_asymmetric" else None,
+    )
+    _health_cols[1].metric(
+        "vol_arbitrage", "🟢 ACTIVA" if _strategies.get("vol_arbitrage_enabled") else "⚪ apagada",
+        delta="seleccion excluyente · SOLO shadow" if _active == "vol_arbitrage" else None,
+    )
+    _health_cols[2].metric(
+        "scalping (excluyente)", "🟢 ACTIVA" if _strategies.get("scalping_exclusive_enabled") else "⚪ apagada",
+        delta="GGAL_BOT_ACTIVE_STRATEGY=scalping" if _active == "scalping" else None,
+    )
+    _scalping_add = _strategies.get("scalping_additive_enabled")
+    _health_cols[3].metric(
+        "scalping (aditivo)", "🟢 ACTIVO" if _scalping_add else "⚪ apagado",
+        delta="GGAL_BOT_ENABLE_SCALPING - independiente de la estrategia principal",
+    )
+    if _scalping_add and _active != "weekly_asymmetric" and _active != "vol_arbitrage":
+        st.caption(
+            "El modulo aditivo de scalping corre junto a CUALQUIER estrategia principal "
+            "(incluida 'scalping' excluyente, donde queda forzado a ENCENDIDO - ver "
+            "config.py::ScalpingConfig)."
+        )
+
 st.divider()
 
 

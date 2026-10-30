@@ -105,6 +105,30 @@ def test_get_deployed_git_sha_from_state_returns_real_sha():
     assert bc.get_deployed_git_sha_from_state({"deployed_git_sha": "abc1234"}) == "abc1234"
 
 
+def test_get_strategies_enabled_from_state_none_when_state_is_none():
+    assert bc.get_strategies_enabled_from_state(None) is None
+
+
+def test_get_strategies_enabled_from_state_none_when_key_missing():
+    """bot_state.json de un deploy anterior a esta mejora - nunca se asume un estado por default."""
+    assert bc.get_strategies_enabled_from_state({"timestamp": "x"}) is None
+
+
+def test_get_strategies_enabled_from_state_none_when_value_is_not_a_dict():
+    assert bc.get_strategies_enabled_from_state({"strategies_enabled": "weekly_asymmetric"}) is None
+
+
+def test_get_strategies_enabled_from_state_returns_the_dict_when_present():
+    strategies = {
+        "active_strategy": "weekly_asymmetric",
+        "weekly_asymmetric_enabled": True,
+        "vol_arbitrage_enabled": False,
+        "scalping_exclusive_enabled": False,
+        "scalping_additive_enabled": True,
+    }
+    assert bc.get_strategies_enabled_from_state({"strategies_enabled": strategies}) == strategies
+
+
 ALL_TESTS = [
     test_load_bot_state_none_when_file_missing,
     test_load_bot_state_none_when_invalid_json,
@@ -119,6 +143,10 @@ ALL_TESTS = [
     test_get_deployed_git_sha_from_state_none_when_state_is_none,
     test_get_deployed_git_sha_from_state_none_when_bot_published_unknown,
     test_get_deployed_git_sha_from_state_returns_real_sha,
+    test_get_strategies_enabled_from_state_none_when_state_is_none,
+    test_get_strategies_enabled_from_state_none_when_key_missing,
+    test_get_strategies_enabled_from_state_none_when_value_is_not_a_dict,
+    test_get_strategies_enabled_from_state_returns_the_dict_when_present,
 ]
 
 

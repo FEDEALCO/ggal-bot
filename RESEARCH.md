@@ -3228,6 +3228,172 @@ business_days`, o (b) subir `max_holding_business_days` como parte del
 mismo cambio - de otro modo el mecanismo de rolleo puede "elegir bien"
 por liquidez y aun así dejar a la estrategia sin poder entrar nunca.
 
+## URGENTE 2026-10-30 — scalping operando tras "apagarla" + weekly_asymmetric sin trades + panel de salud
+
+Pedido explícito del usuario, 3 partes, sobre el mismo log de 72hs
+(`northflank_logs_72h_20261030T130618Z.log`, ventana 2026-10-27T13:06 UTC
+a 2026-10-30T13:05 UTC) ya usado en la corrección de arriba.
+
+### 1. `GGAL_BOT_ENABLE_SCALPING` — ¿por qué sigue operando scalping?
+
+**Hallazgo (VERIFIED, con la salvedad explicada abajo): en el contenedor
+que generó este log, `GGAL_BOT_ENABLE_SCALPING` está en `true`, no en
+`false`.** No es un bug de código - es que el flag sigue prendido en
+producción.
+
+Variable exacta y dónde se lee: `GGAL_BOT_ENABLE_SCALPING` →
+`ggal_bot/config.py` línea 1767, `ScalpingConfig.enabled = _env_bool(
+"GGAL_BOT_ENABLE_SCALPING", False)`. Se lee **una sola vez**, al arrancar
+el proceso (`run_bot.py` línea ~309: `self.scalping_enabled =
+SETTINGS.scalping.enabled`), y queda cacheado en ese atributo de
+instancia durante toda la vida del proceso - cambiar la env var en
+Northflank sin reiniciar/redesplegar el servicio **no tiene ningún
+efecto** hasta el próximo restart. Esto es el comportamiento esperado de
+cualquier config leída por `_env_bool` en este proyecto, no un bug.
+
+Evidencia de que está en `true` ahora mismo:
+
+- Línea de arranque explícita, el ÚLTIMO restart del log
+  (2026-10-28T13:39:05 ART, sin ningún restart posterior hasta el final
+  del log el 2026-10-30T13:05 UTC): `"Modo SCALPING intradia ACTIVADO
+  (GGAL_BOT_ENABLE_SCALPING=true)..."`.
+- Las 157 líneas `[Scalping]` del log de 72hs son el ciclo normal del
+  módulo corriendo (`grep "\[Scalping\]" | sed ... | sort | uniq -c` →
+  `157 sell_to_close`, 0 `buy_to_open` en esta ventana puntual - sin
+  entradas nuevas en 72hs, pero el módulo sí está activo y cerrando
+  posiciones existentes).
+- Cero apariciones de la advertencia `"ATENCION - posiciones SIN NINGUNA
+  gestion de riesgo..."` (`_warn_orphaned_positions_for_active_strategy`,
+  `run_bot.py` líneas ~842-868) - esa advertencia se dispara
+  específicamente cuando `scalping_enabled=False` con posiciones
+  `strategy_tag="scalping"` todavía abiertas. Su ausencia total es
+  evidencia adicional, independiente de la línea de arranque, de que el
+  flag no está en `false`.
+
+¿Hay otro camino que active scalping aparte de esta variable? Sí, uno,
+y **no aplica** a esta situación: `GGAL_BOT_ACTIVE_STRATEGY=scalping`
+(selección EXCLUYENTE de estrategia, distinta de este flag ADITIVO)
+fuerza `self.scalping_enabled=True` sin importar
+`GGAL_BOT_ENABLE_SCALPING` (`run_bot.py` líneas ~318-325). Pero el log
+confirma `"Estrategia activa: weekly_asymmetric"` en todo momento - esa
+rama no se ejecuta aquí. Repasado el único gate real
+(`run_bot.py` línea 1267: `if self.scalping_enabled:
+all_signals.extend(self._run_scalping_cycle(spot))`), no hay ningún otro
+código que pueda emitir una señal de scalping si ese booleano es False.
+
+**Lo que no pude verificar (y por qué)**: no puedo confirmar desde aquí
+si el valor configurado HOY en el dashboard de Northflank es `true` o
+`false` - solo puedo ver qué corrió el proceso ya arrancado, vía logs.
+Intenté usar el CLI de Northflank desde el puente a tu máquina
+(`device_bash`) y no está disponible/autenticado ahí (ese bridge solo
+monta las carpetas conectadas, no tu `$HOME/.northflank` real). **Necesito
+que confirmes dos cosas directamente en el dashboard de Northflank**:
+(1) qué valor tiene configurado `GGAL_BOT_ENABLE_SCALPING` hoy, y (2) si
+hiciste un redeploy/restart del servicio después del 27/10 cuando
+decidiste apagarla - si cambiaste la env var pero el servicio no se
+reinició desde entonces, ese cambio nunca llegó a tomar efecto, y es
+probablemente la explicación completa de los 18+7+5 trades: no se
+"ignoró" una variable en `false`, sino que el `true` previo siguió
+corriendo sin interrupción.
+
+**Sobre el "fix + test" pedido**: no encontré ningún bypass de código -
+el gate es único y correcto bajo la configuración activa
+(`weekly_asymmetric` + `scalping_enabled` resuelto correctamente desde
+`GGAL_BOT_ENABLE_SCALPING`). No hay un bug que arreglar. Sí agregué el
+test de regresión/guardrail que pediste explícitamente, como red de
+seguridad hacia adelante (no como corrección de un bug encontrado):
+`ggal_bot/validation/test_scalping_mode.py::
+test_bot_scalping_disabled_recompute_cycle_never_calls_scalping_cycle_and_emits_no_scalping_order`
+- con `GGAL_BOT_ENABLE_SCALPING=false`, corre un ciclo completo
+(`recompute_cycle()`) con `self._run_scalping_cycle` reemplazado por un
+stub que levanta `AssertionError` si llega a invocarse, y verifica además
+que `bot_state.json` queda con `active_signals=[]` y
+`strategies_enabled.scalping_additive_enabled=False`. Pasa hoy porque no
+hay bypass; si alguna vez se introduce uno, este test lo va a romper
+inmediatamente.
+
+### 2. weekly_asymmetric sin trades desde el 14/10 — causa (ya corregida arriba, resumen directo a la pregunta)
+
+Repitiendo la corrección de la sección anterior, pero respondiendo
+punto por punto lo que pediste descartar/confirmar:
+
+| Causa posible | ¿Aplica? | Evidencia |
+|---|---|---|
+| Kill switch | **No** | Último REJECT de kill switch de weekly_asymmetric: 2026-10-02. Ninguno después en ningún log revisado (72hs ni exports previos). |
+| Límites de griegas | **No** | El embudo de diagnóstico de entradas bloquea el 100% de candidatas en "horizonte semanal" ANTES de llegar a evaluar griegas/dislocación de smile - nunca se alcanza ese chequeo. |
+| Filtro de quotes en la serie cercana | **No aplica** | `GGAL_BOT_FORCE_EXPIRY=2026-12-18` está fijado desde el 2026-10-20 (antes de que yo propusiera restringir a diciembre) - la serie cercana ni siquiera se escanea, así que un filtro sobre ella es irrelevante. |
+| Liquidez | **No (refutada)** | El propio log de diagnóstico muestra `liquidez=0` bloqueadas en TODOS los ciclos observados (27, 28 y 29/10) - cero candidatas llegan a ser rechazadas por este motivo. Mi hipótesis anterior (illiquidez cerca del vencimiento) queda refutada por este log directo. |
+| **Horizonte semanal (`GGAL_BOT_MAX_HOLDING_BUSINESS_DAYS=35`)** | **Sí - causa única confirmada** | `weekly_asymmetric.py` línea 503 bloquea cualquier candidata con `days_business > 35`; con `FORCE_EXPIRY` apuntando a diciembre (37-43 días hábiles durante casi todo este período), el 100% de candidatas cae en este bucket, todos los ciclos, sin excepción. |
+
+**Conclusión**: el freeze efectivamente no está midiendo nada para
+weekly_asymmetric desde que se combinaron `FORCE_EXPIRY=2026-12-18` (fijado
+2026-10-20) con el techo de 35 días hábiles - la estrategia lleva
+aproximadamente la mitad de la ventana del freeze (15/10 al 20/10 sin
+este bloqueo todavía claro, 20/10 en adelante con el 100% de ciclos
+bloqueados) sin poder entrar en absoluto.
+
+**Qué hacer (propuesta, no implementada todavía - sigue dentro del
+freeze)**:
+
+1. **Más inmediato**: el cálculo de días hábiles (sin calendario de
+   feriados) da exactamente 35 días hábiles HOY, 2026-10-30 - el
+   bloqueo debería levantarse por primera vez desde el 20/10, de forma
+   natural, sin ningún cambio de config. Esto es una **predicción**, no
+   confirmada todavía (el log se corta antes de la apertura de hoy) -
+   corresponde pedir un log fresco después del cierre de la rueda de
+   hoy para confirmarlo.
+2. **Más fundamental, independientemente de (1)**: dado que weekly_asymmetric
+   estuvo bloqueada por ~mitad de la ventana del freeze, la muestra de
+   "una versión limpia y estable" que el freeze buscaba producir no
+   existe para esta estrategia. Recomiendo, a tu criterio: (a) si el
+   bloqueo se confirma levantado hoy, **extender/reiniciar el reloj del
+   freeze** desde la fecha real en que empezó a poder entrar de nuevo
+   (en vez de contar desde el 15/10, que incluyó ~2 semanas sin
+   operar), o (b) si preferís que vuelva a operar antes, subir
+   `GGAL_BOT_MAX_HOLDING_BUSINESS_DAYS` por encima de la cantidad de
+   días hábiles a diciembre (ahora mismo eso significaría subirlo a 40+
+   para dar margen) - esto es un cambio de config, no de lógica de
+   trading, pero decido no tocarlo sin tu confirmación explícita porque
+   cambia qué puede o no entrar la estrategia.
+
+### 3. Panel de salud del dashboard — estrategias habilitadas (implementado)
+
+Agregado, exento del freeze por el punto 3 de "Qué SÍ está permitido" en
+`FREEZE.md` (instrumentación/logging de solo lectura, no cambia ninguna
+decisión de trading):
+
+- `ggal_bot/state_writer.py`: nuevo parámetro `strategies_enabled` en
+  `StateWriter.write()`, publicado en `bot_state.json` con el mismo
+  patrón que `shadow_mode_enabled` (valor YA RESUELTO por el proceso del
+  bot, `None` si no se pasa - el dashboard nunca fabrica un estado por
+  default).
+- `run_bot.py`: el único punto de llamada a `state_writer.write()` ahora
+  publica `{"active_strategy": self.active_strategy_name,
+  "weekly_asymmetric_enabled": ..., "vol_arbitrage_enabled": ...,
+  "scalping_exclusive_enabled": ..., "scalping_additive_enabled":
+  self.scalping_enabled}` - distinguiendo explícitamente la selección
+  excluyente (`GGAL_BOT_ACTIVE_STRATEGY`) del flag aditivo
+  (`GGAL_BOT_ENABLE_SCALPING`, el que generó esta confusión real).
+- `dashboard/data/bot_config.py`: nueva función
+  `get_strategies_enabled_from_state(state)`, mismo contrato que
+  `get_shadow_mode_from_state` (None si falta/no es dict, nunca
+  fabricado).
+- `dashboard/app.py`: nueva sección "🩺 Panel de salud — estrategias
+  habilitadas" justo debajo del banner de kill switch, con 4 columnas
+  (weekly_asymmetric, vol_arbitrage, scalping excluyente, scalping
+  aditivo) y "SIN DATOS" si el bot todavía no publicó este campo
+  (deploy anterior a esta mejora).
+- Tests nuevos: `test_state_writer.py` (default `None` sin pasar el
+  parámetro, persiste el dict tal cual con valores `True`/`False`
+  pasado) y `test_dashboard_data_bot_config.py` (los 4 casos None/falta
+  clave/no-es-dict/devuelve-el-dict, mismo patrón que el resto del
+  archivo). Suite completa: `873 passed` (`pytest ggal_bot/validation/`).
+
+Con esto, de un vistazo en el dashboard vas a poder ver qué tiene
+activo el proceso REALMENTE corriendo (no lo que crees haber configurado
+en Northflank) - exactamente el tipo de confusión que generó este
+pedido urgente.
+
 ## Propuesta post-freeze (NO implementar todavía) — rolleo automático por liquidez y operar 5-7 semanas a vencimiento
 
 **Pedido explícito del usuario, diseño/análisis únicamente** — nada de
