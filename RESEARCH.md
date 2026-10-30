@@ -3119,6 +3119,115 @@ probablemente ya conoce (es quien lo resetea), pero se deja constancia
 acá por si no se había notado que `weekly_asymmetric` específicamente
 quedó sin ninguna señal desde el 14/10.
 
+### CORRECCIÓN 2026-10-30 — causa real verificada (no era liquidez): `GGAL_BOT_FORCE_EXPIRY` chocando con `GGAL_BOT_MAX_HOLDING_BUSINESS_DAYS`
+
+**Dos correcciones a la sección de arriba, a partir de un log fresco de
+producción (72hs, 2026-10-27 a 2026-10-30, pedido al usuario y corrido
+con `fetch_bot_logs.py`) que no estaba disponible cuando se escribió lo
+de arriba.**
+
+**1) Corrección de huso horario**: los timestamps embebidos en
+`ggal_bot.log` (ej. "2026-10-16 14:40:52,204") están en **ART
+(UTC-3)**, no en UTC como se asumió arriba al citarlos. Verificado
+cruzando el mismo evento (mismo `client_order_id` `0d20285d06d6`) contra
+`position_events.csv` (que sí usa UTC explícito): el log dice
+"2026-10-14 10:31:59,439" para el mismo evento que `position_events.csv`
+registra como "2026-10-14T13:31:59.439522+00:00" - exactamente 3 horas
+de diferencia. **Corrección de las citas de arriba**: el kill switch se
+disparó a las **17:40:52 UTC** (no 14:40:52 UTC) del 2026-10-16, y el
+último rechazo de `scalping` por este motivo fue a las **21:46:18 UTC**
+(no 18:46:18 UTC) del 2026-10-21. No cambia ninguna conclusión (son los
+mismos eventos, solo mal etiquetados de huso horario), pero se corrige
+para no dejar un dato objetivamente incorrecto en el documento.
+
+**2) Causa real de "cero señales nuevas de `weekly_asymmetric`
+desde el 14/10" - VERIFIED, ya no HYPOTHESIS, y NO es la que se
+escribió arriba.** El log de 72hs (2026-10-27 a 2026-10-30) muestra el
+diagnóstico de embudo de entradas (`run_bot.py` línea ~1750) en CADA
+ciclo, para `weekly_asymmetric`, con el mismo resultado exacto decenas
+de veces seguidas:
+
+> "Diagnostico escaneo de entradas [tendencia=NEUTRAL]: 15 cotizaciones
+> evaluadas -> bloqueadas por direccion tecnica=0, **horizonte
+> semanal=15**, piso min. vencimiento=0, **liquidez=0**, OBI=0,
+> moneyness=0, banda de delta=0; llegaron al chequeo de dislocacion de
+> smile=0."
+
+**100% de las cotizaciones candidatas (15-16 por ciclo) quedan
+bloqueadas por "horizonte semanal" - CERO por liquidez.** Esto
+contradice directamente la explicación de liquidez que se escribió
+arriba como HYPOTHESIS - se corrige acá, no se deja la hipótesis vieja
+sin marcar.
+
+**Mecanismo real (leído en código, `weekly_asymmetric.py` línea 503):**
+`if cfg.max_holding_business_days is not None and q.days_business >
+cfg.max_holding_business_days: # bloqueado por "horizonte semanal"`.
+Es decir, `LongFirstConfig.max_holding_business_days`
+(`GGAL_BOT_MAX_HOLDING_BUSINESS_DAYS`) actúa como un TECHO de días
+hábiles a vencimiento para ENTRADAS nuevas, no solo como límite de
+holding de salida (que es como se usó en el análisis de Tarea 3 arriba
+- ese uso tambien es real, son dos chequeos distintos que leen el mismo
+numero). El log de arranque del propio bot ya lo advertía
+textualmente el 2026-10-20/21 (`ggal_bot_export_2026-10-21_1633/
+ggal_bot.log`): *"Vencimiento FORZADO por config
+(GGAL_BOT_FORCE_EXPIRY=2026-12-18) ... verificar que
+GGAL_BOT_MAX_HOLDING_BUSINESS_DAYS (hoy=35 dias habiles) cubra el plazo
+real hasta ese vencimiento, o ninguna entrada va a poder abrirse ahi"* -
+una advertencia que, verificado ahora, se cumplió exactamente.
+
+**Dato nuevo, no documentado hasta ahora en este archivo**:
+`GGAL_BOT_FORCE_EXPIRY=2026-12-18` ya estaba fijada en producción desde
+al menos el **2026-10-20** (confirmado por log, `ggal_bot_export_2026-
+10-21_1633/ggal_bot.log` y `.../2026-10-21_1122/ggal_bot.log`) - es
+decir, el usuario ya había aplicado (por su cuenta, antes de que esta
+sesión escribiera la propuesta de "Spread y volumen por vencimiento"
+arriba, que se publicó recién en el commit `ccedf77` del 2026-10-28)
+la restricción a diciembre. La ceiling `GGAL_BOT_MAX_HOLDING_BUSINESS_
+DAYS=35` ya estaba configurada de antes (valor razonable para el
+régimen de 1-2 semanas de siempre) y nadie la subió al mover
+`FORCE_EXPIRY` a un vencimiento ~40 días hábiles más lejos - la
+combinación de los dos bloqueó el 100% de las entradas nuevas de
+`weekly_asymmetric`, sin que hiciera falta ningún problema de liquidez
+real para explicarlo (la liquidez de diciembre, de hecho, el propio
+log lo confirma de forma independiente: "liquidez=0" bloqueadas en
+TODOS los ciclos - cero candidatas descartadas por spread/profundidad,
+consistente con la medición directa de la sección de arriba).
+
+**Días hábiles reales a 2026-12-18, calculados con el mismo criterio
+que usa el bot (lunes a viernes, sin calendario de feriados - el
+proyecto no tiene uno, ver `market_hours.py`)**:
+
+| Fecha | Días hábiles a 2026-12-18 | ¿> 35 (bloqueado)? |
+|---|---|---|
+| 2026-10-20 | 43 | Sí |
+| 2026-10-27 | 38 | Sí |
+| 2026-10-28 | 37 | Sí |
+| 2026-10-29 | 36 | Sí |
+| **2026-10-30 (hoy)** | **35** | **No - el bloqueo debería levantarse HOY** |
+
+**Predicción, no todavía confirmada**: el log de 72hs se cortó a las
+10:05 ART del 2026-10-30, ANTES de la apertura del mercado (~11hs ART)
+- no hay ninguna rueda de hoy en el log para confirmar si el bloqueo
+efectivamente se levantó. La condición de código es `days_business >
+35` (estrictamente mayor), así que con `days_business=35` exacto hoy
+debería dejar de bloquear por este motivo por primera vez desde que se
+fijó `FORCE_EXPIRY`. Esto se marca explícitamente como **PREDICCIÓN**,
+a confirmar con un log de hoy después del cierre de rueda - no se
+afirma como hecho todavía.
+
+**Relevancia para la propuesta de Tarea 3 (rolleo automático por
+liquidez, arriba)**: cualquier diseño de rolleo automático tiene que
+leer/respetar `max_holding_business_days` como una restricción dura
+sobre QUÉ vencimientos son candidatos válidos para rollear - rollear a
+una serie más líquida pero mas lejana que ese techo reproduciría
+exactamente este mismo bloqueo total, de forma silenciosa (sin ningún
+error, solo "horizonte semanal" comiéndose el 100% del embudo). Si se
+implementa el rolleo automático post-freeze, debe o (a) excluir de las
+candidatas cualquier vencimiento con `days_business > max_holding_
+business_days`, o (b) subir `max_holding_business_days` como parte del
+mismo cambio - de otro modo el mecanismo de rolleo puede "elegir bien"
+por liquidez y aun así dejar a la estrategia sin poder entrar nunca.
+
 ## Propuesta post-freeze (NO implementar todavía) — rolleo automático por liquidez y operar 5-7 semanas a vencimiento
 
 **Pedido explícito del usuario, diseño/análisis únicamente** — nada de
