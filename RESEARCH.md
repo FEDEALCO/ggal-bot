@@ -3554,3 +3554,130 @@ quedaria como una hipotesis de diseño separada si el usuario quiere
 profundizarla despues del freeze, no se desarrolla mas aca para no
 exceder el pedido de "analizar que cambia", que es lo pedido
 explicitamente.
+
+## Cierre del freeze (15/10-5/11) + estado 19 días después (18/11) — export completo vía Northflank CLI
+
+Export real descargado por el usuario el 18/11 (`fetch_northflank_logs.ps1`,
+proyecto Northflank `ggal-bot`/servicio `supreme-cattle` — **no**
+`quant-bot`/`quantbot`, que es un bot de cripto en Binance completamente
+distinto, repo `FEDEALCO/Quantbot`; se confundió el servicio en el camino,
+ver nota de seguridad abajo). `position_events.csv` (3894 filas, cubre
+2026-09-07 a 2026-11-17 sin huecos de rotación) es la fuente confiable para
+PnL/trades en todo este análisis - `shadow_trades.csv` y
+`market_snapshots.csv` tienen limitaciones serias, documentadas en la
+sección "Hallazgos nuevos" más abajo.
+
+### PnL por estrategia, partido en 3 ventanas (mismo pipeline que `weekly_review.py`: `reconstruct_lifecycle_trades` + `build_strategy_report`, IC95% bootstrap)
+
+| Ventana | Estrategia | n_cerrados | win% | PnL neto ARS | IC95% PnL* | expectancy/trade |
+|---|---|---|---|---|---|---|
+| Pre-freeze (07/09-14/10) | scalping | 435 | 15.6% | -677.736 | [-845.540, -499.535] | -1.558 |
+| Pre-freeze (07/09-14/10) | weekly_asymmetric | 206 | 4.9% | -1.280.378 | [-1.857.530, -822.531] | -6.215 |
+| **Freeze (15/10-05/11)** | scalping | 242 | 4.1% | **-558.944** | [-619.069, -498.526] | -2.310 |
+| **Freeze (15/10-05/11)** | weekly_asymmetric | **0** | - | - | - | - |
+| Post-freeze (06/11-17/11, 12 días) | scalping | 605 | **0.7%** | **-1.868.501** | [-1.949.973, -1.775.215] | -3.088 |
+| Post-freeze (06/11-17/11, 12 días) | weekly_asymmetric | 3 | 66.7% | +52.233 | [-14.798, 161.927] (cruza cero) | +17.411 |
+
+*IC95% PnL es `expectancy_ci * n_trades` (aproximado, ver docstring de
+`metrics.py`) - los tres cortes suman exactamente los totales de todo el
+período (1282/209 trades), confirmando que el corte por fecha no rompe
+ningún trade a mitad de camino.
+
+### Lectura de estos números
+
+1. **El freeze no midió nada de weekly_asymmetric** (ya documentado arriba,
+   ahora confirmado con el journal completo: CERO filas de cualquier tipo
+   en las 3 semanas del freeze, no solo "cero trades cerrados" - ni
+   siquiera un ENTRY rechazado se logueó, consistente con que
+   `GGAL_BOT_FORCE_EXPIRY` + `GGAL_BOT_MAX_HOLDING_BUSINESS_DAYS=35`
+   bloqueaban el 100% del embudo). Lo único que el freeze midió fue
+   scalping.
+
+2. **weekly_asymmetric SÍ volvió a entrar después del freeze** (tal como se
+   predijo: el 30/10 el gap de días hábiles a diciembre cruzó a 35). Hay
+   evidencia directa en `position_events.csv`, ej. 2026-11-17: `ENTRY
+   GFGV4400DI ... (horizonte semanal: 23d habiles; tendencia 1D: BEARISH)`
+   seguido de `CLOSE ... quote_gap_backstop` el mismo día. Pero son solo 3
+   trades en 12 días - muestra demasiado chica para sacar ninguna
+   conclusión (el IC95% cruza cero).
+
+3. **Scalping se deteriora de forma sostenida y estadísticamente
+   significativa**: win% cae 15.6% → 4.1% → 0.7% en las 3 ventanas, PnL
+   negativo en las tres, con IC95% que NUNCA cruza cero (no es ruido:
+   scalping viene perdiendo plata de forma consistente desde que hay
+   datos, 07/09). El tramo post-freeze es el peor con diferencia: 605
+   trades cerrados en solo 12 días, 605*0.7%≈4 ganadores, -1.868.501 ARS
+   netos - ritmo de pérdida mucho mayor que durante el freeze mismo.
+
+### Hallazgo nuevo: `GGAL_BOT_ENABLE_SCALPING` sigue en `true` HOY (18/11), 3 semanas después del pedido de apagarla
+
+Verificado leyendo `bot_state.json` (snapshot vivo, timestamp
+2026-11-18T13:44:18): `env_flags["GGAL_BOT_ENABLE_SCALPING"] = "true"` y
+`strategies_enabled["scalping_additive_enabled"] = true`. El panel de
+salud del dashboard (commit `5329380`, ya deployado - este mismo campo
+`strategies_enabled` solo existe desde ese commit, así que su sola
+presencia confirma que el redeploy sí recogió ese código) está publicando
+este dato correctamente. Esto descarta la hipótesis de "se cambió la
+variable pero no se redesplegó" planteada el 30/10 - han pasado 3 semanas
+y 605 trades de scalping post-freeze con la variable siempre en `true`. Si
+el usuario sigue queriendo apagarla (la evidencia de PnL de arriba lo
+respalda con fuerza), tiene que cambiarla en el dashboard de Northflank Y
+confirmar el redeploy - nada en el código la está ignorando.
+
+### Hallazgo nuevo: `shadow_trades.csv` dejó de escribirse el 2026-10-02T18:01:45 (sigue sin una fila nueva desde entonces, 6+ semanas)
+
+`position_events.csv` siguió registrando ENTRY/CLOSE con normalidad todo
+este tiempo (incluye los cierres de scalping del tramo post-freeze
+analizado arriba), pero `shadow_trades.csv` - el CSV que escribe
+`OrderGateway.send()` en cada fill simulado, y que `weekly_review.py` usa
+para el chequeo de "fills fuera de horario de rueda" (punto 3) - no tiene
+ninguna fila posterior a esa fecha. Esto es un journal DISTINTO del
+`position_events.csv` (dos caminos de escritura separados para el mismo
+evento), así que es posible que uno se rompiera sin afectar al otro. Point
+a verificar: ¿por qué `OrderGateway.send()` dejó de escribir a
+`shadow_trades.csv` específicamente desde esa fecha? No investigado
+todavía en este turno - requiere leer `order_gateway.py` y entender si es
+un bug real (ej. una excepción silenciosa en el writer, un problema de
+permisos/disco, una rotación de archivo que cambió el nombre sin que el
+script de export lo supiera) o un cambio intencional no documentado. Mientras
+no se resuelva, el punto 3 de `weekly_review.py` (fills fuera de horario)
+queda ciego a todo lo que pasó desde el 02/10 - un gap de visibilidad real
+sobre un chequeo de riesgo/calidad de datos.
+
+### Hallazgo nuevo: `market_snapshots.csv` se rota a diario (solo contiene el día de hoy)
+
+Confirmado por rango real del archivo: 2026-11-18T00:00:00 a
+2026-11-18T13:43:56, ninguna fila de ningún día anterior. Esto no es un bug
+nuevo - es la explicación de por qué el punto 4 de `weekly_review.py`
+("% de quotes válidas por contrato operado") muestra 49/63 símbolos
+operados con CERO filas en el archivo: son símbolos de series ya vencidas
+(contratos "OC"/"I"/"J" de septiembre/octubre), que el archivo de hoy
+nunca pudo tener. Implica que el punto 4 (y el punto 6, acumulación para
+Hipótesis 1) de `weekly_review.py`, corrido sobre un export puntual, SOLO
+puede evaluar el día en que se corre - para una foto histórica de calidad
+de quotes habría que exportar `market_snapshots.csv` el mismo día que se
+quiere auditar, no después.
+
+### Hallazgo nuevo (a investigar): 15.051 disparos del quote-gap backstop, 13.907 de ellos en un solo símbolo (`GFGV4000DI`)
+
+`GFGV4000DI` es un put muy OTM de la serie forzada de diciembre
+(strike 4000 contra spot ~4800-6600 en el período). El backstop está
+diseñado exactamente para esto (quote stale/gap en un contrato ilíquido,
+usar el valor teórico como respaldo de último recurso) - no es
+necesariamente un bug, pero la magnitud (13.907 disparos en un solo
+símbolo, contra 394/390/350/10 en los siguientes 4) amerita revisar si
+ese símbolo específico tiene algo mal (¿nunca tuvo order book real en todo
+el período, y por eso cada ciclo dispara el respaldo?) o si es
+comportamiento esperado de un contrato sin ningún interés de mercado real.
+No investigado todavía en este turno.
+
+### Nota de seguridad (18/11): credenciales de OTRO proyecto expuestas en el chat
+
+Durante la búsqueda del ProjectId/ServiceId correctos de Northflank, un
+`northflank get services` corrido contra el proyecto equivocado
+(`quant-bot`, el bot de cripto en Binance, NO este proyecto) imprimió su
+`runtimeEnvironment` completo sin enmascarar, incluyendo
+`BINANCE_API_KEY`/`BINANCE_API_SECRET`/`DASHBOARD_PASSWORD` de ESE OTRO
+bot. Se le recomendó al usuario rotarlas por las dudas. No son credenciales
+de GGAL_BOT y no se usaron ni se van a usar para nada en este proyecto -
+se documenta aquí solo para que quede registro del incidente.
