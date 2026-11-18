@@ -209,7 +209,15 @@ def _add_long_position(bot, symbol="GFGC8000OC", quantity=5, entry_price=100.0):
     ))
 
 
-def _with_backstop_settings(enabled=True, minutes=10.0, catastrophic_pct=0.75, margin_pct=0.05):
+def _with_backstop_settings(enabled=True, minutes=10.0, catastrophic_pct=0.75, margin_pct=0.05, retry_minutes=None):
+    """
+    `retry_minutes=None` (default) deja SETTINGS.risk.quote_gap_backstop_
+    retry_minutes tal cual esta (su propio default de config.py, 2.0) - la
+    enorme mayoria de los tests de este archivo no le importa el
+    espaciado de reintentos, solo el disparo en si. Pasar un valor
+    explicito (ver test_backstop_retry_is_spaced_not_every_cycle) cuando
+    el test necesita controlarlo.
+    """
     class _Ctx:
         def __enter__(self):
             self.orig = (
@@ -217,11 +225,14 @@ def _with_backstop_settings(enabled=True, minutes=10.0, catastrophic_pct=0.75, m
                 SETTINGS.risk.quote_gap_backstop_minutes,
                 SETTINGS.risk.quote_gap_backstop_catastrophic_loss_pct,
                 SETTINGS.risk.quote_gap_backstop_limit_margin_pct,
+                SETTINGS.risk.quote_gap_backstop_retry_minutes,
             )
             SETTINGS.risk.enable_quote_gap_backstop = enabled
             SETTINGS.risk.quote_gap_backstop_minutes = minutes
             SETTINGS.risk.quote_gap_backstop_catastrophic_loss_pct = catastrophic_pct
             SETTINGS.risk.quote_gap_backstop_limit_margin_pct = margin_pct
+            if retry_minutes is not None:
+                SETTINGS.risk.quote_gap_backstop_retry_minutes = retry_minutes
             return self
 
         def __exit__(self, *exc):
@@ -230,6 +241,7 @@ def _with_backstop_settings(enabled=True, minutes=10.0, catastrophic_pct=0.75, m
                 SETTINGS.risk.quote_gap_backstop_minutes,
                 SETTINGS.risk.quote_gap_backstop_catastrophic_loss_pct,
                 SETTINGS.risk.quote_gap_backstop_limit_margin_pct,
+                SETTINGS.risk.quote_gap_backstop_retry_minutes,
             ) = self.orig
 
     return _Ctx()
@@ -439,21 +451,78 @@ def test_recovering_valid_quote_resets_the_backstop_tracking():
         bot._apply_quote_gap_backstop(spot=6000.0, now=1_300.0)
 
         assert "GFGC8000OC" not in bot._position_invalid_quote_since
+        assert "GFGC8000OC" not in bot._backstop_last_action_at  # tracking de reintentos tambien se limpia
         assert bot.portfolio.positions[0].quantity == 5  # nunca se llego a cerrar
 
 
-def test_closed_position_is_purged_from_tracking():
-    with _with_backstop_settings(minutes=10.0), _with_shadow_enabled():
+def test_backstop_retry_is_spaced_not_every_cycle():
+    """
+    BUG REAL DE RIESGO CORREGIDO (2026-11-18, a pedido explicito del
+    usuario - caso real GFGV4000DI, ver RESEARCH.md: 13.907 disparos del
+    mismo "RESPALDO [...] disparado" para un UNICO simbolo en ~16.5hs,
+    ~1 por cada ciclo de poll de 5s). Sin RiskConfig.
+    quote_gap_backstop_retry_minutes, _apply_quote_gap_backstop reactuaba/
+    reloggeaba en TODOS los ciclos mientras el book sin dos puntas
+    persistiera, sin ningun espaciado propio.
+
+    `backstop_minutes=0.0` aca es deliberado: hace que el gatillo de
+    tiempo dispare en la primerisima llamada (elapsed=0 >= 0), para poder
+    enfocar el test exclusivamente en el espaciado de REINTENTOS
+    (`retry_minutes`), no en el umbral de PRIMER disparo (ya cubierto por
+    test_time_gap_forces_close_after_n_minutes_without_catastrophic_loss).
+    """
+    import run_bot as run_bot_module
+
+    with _with_backstop_settings(minutes=0.0, catastrophic_pct=0.75, retry_minutes=2.0), _with_shadow_enabled():
         bot = _make_bot()
         _add_long_position(bot, entry_price=100.0)
-        _upsert_quote(bot, "GFGC8000OC", bid=50.0, ask=150.0)
+        # Ninguna cotizacion en absoluto para esta base (mismo escenario que
+        # test_no_book_at_all_logs_but_never_crashes_and_never_fabricates_a_price,
+        # el que de hecho dispara en cada ciclo en produccion: GFGV4000DI
+        # jamas tuvo un book de dos puntas real).
+
+        error_calls = []
+        original_error = run_bot_module.logger.error
+        run_bot_module.logger.error = lambda msg, *args: error_calls.append(msg % args)
+        try:
+            bot._apply_quote_gap_backstop(spot=6000.0, now=1_000.0)       # 1er disparo: siempre actua/loguea
+            bot._apply_quote_gap_backstop(spot=6000.0, now=1_001.0)       # +1s: dentro de la ventana de 2min
+            bot._apply_quote_gap_backstop(spot=6000.0, now=1_060.0)       # +60s: todavia dentro de la ventana
+            assert len(error_calls) == 1, (
+                f"con retry_minutes=2.0, 3 llamadas en 60s deberian loguear 1 sola vez (reintento "
+                f"espaciado, nunca en cada ciclo) - loguearon {len(error_calls)}"
+            )
+
+            bot._apply_quote_gap_backstop(spot=6000.0, now=1_000.0 + 121.0)  # pasaron >2min desde el ultimo intento
+            assert len(error_calls) == 2, (
+                f"pasado retry_minutes desde el ultimo intento, el mecanismo debe reintentar/realertar "
+                f"de nuevo (nunca deja de intentar del todo) - loguearon {len(error_calls)}"
+            )
+        finally:
+            run_bot_module.logger.error = original_error
+
+        assert bot.portfolio.positions[0].quantity == 5  # sigue sin poder cerrarse sin un precio real
+        assert "GFGC8000OC" in bot._position_invalid_quote_since  # el gap de tiempo sigue trackeado igual
+
+
+def test_closed_position_is_purged_from_tracking():
+    with _with_backstop_settings(minutes=0.0), _with_shadow_enabled():
+        bot = _make_bot()
+        _add_long_position(bot, entry_price=100.0)
+        # Ninguna cotizacion en absoluto (igual que test_backstop_retry_is_
+        # spaced_not_every_cycle) - a diferencia de un book de dos puntas
+        # invalido, esta rama NUNCA llega a armar/llenar una orden, asi que
+        # la posicion sigue abierta hasta el cierre manual mas abajo (lo
+        # que este test quiere simular: "se cerro por OTRA via").
         bot._apply_quote_gap_backstop(spot=6000.0, now=1_000.0)
         assert "GFGC8000OC" in bot._position_invalid_quote_since
+        assert "GFGC8000OC" in bot._backstop_last_action_at  # minutes=0.0 -> ya actuo/logueo en esta llamada
 
         bot.portfolio.positions[0].quantity = 0  # se cerro por otra via (ej. stop normal)
         bot._apply_quote_gap_backstop(spot=6000.0, now=1_300.0)
 
         assert "GFGC8000OC" not in bot._position_invalid_quote_since
+        assert "GFGC8000OC" not in bot._backstop_last_action_at  # tracking de reintentos tambien se limpia
 
 
 ALL_TESTS = [
@@ -474,6 +543,7 @@ ALL_TESTS = [
     test_short_position_loses_when_price_rises_not_falls,
     test_real_gfgc6800oc_case_broken_book_does_not_false_trigger_catastrophic,
     test_recovering_valid_quote_resets_the_backstop_tracking,
+    test_backstop_retry_is_spaced_not_every_cycle,
     test_closed_position_is_purged_from_tracking,
 ]
 

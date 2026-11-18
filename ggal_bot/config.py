@@ -685,6 +685,29 @@ class RiskConfig:
     quote_gap_backstop_limit_margin_pct: float = _env_float(
         "GGAL_BOT_QUOTE_GAP_BACKSTOP_LIMIT_MARGIN_PCT", 0.05
     )
+    # BUG REAL DE RIESGO CORREGIDO (2026-11-18, a pedido explicito del
+    # usuario - caso real GFGV4000DI, ver RESEARCH.md: 13.907 disparos del
+    # mismo "RESPALDO [...] disparado" en un solo simbolo en ~16.5hs). Antes
+    # de esto, _apply_quote_gap_backstop() en run_bot.py no tenia NINGUN
+    # limite de frecuencia propio: mientras el book sigue sin pasar
+    # is_valid_quote() (o directamente sin dos puntas), el metodo reevalua y
+    # REACTUA/reloguea en TODOS los ciclos (cada GGAL_BOT_SHADOW_POLL_SECONDS,
+    # tipicamente 5s) sin ningun espaciado - para un contrato sin book real
+    # (GFGV4000DI: put muy OTM de la serie forzada de diciembre, 0% de
+    # quotes validas en market_snapshots.csv), esto generaba miles de
+    # intentos/alertas idénticos por hora sin aportar ninguna señal nueva.
+    # Este umbral espacia los REINTENTOS (y sus logs, que sirven de alerta)
+    # a lo sumo una vez cada N minutos por simbolo - NUNCA deja de intentar
+    # cerrar la posicion (sigue siendo el ultimo resorte, sigue disparando
+    # el catastrofico sin esperar si corresponde - ver
+    # _apply_quote_gap_backstop), solo deja de hacerlo en CADA ciclo. Valor
+    # razonado (no medido, DATA INSUFFICIENT igual que los 3 de arriba):
+    # mucho mas corto que quote_gap_backstop_minutes (10 min, el umbral de
+    # PRIMER disparo) para seguir siendo claramente "el ultimo resorte, no
+    # una espera adicional", pero ya no en cada ciclo de pocos segundos.
+    quote_gap_backstop_retry_minutes: float = _env_float(
+        "GGAL_BOT_QUOTE_GAP_BACKSTOP_RETRY_MINUTES", 2.0
+    )
 
     # --- Presupuesto PREVENTIVO de Griegas por entrada (MEJORA 2026-09-28) ---
     # A pedido explicito del usuario ("mejor trader quant... presupuesto de

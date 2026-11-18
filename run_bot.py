@@ -580,6 +580,14 @@ class GgalOptionsBot:
         self._position_invalid_quote_since: Dict[str, float] = {}
         self._position_invalid_quote_last_mid: Dict[str, float] = {}
         self._position_invalid_quote_last_valid_iv: Dict[str, float] = {}
+        # BUG REAL DE RIESGO CORREGIDO (2026-11-18, caso real GFGV4000DI -
+        # ver RiskConfig.quote_gap_backstop_retry_minutes para la evidencia
+        # completa y el razonamiento del valor). symbol -> timestamp
+        # (time.time()) del ULTIMO intento de accion de este mecanismo
+        # (logueo del error "sin book operable" O el logueo/submit de la
+        # orden de respaldo) - permite espaciar reintentos en vez de
+        # reactuar en cada ciclo mientras la condicion persista.
+        self._backstop_last_action_at: Dict[str, float] = {}
         self._shutting_down = False
         # Numero de señal (SIGINT/SIGTERM) que disparo el shutdown, o None si
         # todavia no se recibio ninguna. Se guarda aca (en vez de loguearse
@@ -1515,6 +1523,7 @@ class GgalOptionsBot:
                 del self._position_invalid_quote_since[symbol]
                 self._position_invalid_quote_last_mid.pop(symbol, None)
                 self._position_invalid_quote_last_valid_iv.pop(symbol, None)
+                self._backstop_last_action_at.pop(symbol, None)
 
         for pos in open_positions:
             if self.mid_price_exec.has_open_order_for(pos.symbol):
@@ -1542,6 +1551,7 @@ class GgalOptionsBot:
                         "resuelve el tracking de este mecanismo para esta base.", pos.symbol,
                     )
                 self._position_invalid_quote_since.pop(pos.symbol, None)
+                self._backstop_last_action_at.pop(pos.symbol, None)
                 continue
 
             invalid_since_ts = self._position_invalid_quote_since.setdefault(pos.symbol, now_ts)
@@ -1591,6 +1601,20 @@ class GgalOptionsBot:
             )
             if reason is None:
                 continue
+
+            # BUG REAL DE RIESGO CORREGIDO (2026-11-18, caso real GFGV4000DI
+            # - ver RiskConfig.quote_gap_backstop_retry_minutes): mientras
+            # `reason` siga disparando (el book sigue sin resolverse),
+            # reintentar/realertar como mucho una vez cada N minutos por
+            # simbolo, nunca en cada ciclo. Esto NUNCA retrasa el primer
+            # disparo (quote_gap_backstop_minutes/catastrophic_loss_pct de
+            # arriba siguen decidiendo CUANDO dispara por primera vez para
+            # esta base) - solo espacia los reintentos UNA VEZ que ya
+            # disparo y el intento anterior no resolvio la posicion.
+            last_action_at = self._backstop_last_action_at.get(pos.symbol)
+            if last_action_at is not None and (now_ts - last_action_at) < SETTINGS.risk.quote_gap_backstop_retry_minutes * 60.0:
+                continue
+            self._backstop_last_action_at[pos.symbol] = now_ts
 
             if not book_has_two_sided_quote:
                 # Sin NINGUN precio para proteger la orden (ver docstring

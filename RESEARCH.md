@@ -3681,3 +3681,85 @@ Durante la búsqueda del ProjectId/ServiceId correctos de Northflank, un
 bot. Se le recomendó al usuario rotarlas por las dudas. No son credenciales
 de GGAL_BOT y no se usaron ni se van a usar para nada en este proyecto -
 se documenta aquí solo para que quede registro del incidente.
+
+## Seguimiento 18/11 (2da parte, mismo día): seguridad, shadow_trades.csv, GFGV4000DI con fix
+
+### 1) Seguridad: confirmado, no se filtró ninguna credencial de Binance
+
+`grep` de las cadenas literales expuestas (API key/secret/password del
+incidente documentado arriba) contra todo el árbol de trabajo Y contra
+`git log --all -p` (historial completo, mensajes + diffs): cero
+coincidencias. La única mención en `RESEARCH.md` es genérica (nombres de
+variable, nunca los valores). Instrucción del usuario incorporada: de acá
+en adelante, cualquier comando de Northflank corrido por este agente es
+exclusivamente contra el servicio de GGAL_BOT (`ggal-bot`/`supreme-cattle`),
+nunca contra otro proyecto.
+
+### 2) `shadow_trades.csv` → confirmado: es diseño, no bug - rotación de schema ya documentada en el propio código
+
+`order_gateway.py::ShadowAuditLogger` (docstring, corrección 2026-10-05)
+ya documenta esto explícitamente: cuando el header en disco no coincide
+con el header actual de la clase, **nunca** se reescribe el archivo viejo
+(preservación del histórico real) - las filas nuevas pasan a escribirse en
+un sibling versionado `shadow_trades.schemaN.csv`. El archivo
+`shadow_trades.csv` que bajamos el 18/11 es justamente el que quedó
+congelado en esa rotación (fills 2026-09-01 a 2026-10-02, mezcla real de
+filas de 10 y 13 columnas - el archivo pre-fix que motivó la corrección en
+primer lugar).
+
+**Ya NO hace falta tocar código**: tanto `dashboard/pnl_engine.py::
+load_fills()` (`_discover_shadow_trade_files`) como `ggal_bot/ops/
+weekly_review.py::load_shadow_fill_rows()` (su propia implementación
+liviana, deliberadamente sin pandas) **ya descubren y concatenan toda la
+familia `shadow_trades.csv` + `shadow_trades.schemaN.csv`** - verificado
+leyendo ambas funciones directamente, no es solo lo que dice el
+docstring. El dashboard en producción (que lee directo de `/app/logs/`)
+ya ve el archivo completo sin ningún cambio.
+
+**El gap real está en `fetch_northflank_logs.ps1`**: su lista fija de
+archivos a descargar (`$coreFiles`/`$optionalFiles`) solo pide
+`shadow_trades.csv` por nombre exacto - nunca el sibling `schemaN`. Por
+eso el export del 18/11 "parecía" tener datos congelados desde el 2/10:
+no es que el bot dejó de loguear, es que el script de export nunca pidió
+el archivo correcto. Pendiente: confirmar el nombre exacto del sibling
+(`northflank exec service --cmd "ls -la /app/logs/shadow_trades*"`) y
+agregarlo al export - no se modifica el script todavía (vive solo en la
+máquina del usuario, sin versionar en este repo) hasta tener ese nombre
+confirmado.
+
+### 3) GFGV4000DI - causa raíz confirmada + fix implementado
+
+**Sí tuvo una posición real, no es un fantasma**: `position_events.csv`
+muestra `ENTRY 2026-11-16T20:58:30 sell -14 ... reason=spread_completion`
+(pata corta agregada por el mecanismo de completado de spread, ver
+`GGAL_BOT_ENABLE_SPREAD_COMPLETION`) y `CLOSE 2026-11-17T13:31:10 buy +14
+... reason=quote_gap_backstop` - quedó abierta ~16.5hs.
+
+**Causa del aluvión de disparos**: `_apply_quote_gap_backstop()` (`run_bot.py`)
+no tenía ningún límite de frecuencia propio - mientras la posición sigue
+abierta y el book sigue sin dos puntas (que es exactamente el caso de
+GFGV4000DI, un put muy OTM de la serie forzada de diciembre: 0% de quotes
+válidas en `market_snapshots.csv`), cada ciclo (`GGAL_BOT_SHADOW_POLL_SECONDS=5`)
+re-evalúa, no encuentra book operable, y vuelve a loguear "RESPALDO
+[...] disparado... sin NINGUN book operable" - sin crear ninguna orden
+en vigilancia que frene el próximo ciclo (esa rama específica, sin book
+de dos puntas, nunca llega a `submit_protected_limit`). 16.5hs ÷ 5s ≈
+11.880 ciclos, del mismo orden que los 13.907 disparos reales observados.
+
+**Fix** (commit nuevo, no requiere exception al freeze porque el freeze ya
+terminó el 5/11): nuevo `RiskConfig.quote_gap_backstop_retry_minutes`
+(`GGAL_BOT_QUOTE_GAP_BACKSTOP_RETRY_MINUTES`, default 2.0 minutos, DATA
+INSUFFICIENT para calibrar un valor medido - razonado como claramente más
+corto que `quote_gap_backstop_minutes`, 10 min, el umbral de PRIMER
+disparo). Nuevo tracker `self._backstop_last_action_at` (mismo patrón de
+limpieza que `_position_invalid_quote_since`). El mecanismo sigue
+intentando cerrar la posición indefinidamente (nunca se rinde del todo,
+nunca deja de alertar) - solo espacia los reintentos/logs a lo sumo una
+vez cada `retry_minutes` por símbolo, en vez de en cada ciclo. El primer
+disparo (`quote_gap_backstop_minutes`/`catastrophic_loss_pct`) no cambia
+en nada - esto solo afecta reintentos DESPUÉS de que ya disparó una vez.
+
+Test nuevo: `test_quote_gap_backstop.py::test_backstop_retry_is_spaced_not_every_cycle`
+(3 llamadas en 60s loguean 1 sola vez con `retry_minutes=2.0`; una 4ta
+llamada pasados los 2 minutos vuelve a loguear - el mecanismo nunca se
+apaga del todo). Suite completa: 874 passed.
