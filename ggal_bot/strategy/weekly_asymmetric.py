@@ -767,6 +767,7 @@ class WeeklyAsymmetricStrategy:
         self, option_chain: OptionChain, portfolio: Portfolio, trend: str = Trend.NEUTRAL.value,
         max_quote_age_seconds: Optional[float] = None, now: Optional[float] = None,
         forced_expiry: Optional[date] = None, strategy_tag: str = "weekly_asymmetric",
+        max_spread_relative: Optional[float] = None,
     ) -> List[SpreadCompletionSignal]:
         """
         `trend`: misma lectura inyectada que scan_entry_signals(). Bajo
@@ -811,6 +812,20 @@ class WeeklyAsymmetricStrategy:
         el modo Scalping bajo sus propias reglas. Default
         "weekly_asymmetric" preserva el comportamiento previo a este
         parametro para cualquier llamador que no lo pase.
+
+        `max_spread_relative` (CORREGIDO 2026-11-18, caso real GFGV4000DI -
+        ver RESEARCH.md y run_bot.py:_act_on_spread_completion_signal para
+        el fix equivalente en el punto de ejecucion): antes de este
+        parametro, `_find_wing_quote` solo descartaba un wing por
+        antiguedad (`max_quote_age_seconds`) o por `bid<=0/ask<=0` - un
+        book de dos puntas pero con spread arbitrariamente ancho pasaba
+        igual, exactamente el defecto que permitio vender una pata corta
+        sin un book realmente operable. Si se pasa junto con
+        `max_quote_age_seconds`, el wing se exige `is_valid_quote()`
+        completo (dos puntas + spread maximo + antiguedad maxima - ver
+        OrderBookSnapshot.is_valid_quote) en vez de solo antiguedad.
+        Default None = comportamiento previo (solo antiguedad), para
+        cualquier llamador/test que no lo pase.
         """
         if not self.cfg.enable_spread_completion:
             return []
@@ -842,7 +857,13 @@ class WeeklyAsymmetricStrategy:
             wing = self._find_wing_quote(
                 option_chain, quote, self.cfg,
                 max_quote_age_seconds=max_quote_age_seconds, now=now,
+                max_spread_relative=max_spread_relative,
             )
+            # Fallback defensivo: si no se paso max_spread_relative (algun
+            # llamador/test viejo), se preserva el chequeo bare de antes;
+            # con max_spread_relative presente, _find_wing_quote ya exigio
+            # is_valid_quote() completo y esto queda redundante pero
+            # inofensivo.
             if wing is None or wing.book.bid <= 0 or wing.book.ask <= 0:
                 continue
 
@@ -873,6 +894,7 @@ class WeeklyAsymmetricStrategy:
     def _find_wing_quote(
         option_chain: OptionChain, long_quote: OptionQuote, cfg=None,
         max_quote_age_seconds: Optional[float] = None, now: Optional[float] = None,
+        max_spread_relative: Optional[float] = None,
     ) -> Optional[OptionQuote]:
         """
         Entre las bases del mismo tipo y vencimiento, busca la mas cercana
@@ -894,15 +916,31 @@ class WeeklyAsymmetricStrategy:
         sola mientras el resto del ciclo sigue fresco, ver docstring de
         scan_spread_completion_signals). Default None = sin filtro, mismo
         comportamiento que antes de esta guardia.
+
+        `max_spread_relative` (CORREGIDO 2026-11-18, caso real GFGV4000DI):
+        si se pasa JUNTO CON `max_quote_age_seconds`, el filtro de arriba
+        deja de ser "solo antiguedad" y pasa a exigir
+        `q.book.is_valid_quote(max_spread_relative, max_quote_age_seconds, now=now)`
+        - dos puntas + spread maximo + antiguedad maxima, el mismo criterio
+        unificado que ya protege a las SALIDAS (ver
+        RiskConfig.enforce_quote_validity_filter_for_exits). Antes, un wing
+        con dos puntas pero spread arbitrariamente ancho pasaba igual -
+        exactamente el book que se vendio sin ser realmente operable. Default
+        None = comportamiento previo (solo antiguedad), para cualquier
+        llamador/test que no lo pase.
         """
         cfg = cfg if cfg is not None else SETTINGS.long_first
         min_wing_strike_diff = long_quote.strike * cfg.spread_wing_moneyness_pct
+        if max_spread_relative is not None and max_quote_age_seconds is not None:
+            quote_ok = lambda q: q.book.is_valid_quote(max_spread_relative, max_quote_age_seconds, now=now)
+        else:
+            quote_ok = lambda q: max_quote_age_seconds is None or not q.book.is_stale(max_quote_age_seconds, now=now)
         same_series = [
             q for q in option_chain.all_quotes()
             if q.option_type is long_quote.option_type
             and q.expiry == long_quote.expiry
             and q.symbol != long_quote.symbol
-            and (max_quote_age_seconds is None or not q.book.is_stale(max_quote_age_seconds, now=now))
+            and quote_ok(q)
         ]
         if long_quote.option_type is OptionType.CALL:
             wings = [q for q in same_series if q.strike >= long_quote.strike + min_wing_strike_diff]

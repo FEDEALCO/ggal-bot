@@ -989,6 +989,68 @@ def test_scan_spread_completion_signals_excludes_stale_wing_candidate():
     assert len(signals_fresh) == 1
 
 
+def test_scan_spread_completion_signals_excludes_wing_with_two_sided_but_too_wide_book():
+    """
+    CORREGIDO 2026-11-18, caso real GFGV4000DI (16/11 20:58 UTC, ver
+    RESEARCH.md y run_bot.py:_act_on_spread_completion_signal para el fix
+    equivalente en el punto de ejecucion): antes, `_find_wing_quote` solo
+    descartaba un wing por antiguedad (test de arriba) o por bid<=0/ask<=0 -
+    un wing con dos puntas pero spread arbitrariamente ancho (bid=30.0,
+    ask=40.0 sobre strike 4000 -> spread_relative=28.6%, muy por encima del
+    5% default de RiskConfig.max_spread_relative) pasaba igual, exactamente
+    el book que termino vendiendose sin ser realmente operable. Pasando
+    `max_spread_relative` JUNTO CON `max_quote_age_seconds`, el filtro pasa a
+    exigir is_valid_quote() completo y ese wing queda excluido.
+    """
+    now = time.time()
+    chain = OptionChain()
+    long_put = _quote("GFGV4600DI", 4600, 0.55, 6000.0, days_biz=3, option_type=OptionType.PUT)
+    wide_wing = _quote(
+        "GFGV4000DI", 4000, 0.50, 6000.0, days_biz=3, option_type=OptionType.PUT,
+        bid=30.0, ask=40.0,  # spread_relative=(40-30)/35=28.6%, caso real GFGV4000DI
+    )
+    chain.upsert_quote(long_put)
+    chain.upsert_quote(wide_wing)
+
+    strategy = WeeklyAsymmetricStrategy(
+        _lenient_risk_manager(), config=_default_config(spread_wing_moneyness_pct=0.02),
+    )
+    portfolio = Portfolio()
+    portfolio.add(Position(symbol=long_put.symbol, quantity=14, multiplier=100.0))
+
+    # Sin max_spread_relative (comportamiento previo a este fix, sin
+    # cambios): el wing ancho pasa igual, SI completa el spread.
+    signals_no_guard = strategy.scan_spread_completion_signals(
+        chain, portfolio, trend="BEARISH", max_quote_age_seconds=90.0, now=now,
+    )
+    assert len(signals_no_guard) == 1
+
+    # Con max_spread_relative (el fix): el unico wing disponible tiene
+    # spread 28.6%, por encima del 5% -> no se encuentra ningun wing valido,
+    # no se genera señal (la larga queda sola, riesgo acotado).
+    signals_guarded = strategy.scan_spread_completion_signals(
+        chain, portfolio, trend="BEARISH", max_quote_age_seconds=90.0, now=now,
+        max_spread_relative=0.05,
+    )
+    assert signals_guarded == []
+
+    # Si el wing tiene un spread operable (ej. bid=38/ask=42 -> spread_rel
+    # ~10%... probemos con uno realmente dentro de banda: bid=39.5/ask=40.5
+    # -> spread_rel=2.5%), la guardia de spread no bloquea nada.
+    chain_tight = OptionChain()
+    tight_wing = _quote(
+        "GFGV4000DI", 4000, 0.50, 6000.0, days_biz=3, option_type=OptionType.PUT,
+        bid=39.5, ask=40.5,
+    )
+    chain_tight.upsert_quote(long_put)
+    chain_tight.upsert_quote(tight_wing)
+    signals_tight = strategy.scan_spread_completion_signals(
+        chain_tight, portfolio, trend="BEARISH", max_quote_age_seconds=90.0, now=now,
+        max_spread_relative=0.05,
+    )
+    assert len(signals_tight) == 1
+
+
 def test_scan_spread_completion_signals_forced_expiry_ignores_other_expiries():
     """
     Feature nueva (2026-09-01, a pedido explicito del usuario -
@@ -2651,6 +2713,7 @@ ALL_TESTS = [
     test_scan_spread_completion_signals_picks_further_otm_wing_for_bull_call_spread,
     test_scan_spread_completion_signals_forced_expiry_ignores_other_expiries,
     test_scan_spread_completion_signals_excludes_stale_wing_candidate,
+    test_scan_spread_completion_signals_excludes_wing_with_two_sided_but_too_wide_book,
     test_scan_spread_completion_signals_picks_lower_strike_wing_for_bear_put_spread,
     test_scan_entry_signals_bullish_trend_only_considers_calls,
     test_scan_entry_signals_bearish_trend_only_considers_puts,

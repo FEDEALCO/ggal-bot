@@ -712,6 +712,65 @@ def test_act_on_spread_completion_signal_logs_entry_to_position_event_journal():
         SETTINGS.shadow.enabled = original_enabled
 
 
+def test_act_on_spread_completion_signal_rejects_wing_with_two_sided_but_too_wide_book():
+    """
+    CORREGIDO 2026-11-18, caso real GFGV4000DI (16/11 20:58 UTC): la pata
+    corta de spread_completion se vendio (-14 @ 32.01) sobre un book que
+    tenia dos puntas (bid>0, ask>0 - el UNICO chequeo que existia antes de
+    este fix) pero no era realmente operable; el quote_gap_backstop tuvo que
+    cerrarla ~17hs despues a perdida (34.966, ver RESEARCH.md). Este test
+    reproduce exactamente ese defecto con un book sintetico de dos puntas
+    pero spread muy por encima de RiskConfig.max_spread_relative (5%
+    default): bid=30.0/ask=40.0 -> spread_relative=(40-30)/35=28.6%. Con el
+    fix (enforce_entry_spread_gate, mismo gate que ya protegia la pata
+    LARGA via _act_on_entry_signal desde 2026-10-08), _act_on_spread_
+    completion_signal debe rechazar la pata corta SIN enviar ninguna orden
+    - la larga queda sola, riesgo acotado, en vez de una pata corta
+    descubierta sobre un precio no confiable.
+    """
+    from ggal_bot.strategy.weekly_asymmetric import SpreadCompletionSignal
+    from ggal_bot.data.option_chain import OptionQuote
+
+    original_enabled = SETTINGS.shadow.enabled
+    original_gate = SETTINGS.risk.enforce_entry_spread_gate
+    SETTINGS.shadow.enabled = True
+    SETTINGS.risk.enforce_entry_spread_gate = True
+    try:
+        bot = GgalOptionsBot()
+        _isolate_position_event_journal(bot)
+
+        # Book de dos puntas (pasa el chequeo viejo bid>0/ask>0) pero con
+        # spread_relative=28.6%, muy por encima del 5% default de
+        # RiskConfig.max_spread_relative - exactamente el tipo de book que
+        # el caso real GFGV4000DI demostro que no es operable.
+        book = OrderBookSnapshot("GFGV4000DI", bid=30.0, ask=40.0, bid_size=50, ask_size=50)
+        option_quote = OptionQuote(
+            symbol="GFGV4000DI", strike=4000.0, expiry=date(2026, 12, 18), option_type=OptionType.PUT,
+            book=book, days_calendar=30, days_business=21,
+        )
+        option_quote.greeks = {"delta": -0.2, "gamma": 0.001, "vega": 1.0, "theta": -0.5, "rho": -0.05, "price": 35.0}
+        bot.option_chain.upsert_quote(option_quote)
+
+        signal = SpreadCompletionSignal(
+            long_symbol="GFGV4600DI", short_symbol="GFGV4000DI", option_type=OptionType.PUT,
+            reason="spread_completion_test_GFGV4000DI", long_quantity_confirmed=14.0,
+        )
+        bot._act_on_spread_completion_signal(signal, spot=6000.0)
+
+        rows = _read_position_events(bot)
+        entry_rows = [r for r in rows if r["event_type"] == "ENTRY" and r["symbol"] == "GFGV4000DI"]
+        assert len(entry_rows) == 0, (
+            f"la pata corta NO deberia haberse vendido (book no operable, spread 28.6%), "
+            f"pero se encontraron {len(entry_rows)} fila(s) ENTRY"
+        )
+        assert not any(p.symbol == "GFGV4000DI" for p in bot.portfolio.positions), (
+            "no deberia haber ninguna Position para la pata corta rechazada"
+        )
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+        SETTINGS.risk.enforce_entry_spread_gate = original_gate
+
+
 def test_act_on_naked_short_wing_exit_signal_closes_it_and_logs_journal():
     """
     Tarea #27 item 3 (caso real GFGV5000OC): una vez que
@@ -906,6 +965,7 @@ ALL_TESTS = [
     test_act_on_signal_logs_entry_to_position_event_journal_with_vol_arbitrage_tag,
     test_maybe_hedge_logs_entry_and_add_events_to_position_event_journal,
     test_act_on_spread_completion_signal_logs_entry_to_position_event_journal,
+    test_act_on_spread_completion_signal_rejects_wing_with_two_sided_but_too_wide_book,
     test_act_on_naked_short_wing_exit_signal_closes_it_and_logs_journal,
     test_capital_available_ars_excludes_delta_hedge_underlying_position,
     test_on_book_update_stamps_spot_last_update_at,

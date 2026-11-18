@@ -3763,3 +3763,129 @@ Test nuevo: `test_quote_gap_backstop.py::test_backstop_retry_is_spaced_not_every
 (3 llamadas en 60s loguean 1 sola vez con `retry_minutes=2.0`; una 4ta
 llamada pasados los 2 minutos vuelve a loguear - el mecanismo nunca se
 apaga del todo). Suite completa: 874 passed.
+
+## Seguimiento 18/11 (3ra parte, mismo día): horario BYMA/DST, spread_completion sin quote válido
+
+### 1) Horario BYMA: VERIFICADO contra fuente oficial MÁS NUEVA - el código ya estaba correcto, la entrada de GFGV4000DI fue DENTRO de horario
+
+El usuario pidió verificar si BYMA cambió el horario de opciones por el
+cambio de horario de EE.UU. del 1/11, dado que la entrada de GFGV4000DI
+(16/11 20:58 UTC = 17:58 ART) le pareció "después del cierre".
+
+**VERIFICADO contra la fuente oficial MÁS RECIENTE** (Comunicado BYMA N°
+19031, 28/10/2026, efectivo 02/11/2026, PDF oficial leído completo vía
+web-fetch: `cdn.prod.website-files.com/.../BYMA-COM19031-Horarios...pdf`):
+"Negociación Regular – Opciones y Plazos **10:30 hs. a 18:00 hs.**" - este
+comunicado **deja sin efecto** el N°19024 (la fuente que `market_hours.py`
+ya citaba desde el 2026-10-02) pero con **los mismos números exactos**:
+apertura 10:30 ART sin cambio, cierre 17:00→18:00 ART desde el 2/11. Un
+artículo de Ámbito (23/09/2026) confirma que este corrimiento de horario
+de BYMA está atado al cambio estacional de horario de EE.UU. ("para
+alinearse con Wall Street"), igual que la hipótesis del usuario. **No
+existe ningún horario de apertura de 11:30 en ninguna fuente oficial** - la
+ventana alternativa que sugirió el usuario no es correcta; la vigente
+sigue siendo 10:30-18:00 ART.
+
+**Conclusión sobre GFGV4000DI**: `ggal_bot/market_hours.py` YA implementaba
+correctamente este horario (fecha-consciente, `_BYMA_SESSION_END_CHANGE_DATE_ART
+= 2026-11-02`, verificado originalmente el 2026-10-02 contra el Comunicado
+19024, que resultó tener los mismos valores que el 19031 que lo sucedió).
+17:58 ART **está DENTRO** de la ventana 10:30-18:00 ART (faltaban 2
+minutos para el cierre, no después de él) - la entrada **no violó ningún
+gate de horario**, el gate funcionó correctamente. La premisa de "después
+del cierre" partía de un supuesto desactualizado (probablemente el cierre
+viejo de 17:00).
+
+**Fills fuera de la ventana oficial desde el 1/11** (`position_events.csv`,
+1454 eventos ≥2026-11-01 revisados contra `market_hours.is_within_byma_session()`
+real): **2 de 1454**, ambos cierres del `quote_gap_backstop` (nunca una
+entrada nueva), 8-10 minutos después del cierre de las 18:00 ART:
+
+| timestamp UTC | ART | symbol | tipo | motivo |
+|---|---|---|---|---|
+| 2026-11-16T21:10:29 | 18:10:29 (lunes) | GFGV4400DI | CLOSE | quote_gap_backstop |
+| 2026-11-17T21:08:47 | 18:08:47 (martes) | GFGV4400DI | CLOSE | quote_gap_backstop |
+
+Esto es **por diseño, no un bug**: `_apply_quote_gap_backstop()` corre
+ANTES del gate de horario en `recompute_cycle()` (`run_bot.py`, línea
+~1175 vs. ~1241) y deliberadamente no depende de
+`_market_data_is_reliable_for_trading()` - es un mecanismo de ÚLTIMO
+RECURSO para cerrar/reducir riesgo de una posición ya abierta con quote
+inválido, nunca abre exposición nueva; bloquearlo fuera de horario
+significaría dejar una posición en riesgo sin protección hasta la
+apertura del día siguiente, exactamente lo que este mecanismo existe para
+evitar. Ningún fix necesario acá.
+
+**Cobertura de test de ambos períodos**: ya existía completa en
+`test_market_hours.py` (cierre 17:00 pre-2/11, cierre 18:00 post-2/11,
+frontera exacta en ambos sentidos, apertura 10:30 inclusive, fin de
+semana) - no hacía falta agregar nada.
+
+**Limpieza menor**: el docstring de `_market_data_is_reliable_for_trading()`
+en `run_bot.py` todavía citaba la ventana vieja desactualizada
+("11:00-17:00 ART... SUPUESTO no verificado") de ANTES de la corrección
+del 2026-10-02 - la función en sí siempre llamó a la lógica real y
+correcta de `market_hours.py`, esto era solo un comentario desincronizado
+con el código. Corregido.
+
+### 2) spread_completion vendió una pata sin book realmente operable - CONFIRMADO y corregido
+
+El usuario tenía razón: `WeeklyAsymmetricStrategy.scan_spread_completion_signals`
+(vía `_find_wing_quote`) y `run_bot.py::_act_on_spread_completion_signal`
+solo exigían `bid>0 y ask>0` (book "de dos puntas") para la pata corta de
+un spread, nunca el chequeo completo de spread máximo (`is_valid_quote()`/
+`is_tradeable()`, 5% default) que **ya existía para la pata LARGA**
+(`_act_on_entry_signal`, gate `enforce_entry_spread_gate` agregado el
+2026-10-08) y para las SALIDAS (`enforce_quote_validity_filter_for_exits`).
+Un book de dos puntas pero con spread arbitrariamente ancho pasaba igual -
+exactamente el tipo de precio no confiable contra el que se vendió la pata
+corta de GFGV4000DI.
+
+**Precio de cierre del backstop para GFGV4000DI**: **34.966** (compra para
+cerrar 14 contratos el 17/11 13:31:10 UTC, vs. entrada de venta a 32.01 el
+16/11 20:58:30 UTC - pérdida de ~2.956/unidad × 14 × 100 ≈ ARS 4.138 antes
+de costos, ver `position_events.csv`).
+
+**Fix aplicado en DOS capas (defensa en profundidad)**:
+1. **Detección de señal** (`scan_spread_completion_signals`/`_find_wing_quote`,
+   `ggal_bot/strategy/weekly_asymmetric.py`): nuevo parámetro
+   `max_spread_relative`; cuando se pasa junto con `max_quote_age_seconds`
+   (como ya hace `run_bot.py`), el candidato a wing debe pasar
+   `is_valid_quote()` completo (dos puntas + spread máximo + antigüedad
+   máxima) en vez de solo antigüedad.
+2. **Ejecución** (`_act_on_spread_completion_signal`, `run_bot.py`): mismo
+   gate `enforce_entry_spread_gate`/`is_tradeable()` (spread + tamaño
+   mínimo de punta) que ya protegía a la pata larga desde el 2026-10-08 -
+   antes esta pata nunca lo había recibido. Se usa `is_tradeable()` en vez
+   de `is_valid_quote()` en este punto puntual porque es una EJECUCIÓN de
+   orden nueva (necesita tamaño mínimo operable), no un marcado a mercado
+   de una posición ya abierta - mismo criterio que ya distingue el propio
+   código entre ambas funciones (ver docstring de `OrderBookSnapshot.is_valid_quote`).
+   Si la pata corta se rechaza, la larga queda sola (riesgo acotado, nunca
+   una posición naked descubierta).
+
+**Bonus (mismo hallazgo, aplicado por consistencia)**: el filtro de
+`valid_quotes` para ENTRADAS NUEVAS de `weekly_asymmetric`, `vol_arbitrage`
+y `scalping` (los tres loops en `run_bot.py`) solo exigía
+`iv is not None` + no-stale, nunca el spread máximo - se tightened a
+`is_valid_quote()` completo en los tres. `vol_arbitrage` no está activo en
+producción actualmente, pero quedaba con el mismo hueco latente para
+cuando se reactive.
+
+**Tests nuevos**: `test_long_first_mode.py::test_scan_spread_completion_signals_excludes_wing_with_two_sided_but_too_wide_book`
+(capa 1, reproduce GFGV4000DI: wing bid=30/ask=40 sobre strike 4000 →
+spread 28.6%, excluido con `max_spread_relative`, incluido sin él -
+compatibilidad hacia atrás verificada) y
+`test_execution_pipeline.py::test_act_on_spread_completion_signal_rejects_wing_with_two_sided_but_too_wide_book`
+(capa 2, llamada directa a `_act_on_spread_completion_signal` con el mismo
+book ancho: cero filas ENTRY, cero Position nueva). Suite completa: 876
+passed (874 + 2 nuevos).
+
+### 3) Scalping: pendiente de verificación
+
+El usuario indicó que ya aplicó el cambio en Northflank para apagar
+`GGAL_BOT_ENABLE_SCALPING`. Falta una verificación puntual y acotada
+EXCLUSIVAMENTE contra el servicio de GGAL_BOT (`ggal-bot`/`supreme-cattle`,
+nunca otro) de `bot_state.json` post-redeploy para confirmar
+`env_flags.GGAL_BOT_ENABLE_SCALPING=false` y
+`strategies_enabled.scalping_additive_enabled=false`.

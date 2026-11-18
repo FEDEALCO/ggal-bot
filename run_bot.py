@@ -710,9 +710,15 @@ class GgalOptionsBot:
           1. El flag esta desactivado explicitamente
              (RiskConfig.enforce_market_hours_gate=False) - siempre True en
              ese caso, comportamiento previo a esta mejora.
-          2. Estamos fuera de la rueda asumida (ggal_bot.market_hours.
-             is_within_byma_session(), 11:00-17:00 ART Lun-Vie, SUPUESTO no
-             verificado - ver docstring de ese modulo).
+          2. Estamos fuera de la rueda vigente (ggal_bot.market_hours.
+             is_within_byma_session(): 10:30-17:00 ART Lun-Vie hasta
+             2026-11-01 inclusive, 10:30-18:00 ART desde 2026-11-02 en
+             adelante por cambio estacional de horario - VERIFICADO contra
+             Comunicado BYMA N. 19024/19031, ver docstring de ese modulo).
+             CORREGIDO 2026-11-18: este comentario tenia la ventana vieja
+             (11:00-17:00, pre-correccion del 2026-10-02) desactualizada;
+             la funcion en si siempre llamo a la logica real y correcta de
+             market_hours.py, esto era solo un comentario desincronizado.
           3. En modo shadow, la fuente activa es MockReplaySource (100%
              sintetica, sin ningun concepto de horario de rueda) - AUNQUE
              el reloj diga que es horario de rueda: si el failover
@@ -1691,10 +1697,20 @@ class GgalOptionsBot:
             # resto de la sonrisa recalculada con el spot actual. Se excluye
             # explicitamente de la deteccion de señales (no de la cadena en
             # si: sigue disponible para portfolio/P&L con su ultimo valor).
+            # CORREGIDO 2026-11-18 (caso real GFGV4000DI, ver RESEARCH.md y
+            # WeeklyAsymmetricStrategy.scan_spread_completion_signals para el
+            # mismo fix en weekly_asymmetric): antes, una base con dos puntas
+            # pero spread arbitrariamente ancho igual entraba a la sonrisa y
+            # podia generar una señal de entrada - is_valid_quote() agrega el
+            # mismo chequeo de spread maximo que ya protegia a las SALIDAS
+            # (RiskConfig.enforce_quote_validity_filter_for_exits), ahora
+            # tambien para la DETECCION de señales nuevas.
             valid_quotes = [
                 q for q in quotes
                 if q.iv is not None
-                and not q.book.is_stale(SETTINGS.risk.max_option_quote_staleness_seconds)
+                and q.book.is_valid_quote(
+                    SETTINGS.risk.max_spread_relative, SETTINGS.risk.max_option_quote_staleness_seconds,
+                )
             ]
             if len(valid_quotes) < 3:
                 continue
@@ -2057,9 +2073,15 @@ class GgalOptionsBot:
                 # comparable contra el resto de la sonrisa recalculada con el
                 # spot actual - se excluye de la deteccion de señales de entrada.
                 is_stale_threshold = SETTINGS.risk.max_option_quote_staleness_seconds
+                # CORREGIDO 2026-11-18 (caso real GFGV4000DI, ver RESEARCH.md):
+                # is_valid_quote() agrega el chequeo de spread maximo (antes
+                # solo se filtraba por antiguedad aca) - mismo criterio que
+                # ya protege a las salidas, ahora tambien a la deteccion de
+                # entradas nuevas de weekly_asymmetric.
                 valid_quotes = [
                     q for q in quotes
-                    if q.iv is not None and not q.book.is_stale(is_stale_threshold)
+                    if q.iv is not None
+                    and q.book.is_valid_quote(SETTINGS.risk.max_spread_relative, is_stale_threshold)
                 ]
                 # Diagnostico puro (ver _log_entry_scan_diagnostics_if_due): cuenta
                 # POR QUE una cotizacion no llego a "valida" - sin punta vigente
@@ -2157,6 +2179,10 @@ class GgalOptionsBot:
                     self.option_chain, self.portfolio, trend=trend,
                     max_quote_age_seconds=SETTINGS.risk.max_option_quote_staleness_seconds,
                     now=time.time(), forced_expiry=self._forced_expiry,
+                    # CORREGIDO 2026-11-18 (caso real GFGV4000DI): sin esto,
+                    # el wing solo se descartaba por antiguedad, nunca por
+                    # spread ancho - ver docstring de scan_spread_completion_signals.
+                    max_spread_relative=SETTINGS.risk.max_spread_relative,
                 )
                 all_signals.extend(spread_signals)
                 for sp in spread_signals:
@@ -2294,7 +2320,15 @@ class GgalOptionsBot:
             if open_scalping_positions >= SETTINGS.scalping.max_concurrent_positions:
                 break
             is_stale_threshold = SETTINGS.risk.max_option_quote_staleness_seconds
-            valid_quotes = [q for q in quotes if q.iv is not None and not q.book.is_stale(is_stale_threshold)]
+            # CORREGIDO 2026-11-18 (caso real GFGV4000DI en weekly_asymmetric,
+            # ver RESEARCH.md): mismo fix aplicado aca por consistencia -
+            # is_valid_quote() exige ademas spread<=max_spread_relative, no
+            # solo antiguedad.
+            valid_quotes = [
+                q for q in quotes
+                if q.iv is not None
+                and q.book.is_valid_quote(SETTINGS.risk.max_spread_relative, is_stale_threshold)
+            ]
             if len(valid_quotes) < 3:
                 continue
             surface = VolatilitySurface(valid_quotes)
@@ -3171,6 +3205,42 @@ class GgalOptionsBot:
         quote = self.option_chain.get(signal.short_symbol)
         if quote is None or quote.book.bid <= 0 or quote.book.ask <= 0:
             return
+
+        # CORREGIDO 2026-11-18 (caso real GFGV4000DI, 16/11: pata corta de
+        # spread_completion vendida a -14 @ 32.01 sobre un book que superaba
+        # el spread maximo operable, cerrada ~17hs despues con perdida por el
+        # quote_gap_backstop a 34.966 - ver RESEARCH.md). El chequeo de
+        # arriba (bid/ask>0) es el MISMO que ya tenia _act_on_entry_signal
+        # ANTES de la mejora enforce_entry_spread_gate de 2026-10-08: permite
+        # pasar un book "de dos puntas" aunque este arbitrariamente ancho (o
+        # con tamaño insuficiente), que es exactamente lo que NO protege
+        # contra una ejecucion a un precio no operable. _act_on_entry_signal
+        # ya cierra ese hueco para la pata LARGA (ver
+        # RiskConfig.enforce_entry_spread_gate mas arriba en ese metodo); esta
+        # pata CORTA nunca habia recibido el mismo gate - este es el fix. Se
+        # evalua con el `self.risk_manager` de weekly_asymmetric (unica
+        # estrategia que llama a este metodo; scalping no usa spread
+        # completion) para que el umbral sea IDENTICO al de la pata larga del
+        # mismo spread. `is_tradeable()` (spread+dos puntas+tamaño minimo) es
+        # la funcion correcta aca (no is_valid_quote, que no exige tamaño) -
+        # ver su propio docstring de distincion en option_chain.py: esta es
+        # una EJECUCION de orden nueva, no un marcado a mercado de una
+        # posicion ya abierta.
+        if SETTINGS.risk.enforce_entry_spread_gate:
+            if not quote.book.is_tradeable(
+                self.risk_manager.limits.max_spread_relative, self.risk_manager.limits.min_book_size,
+            ):
+                logger.info(
+                    "Pata corta de spread completion %s descartada: punta no operable "
+                    "(bid=%.3f ask=%.3f spread_rel=%.4f limite=%.4f bid_size=%.1f ask_size=%.1f "
+                    "min_size=%.1f) - la larga %s queda sola (riesgo acotado, sin pata corta "
+                    "descubierta sin book valido).",
+                    signal.short_symbol, quote.book.bid, quote.book.ask, quote.book.spread_relative,
+                    self.risk_manager.limits.max_spread_relative, quote.book.bid_size, quote.book.ask_size,
+                    self.risk_manager.limits.min_book_size, signal.long_symbol,
+                )
+                return
+
         if self.mid_price_exec.has_open_order_for(signal.short_symbol):
             logger.debug("Pata corta %s pospuesta: ya hay una orden en vigilancia sobre esa base.", signal.short_symbol)
             return
