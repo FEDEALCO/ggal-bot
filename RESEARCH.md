@@ -3942,3 +3942,52 @@ cobertura (dedupe incluido), y `is_within_byma_session` usando el
 fallback para una fecha de gap. Los tests ya existentes (ambos períodos,
 frontera exacta, fin de semana) siguen pasando sin cambios - los valores
 verificados no cambiaron, solo la estructura interna.
+
+## Re-corrida — Módulo B PANEL (rupturas, 14 ADRs) — 2026-11-20
+
+A pedido explícito del usuario, tarea 100% OFFLINE (no toca `ggal_bot/`,
+no cambia lógica de producción): re-correr el panel de rupturas ya
+pre-registrado el 2026-10-27 ("Pre-registro — Módulo B PANEL: misma
+señal sobre 14 ADRs argentinos", ver arriba) con dato actualizado al
+2026-11-20. **Ningún parámetro de señal/entrada/salida/costos/criterio
+de veredicto se tocó** - el holdout (últimos 2 años calendario del panel
+completo) se desplaza mecánicamente con el tiempo transcurrido, de
+2024-10-26/2026-10-26 a 2024-11-20/2026-11-20.
+
+**Veredicto (sin cambios respecto al 27/10, el holdout decide)**:
+alcista RECHAZADA (N=83, IC95%=[-5,45%,+1,66%], p=0,9410 vs. azar);
+bajista RECHAZADA (N=118, IC95%=[-6,44%,+1,42%], p=0,9820). El gate de
+opciones de GGAL no pasa (IC95% alcista del holdout cruza cero) - no se
+ejecuta la expresión en opciones. **Dato nuevo**: la rama alcista, que
+en octubre apenas empataba con el azar (expectancy +0,07%, percentil
+51,8), ahora pierde contra el azar (expectancy -2,54%, percentil 5,9) -
+el mes transcurrido empeoró el cuadro, no lo mejoró.
+
+**Caveat declarado**: el script original de la corrida de octubre
+(`modulo_b_panel.py`, scratchpad de esa sesión) no sobrevivió el corte
+de contexto entre sesiones - esta corrida es una reimplementación fiel
+de la metodología tal como quedó escrita más arriba en este documento,
+no una ejecución del mismo archivo. Los números de N y expectancy neta
+coinciden razonablemente con octubre, pero la media del benchmark
+aleatorio salió sistemáticamente más alta en ambas ramas en esta
+reconstrucción, lo que resta significancia a las ventanas
+Completo/Desarrollo (contexto, nunca el veredicto) frente a octubre -
+no se pudo aislar la causa exacta sin el script original. **Esto no
+afecta el veredicto**: el holdout rechaza ambas ramas en las dos
+corridas, y en esta corrida lo hace de forma más clara, no menos.
+
+**Recortado deliberadamente esta ronda** (ya declarados en el
+pre-registro original como contexto, nunca el veredicto principal, por
+lo que omitirlos no cambia ninguna conclusión): curva de equity de
+cartera/drawdown, y filtros de régimen CCL implícito/MERVAL.
+
+Reporte completo (metodología, tablas por ventana/ticker, comparación
+con el 27/10) entregado al usuario como documento aparte
+(`REPORT_modulo_b_refresh.md`). Script de esta corrida:
+`modulo_b_panel/backtest.py` (scratchpad de esta sesión, no forma parte
+de `ggal_bot/`).
+
+**Recomendación**: sin cambios para `GGAL_BOT` a partir de este
+resultado - la señal de ruptura sobre el panel de ADRs no muestra un
+edge que sobreviva el holdout pre-registrado, en ninguna de las dos
+corridas.
