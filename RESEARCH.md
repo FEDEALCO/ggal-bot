@@ -3893,3 +3893,52 @@ observado el 18/11 (seguimiento 2da parte), cuando todavía estaba en
 `true` pese a la decisión original del 10/27. Con esto se cierran los 4
 puntos pendientes de este seguimiento (seguridad, shadow_trades.csv,
 GFGV4000DI con fix, horario BYMA + spread_completion, scalping).
+
+## Seguimiento 20/11: horario BYMA como tabla de vigencias (no un corte fijo)
+
+El usuario pidió confirmar de nuevo que las opciones siguen el horario
+10:30-18:00 ART desde el 2/11, y reemplazar cualquier horario fijo por
+una tabla de vigencias (fecha de inicio + fuente), con test para ambos
+períodos y alerta si la fecha actual no está cubierta por ninguna
+vigencia.
+
+**Re-confirmación**: sin cambios respecto a lo verificado el 18/11 (ver
+seguimiento de arriba) - el Comunicado BYMA N. 19031 (28/10/2026, PDF
+oficial) sigue vigente, confirma 10:30-18:00 ART desde el 02/11/2026, y
+reemplaza al N. 19024 con los mismos valores exactos.
+
+**Rediseño implementado** (`ggal_bot/market_hours.py`): la constante
+fija `_BYMA_SESSION_END_CHANGE_DATE_ART` (una sola fecha de corte
+hardcodeada) se reemplazó por `BYMA_OPTIONS_SESSION_REGIMES`, una tupla
+de `SessionRegime(effective_from, open_hour_art, close_hour_art,
+source)`:
+
+| vigente desde | apertura ART | cierre ART | fuente |
+|---|---|---|---|
+| 2025-07-28 | 10:30 | 17:00 | Bloomberg Línea (verificado 2026-10-02) |
+| 2026-11-02 | 10:30 | 18:00 | BYMA Comunicado N. 19031 (28/10/2026, reemplaza a N. 19024 con los mismos valores) |
+
+`_regime_for(fecha_art)` resuelve la vigencia MAS RECIENTE que ya
+empezó para esa fecha. Un futuro cambio de horario se incorpora
+agregando una fila nueva (nunca editando/borrando las anteriores) -
+preserva la trazabilidad de qué vigencia rigió cada fecha ya operada.
+`BYMA_SESSION_START_HOUR_ART`/`BYMA_SESSION_END_HOUR_ART` se mantienen
+como snapshot de compatibilidad (re-exportados por
+`dashboard/data/freshness.py`) pero ninguna función interna los usa -
+`is_within_byma_session`/`_session_end_hour_art` siempre resuelven
+contra la tabla.
+
+**Alerta de fecha sin vigencia** (pedido explícito): el único gap
+posible es una fecha ANTERIOR a 2025-07-28 (la última vigencia no tiene
+fin, cubre cualquier fecha futura hasta que se agregue una nueva fila) -
+`_regime_for` loguea un warning una sola vez por fecha distinta (dedupe,
+mismo criterio anti-spam que el throttle del backstop) y cae a la
+vigencia más antigua como fallback conservador en vez de fallar.
+
+**Tests nuevos** en `test_market_hours.py` (16/16 en el archivo, 880/880
+en la suite completa): estructura de la tabla, `_regime_for` para ambos
+períodos + indefinidamente hacia el futuro, la alerta de fecha sin
+cobertura (dedupe incluido), y `is_within_byma_session` usando el
+fallback para una fecha de gap. Los tests ya existentes (ambos períodos,
+frontera exacta, fin de semana) siguen pasando sin cambios - los valores
+verificados no cambiaron, solo la estructura interna.
