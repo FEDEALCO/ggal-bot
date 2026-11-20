@@ -3881,11 +3881,15 @@ compatibilidad hacia atrás verificada) y
 book ancho: cero filas ENTRY, cero Position nueva). Suite completa: 876
 passed (874 + 2 nuevos).
 
-### 3) Scalping: pendiente de verificación
+### 3) Scalping: CONFIRMADO apagado en producción (20/11)
 
-El usuario indicó que ya aplicó el cambio en Northflank para apagar
-`GGAL_BOT_ENABLE_SCALPING`. Falta una verificación puntual y acotada
-EXCLUSIVAMENTE contra el servicio de GGAL_BOT (`ggal-bot`/`supreme-cattle`,
-nunca otro) de `bot_state.json` post-redeploy para confirmar
-`env_flags.GGAL_BOT_ENABLE_SCALPING=false` y
-`strategies_enabled.scalping_additive_enabled=false`.
+Verificación puntual contra `bot_state.json` en vivo, EXCLUSIVAMENTE
+contra el servicio de GGAL_BOT (`ggal-bot`/`supreme-cattle`, corrida por
+el usuario en su propia terminal vía `northflank exec`, nunca otro
+proyecto): `env_flags.GGAL_BOT_ENABLE_SCALPING = "false"` post-redeploy.
+Confirma que el cambio del usuario en Northflank (apagar
+`GGAL_BOT_ENABLE_SCALPING`) sí quedó aplicado - a diferencia de lo
+observado el 18/11 (seguimiento 2da parte), cuando todavía estaba en
+`true` pese a la decisión original del 10/27. Con esto se cierran los 4
+puntos pendientes de este seguimiento (seguridad, shadow_trades.csv,
+GFGV4000DI con fix, horario BYMA + spread_completion, scalping).
