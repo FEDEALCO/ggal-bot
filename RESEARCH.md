@@ -1,5 +1,33 @@
 # RESEARCH.md — Mandato de research cuantitativo GGAL_BOT
 
+## Resumen ejecutivo (actualizado 2026-11-24) — leer esto primero
+
+**Qué se probó y el veredicto de cada línea, con los números que lo deciden** (todo en shadow mode, nunca con dinero real; IC = intervalo de confianza 95%, bootstrap):
+
+| Línea | Qué es | N (lo que decide) | Resultado | Veredicto |
+|---|---|---|---|---|
+| `weekly_asymmetric` (operada en vivo) | Compra opciones largas GGAL por dislocación de IV, Long-First | 213 trades cerrados, todo el historial (7/9-19/11) | PnL neto -$1.109.144 ARS, win 6.6%, expectancy -$5.207/tr, IC95% [-8.200, -2.596] | **RECHAZADA** (negativo, IC no cruza cero) |
+| `scalping` (operada en vivo, apagada 18/11) | Scalping intradía por reversión de IV | 1295 trades cerrados, todo el historial | PnL neto -$3.143.863 ARS, win 6.3%, expectancy -$2.428/tr, IC95% [-2.588, -2.261] | **RECHAZADA** — pero ver lección de costos abajo: al mid la señal es positiva |
+| `vol_arbitrage` | Arbitraje de volatilidad delta-neutral (modo original del proyecto) | 0 trades (nunca fue la estrategia activa en el período con journal) | sin datos | **NO PROBADA** |
+| Hipótesis 2 — venta de vol con riesgo definido (bull put spread) | Diseño/sizing, nunca operado | — | brecha de 12-17x entre crédito teórico (Black-Scholes) y crédito real (bid/ask), garantía BYMA y riesgo de asignación anticipada sin resolver | **"Datos acumulándose"** (no rechazada ni soportada — falta IV real acumulada) |
+| Hipótesis 1 / 1b — provisión de liquidez / ejecución pasiva de scalping | ¿Cotizar dentro del spread en vez de cruzarlo? | H1: datos insuficientes para el test completo. H1b: 213 trades, timeout 30s | H1b: NO SOPORTADA tal como se pre-registró | **H1 backlog / H1b RECHAZADA** |
+| Hipótesis 6 — divergencia MACD/RSI + Fibonacci intradía | Señal spot GGAL intradía | — | datos intradía bloqueados, 14 grados de libertad sin fijar | **BACKLOG, nunca pre-registrada** |
+| Módulo B — ruptura (breakout) del ADR GGAL solo | 20 ruedas + volumen, un solo ticker | N=7 (calls) / N=8 (puts) en holdout | muestra insuficiente | **DATA INSUFFICIENT** |
+| Módulo B PANEL — misma ruptura sobre 14 ADRs argentinos | Igual señal, panel diversificado | 27/10: N=89/117 (holdout); 20/11 (re-corrida): N=83/118 (holdout) | Alcista: expectancy -2,54%, IC95%[-5,45%,+1,66%], p=0,94 vs. azar. Bajista: expectancy -2,82%, IC95%[-6,44%,+1,42%], p=0,98 | **RECHAZADA en ambas ramas, ambas corridas** — el gate para expresar esto en opciones de GGAL no pasa |
+
+**Lección central: costos de minorista vs. edge por trade.** El caso más claro es scalping: la señal de reversión de IV SÍ tiene edge real al precio medio (+607 ARS/trade, IC95% [+59,8, +1.195,6], enteramente positivo - no es casualidad). El problema nunca fue la señal: es que cruzar el spread real (~2.343 ARS/trade) más comisión+derecho de mercado+IVA (~1.221 ARS/trade en escala Gold) suman ~3.564 ARS/trade de fricción - 5 a 6 veces más grande que el edge que la señal genera. Escalar el tamaño de la posición no ayuda (IOL no tiene comisión mínima, todo es proporcional). Solo en la escala Black (0,10%) combinada con una ejecución que capture una fracción del spread (no solo pasividad al mid) el número cruza a positivo (+667 ARS/trade, IC95%[126,7, 1.266,9]) - y esa ejecución todavía no existe, solo está pre-registrada como hipótesis (H1b), que a su vez salió rechazada en su forma más simple (orden límite al mid con timeout). La misma lección aplica en espíritu al panel de rupturas de ADRs: el costo fijo de 0,8470% ida y vuelta (tarifa real IOL) es grande frente al movimiento típico de 20 ruedas de un ADR argentino, y ninguna de las dos ramas generó edge suficiente para superarlo con margen estadístico. **El patrón repetido en todo este mandato de research es el mismo: para un bot minorista operando con costos reales (no institucionales), el listón para que una señal sea operable es mucho más alto que "la señal existe" - tiene que sobrevivir la fricción real de ejecutarla.**
+
+**Condiciones concretas para retomar** (ninguna cumplida hoy, 24/11):
+1. **weekly_asymmetric / scalping**: no se van a ajustar parámetros sobre los mismos datos que los rechazaron (decisión explícita del usuario, 24/11). Retomar requeriría una hipótesis NUEVA, pre-registrada ANTES de ver datos, sobre una muestra que todavía no se usó para rechazar nada - no una recalibración de umbrales existentes.
+2. **Hipótesis 2 (venta de vol)**: acumular varias semanas más de IV real en `market_snapshots.csv` (columna `iv`, poblada de forma confiable recién desde el 2026-10-15) y resolver, con datos reales (no supuestos), la garantía BYMA para la pata corta y un mecanismo de detección de asignación anticipada - ambos deben estar resueltos, no solo documentados como riesgo.
+3. **Hipótesis 1b (ejecución pasiva)**: si se quiere revivirla, hace falta un mecanismo de captura de spread real (cotizar en vez de cruzar) validado contra fills reales, no un modelo de "25% a favor" asumido - y recién ahí volver a medir si cambia el resultado de scalping.
+4. **Módulo B (rupturas)**: ninguna acción pendiente salvo que el usuario quiera extender el holdout con más tiempo real, correr los cortes de régimen CCL/MERVAL ya recortados deliberadamente, o abrir una línea de investigación distinta - la señal en sí no mostró edge que sobreviva el holdout en dos corridas con un mes de diferencia.
+5. **vol_arbitrage**: nunca se evaluó con datos reales en este mandato (cero trades en el journal) - antes de considerarla, necesitaría el mismo tratamiento (pre-registro + holdout) que las demás, no un supuesto de que "es la que arrancó el proyecto, debe andar".
+
+Detalle completo de cada línea (metodología, pre-registros, todas las tablas y la traza completa de cada hallazgo) en las secciones de abajo, en orden cronológico.
+
+---
+
 Iniciado 2026-10-13, a pedido explicito del usuario (ver hilo de auditoria).
 Documento vivo: se actualiza con cada hallazgo, pre-registro y resultado.
 Disciplina de todo el proyecto aplica aca tambien: nunca fabricar un
