@@ -12,10 +12,11 @@ Correr con:
 from __future__ import annotations
 
 import csv
+import gzip
 import os
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -30,6 +31,12 @@ def _temp_logger_path() -> Path:
     path = Path(name)
     path.unlink()  # el logger debe poder crearlo desde cero
     return path
+
+
+def _set_mtime_to_yesterday(path: Path, today: date) -> None:
+    yesterday_noon = datetime(today.year, today.month, today.day, 12, 0, tzinfo=timezone.utc) - timedelta(days=1)
+    ts = yesterday_noon.timestamp()
+    os.utime(path, (ts, ts))
 
 
 def test_logger_writes_header_on_first_use():
@@ -118,6 +125,68 @@ def test_write_failure_does_not_raise():
         path.unlink(missing_ok=True)
 
 
+def test_logger_rotates_daily_and_purges_archives_older_than_retention():
+    """
+    MEJORA 2026-11-24 (ultimos ajustes de seguridad antes de la pausa de
+    desarrollo, a pedido explicito del usuario: "Rotacion diaria con gzip
+    para ccl_bond_quotes.csv ... con retencion configurable"). Mismo patron
+    que test_market_snapshot_log.py (rotacion) + test_portfolio_greeks_log.py
+    (retencion), aplicado aca.
+    """
+    path = _temp_logger_path()
+    old_archive_path = None
+    recent_archive_path = None
+    try:
+        logger = CclBondQuoteLogger(path=path, retention_days=30)
+        logger.log_records([{"symbol": "GD30", "px_bid": 1.0, "px_ask": 1.0, "c": 1.0}])
+
+        today = datetime.now(timezone.utc).date()
+        old_date = today - timedelta(days=60)
+        old_archive_path = path.with_name(f"{path.stem}-{old_date.isoformat()}{path.suffix}.gz")
+        with gzip.open(old_archive_path, "wb") as f:
+            f.write(b"archivo viejo, deberia purgarse")
+
+        _set_mtime_to_yesterday(path, today)
+        logger.log_records(
+            [{"symbol": "GD30", "px_bid": 2.0, "px_ask": 2.0, "c": 2.0}],
+            now=datetime(today.year, today.month, today.day, 0, 5, tzinfo=timezone.utc),
+        )
+
+        yesterday = today - timedelta(days=1)
+        recent_archive_path = path.with_name(f"{path.stem}-{yesterday.isoformat()}{path.suffix}.gz")
+        assert recent_archive_path.exists(), "deberia haber rotado el archivo de ayer."
+        assert not old_archive_path.exists(), "el archivo de hace 60 dias deberia haberse purgado (retencion=30)."
+    finally:
+        path.unlink(missing_ok=True)
+        if old_archive_path is not None:
+            old_archive_path.unlink(missing_ok=True)
+        if recent_archive_path is not None:
+            recent_archive_path.unlink(missing_ok=True)
+
+
+def test_logger_rotation_disabled_via_flag_keeps_accumulating_in_the_same_file():
+    path = _temp_logger_path()
+    try:
+        logger = CclBondQuoteLogger(path=path, rotate_daily=False)
+        logger.log_records([{"symbol": "GD30", "px_bid": 1.0, "px_ask": 1.0, "c": 1.0}])
+        today = datetime.now(timezone.utc).date()
+        _set_mtime_to_yesterday(path, today)
+
+        logger.log_records(
+            [{"symbol": "GD30", "px_bid": 2.0, "px_ask": 2.0, "c": 2.0}],
+            now=datetime(today.year, today.month, today.day, 0, 5, tzinfo=timezone.utc),
+        )
+
+        yesterday = today - timedelta(days=1)
+        archive_path = path.with_name(f"{path.stem}-{yesterday.isoformat()}{path.suffix}.gz")
+        assert not archive_path.exists(), "con rotate_daily=False no deberia archivarse nunca."
+        with open(path, newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        assert len(rows) == 3  # header + las dos filas, todo en el mismo archivo
+    finally:
+        path.unlink(missing_ok=True)
+
+
 ALL_TESTS = [
     test_logger_writes_header_on_first_use,
     test_log_records_writes_one_row_per_configured_ticker_found,
@@ -125,6 +194,8 @@ ALL_TESTS = [
     test_log_records_does_nothing_with_empty_or_none_records,
     test_custom_ticker_list_overrides_default,
     test_write_failure_does_not_raise,
+    test_logger_rotates_daily_and_purges_archives_older_than_retention,
+    test_logger_rotation_disabled_via_flag_keeps_accumulating_in_the_same_file,
 ]
 
 

@@ -32,6 +32,22 @@ RESET: deliberadamente manual (no hay auto-recuperacion por tiempo ni por
 ningun criterio automatico) - ver reset(). Se puede resetear via
 `python -m ggal_bot.risk.kill_switch --reset "motivo"` o llamando a
 KillSwitch().reset("motivo") directamente.
+
+TRIP MANUAL (AGREGADO 2026-11-24, ultimos ajustes de seguridad antes de la
+pausa de desarrollo, a pedido EXPLICITO del usuario: "el comando exacto
+para DISPARAR el kill switch manualmente"): antes de esta mejora, el CLI
+solo soportaba --reset/--status - no habia forma de disparar el kill
+switch a mano sin escribir un script Python ad-hoc. Ahora tambien soporta
+`python -m ggal_bot.risk.kill_switch --trip "motivo"` (equivalente a
+KillSwitch().trip("motivo", tripped_by="manual_cli")), para una pausa
+operativa deliberada: con el kill switch disparado, _act_on_entry_signal
+(weekly_asymmetric/scalping), _act_on_signal (vol_arbitrage) y
+_act_on_spread_completion_signal (pata corta de spread) bloquean CUALQUIER
+entrada nueva en los tres - ver run_bot.py, los tres consultan
+self.kill_switch.is_tripped() (los dos ultimos agregados el 2026-11-24,
+antes eran un gap real sin cubrir). Las salidas (Stop Loss/Take Profit/
+horizonte/guardia de fin de semana) siguen funcionando con normalidad, a
+proposito (ver seccion de arriba).
 """
 from __future__ import annotations
 
@@ -222,10 +238,16 @@ class KillSwitch:
 
 
 def _cli() -> int:
-    """`python -m ggal_bot.risk.kill_switch --reset "motivo"` /
+    """`python -m ggal_bot.risk.kill_switch --trip "motivo"` /
+    `python -m ggal_bot.risk.kill_switch --reset "motivo"` /
     `python -m ggal_bot.risk.kill_switch --status`."""
     args = sys.argv[1:]
     ks = KillSwitch()
+    if args and args[0] == "--trip":
+        reason = args[1] if len(args) > 1 else "trip manual via CLI"
+        ks.trip(reason, tripped_by="manual_cli")
+        print(f"Kill switch DISPARADO: {reason}")
+        return 0
     if args and args[0] == "--reset":
         reason = args[1] if len(args) > 1 else "reset manual via CLI"
         ks.reset(reason)

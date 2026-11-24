@@ -17,8 +17,10 @@ from ggal_bot.config import SETTINGS, RiskLimitsConfig
 from ggal_bot.data.option_chain import OrderBookSnapshot, OptionQuote
 from ggal_bot.models.black_scholes import OptionType
 from ggal_bot.portfolio.portfolio import Portfolio, Position
+from ggal_bot.risk import kill_switch as kill_switch_module
 from ggal_bot.risk.kill_switch import KillSwitch
-from ggal_bot.strategy.weekly_asymmetric import EntrySignal
+from ggal_bot.strategy.vol_arbitrage import TradeSignal
+from ggal_bot.strategy.weekly_asymmetric import EntrySignal, SpreadCompletionSignal
 from run_bot import GgalOptionsBot
 from datetime import date
 
@@ -299,3 +301,107 @@ def test_tripped_kill_switch_blocks_new_entry_but_never_blocks_exit(tmp_path):
         )
     finally:
         SETTINGS.shadow.enabled = original_enabled
+
+
+def test_tripped_kill_switch_blocks_spread_completion_short_leg(tmp_path):
+    """
+    GAP CERRADO (2026-11-24, ultimos ajustes de seguridad antes de la pausa
+    de desarrollo, a pedido explicito del usuario: "Confirma en codigo que
+    el kill switch tambien bloquea spread_completion"). Verificado por
+    lectura de codigo ANTES de este fix: _act_on_spread_completion_signal
+    (la pata CORTA de un spread de weekly_asymmetric) nunca consultaba
+    self.kill_switch - este test confirma que, con el kill switch
+    disparado, esa pata corta NO se abre.
+
+    Mismo criterio de aislamiento que test_tripped_kill_switch_blocks_new_
+    entry_but_never_blocks_exit: KillSwitch con path DEDICADO (tmp_path),
+    no el default compartido de aislamiento de tests.
+    """
+    original_enabled = SETTINGS.shadow.enabled
+    SETTINGS.shadow.enabled = True
+    try:
+        bot = GgalOptionsBot()
+        bot.kill_switch = KillSwitch(path=tmp_path / "kill_switch_isolated.json")
+        bot.option_chain.upsert_quote(_make_quote("GFGC7200OC"))
+
+        bot.kill_switch.trip("prueba de bloqueo de spread_completion")
+
+        signal = SpreadCompletionSignal(
+            long_symbol="GFGC7000OC", short_symbol="GFGC7200OC",
+            option_type=OptionType.CALL, reason="test_kill_switch", long_quantity_confirmed=3.0,
+        )
+        bot._act_on_spread_completion_signal(signal, spot=7050.0)
+        assert bot._position_quantity("GFGC7200OC") == 0.0, (
+            "el kill switch debia bloquear la pata corta de spread completion"
+        )
+    finally:
+        SETTINGS.shadow.enabled = original_enabled
+
+
+def test_tripped_kill_switch_blocks_vol_arbitrage_entry(tmp_path):
+    """
+    GAP CERRADO (2026-11-24, mismo pedido que el test de arriba): verificado
+    por lectura de codigo que _act_on_signal (entradas de vol_arbitrage)
+    tampoco consultaba self.kill_switch antes de este fix - este test
+    confirma que, con el kill switch disparado, esa entrada NO se abre.
+    """
+    original_strategy = SETTINGS.strategy.active
+    original_shadow = SETTINGS.shadow.enabled
+    SETTINGS.strategy.active = "vol_arbitrage"
+    SETTINGS.shadow.enabled = True
+    try:
+        bot = GgalOptionsBot()
+        bot.kill_switch = KillSwitch(path=tmp_path / "kill_switch_isolated.json")
+        bot.option_chain.upsert_quote(_make_quote("GFGC7000OC"))
+
+        bot.kill_switch.trip("prueba de bloqueo de vol_arbitrage")
+
+        signal = TradeSignal(
+            symbol="GFGC7000OC", action="buy", reason="test_kill_switch", iv_dislocation_vol_points=5.0,
+        )
+        bot._act_on_signal(signal, spot=7050.0)
+        assert bot._position_quantity("GFGC7000OC") == 0.0, (
+            "el kill switch debia bloquear la entrada nueva de vol_arbitrage"
+        )
+    finally:
+        SETTINGS.strategy.active = original_strategy
+        SETTINGS.shadow.enabled = original_shadow
+
+
+def test_cli_trip_disparara_el_kill_switch(monkeypatch, tmp_path):
+    """
+    AGREGADO 2026-11-24 (ultimos ajustes de seguridad antes de la pausa de
+    desarrollo, a pedido explicito del usuario: "el comando exacto para
+    DISPARAR el kill switch manualmente ... si el CLI no lo permite, agrega
+    --trip con test"). Antes de esto, `python -m ggal_bot.risk.kill_switch`
+    solo soportaba --reset/--status. Usa un path DEDICADO via
+    monkeypatch de paths.KILL_SWITCH_STATE_FILE (no el default de
+    aislamiento de _shadow_audit_isolation, compartido con otros tests de
+    este archivo) para no interferir entre tests.
+    """
+    isolated_path = tmp_path / "kill_switch_cli_test.json"
+    monkeypatch.setattr(kill_switch_module.paths, "KILL_SWITCH_STATE_FILE", isolated_path)
+    monkeypatch.setattr("sys.argv", ["kill_switch.py", "--trip", "pausa de desarrollo"])
+
+    exit_code = kill_switch_module._cli()
+
+    assert exit_code == 0
+    ks = KillSwitch(path=isolated_path)
+    assert ks.is_tripped() is True
+    state = ks.status()
+    assert state.reason == "pausa de desarrollo"
+    assert state.tripped_by == "manual_cli"
+
+
+def test_cli_reset_sigue_funcionando_despues_de_agregar_trip(monkeypatch, tmp_path):
+    """Regresion: agregar --trip no debe romper el --reset ya existente."""
+    isolated_path = tmp_path / "kill_switch_cli_test.json"
+    ks = KillSwitch(path=isolated_path)
+    ks.trip("motivo previo")
+    monkeypatch.setattr(kill_switch_module.paths, "KILL_SWITCH_STATE_FILE", isolated_path)
+    monkeypatch.setattr("sys.argv", ["kill_switch.py", "--reset", "ya revisado"])
+
+    exit_code = kill_switch_module._cli()
+
+    assert exit_code == 0
+    assert KillSwitch(path=isolated_path).is_tripped() is False

@@ -13,10 +13,11 @@ Correr con:
 from __future__ import annotations
 
 import csv
+import gzip
 import os
 import sys
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -31,6 +32,12 @@ def _temp_logger_path() -> Path:
     path = Path(name)
     path.unlink()  # el logger debe poder crearlo desde cero (no existe todavia)
     return path
+
+
+def _set_mtime_to_yesterday(path: Path, today: date) -> None:
+    yesterday_noon = datetime(today.year, today.month, today.day, 12, 0, tzinfo=timezone.utc) - timedelta(days=1)
+    ts = yesterday_noon.timestamp()
+    os.utime(path, (ts, ts))
 
 
 def test_logger_writes_header_on_first_use():
@@ -198,13 +205,103 @@ def test_recompute_cycle_wires_portfolio_greeks_log_with_portfolio_and_per_strat
             with open(log_path, newline="", encoding="utf-8") as f:
                 rows = list(csv.reader(f))
             scopes = {r[1] for r in rows[1:]}
-            assert scopes == {"portfolio", "weekly_asymmetric", "vol_arbitrage", "scalping"}
+            # "none" agregado a VALID_STRATEGIES (2026-11-24, fail-safe de
+            # GGAL_BOT_ACTIVE_STRATEGY=none - ver config.py): run_bot.py arma
+            # per_strategy_totals iterando VALID_STRATEGIES completo, asi que
+            # ahora tambien aparece una fila "none" (siempre en cero - ninguna
+            # Position real lleva ese strategy_tag) junto a las 3 de antes.
+            assert scopes == {"portfolio", "weekly_asymmetric", "vol_arbitrage", "scalping", "none"}
             portfolio_row = next(r for r in rows[1:] if r[1] == "portfolio")
             weekly_row = next(r for r in rows[1:] if r[1] == "weekly_asymmetric")
             assert portfolio_row[2] == weekly_row[2] == "100.0"  # delta = 2*100*0.5
     finally:
         SETTINGS.shadow.enabled = original_shadow
         SETTINGS.risk.enforce_market_hours_gate = original_gate
+
+
+def test_log_greeks_skips_writing_rows_when_no_open_positions():
+    """
+    MEJORA 2026-11-24 (ultimos ajustes de seguridad antes de la pausa de
+    desarrollo, a pedido explicito del usuario: "que portfolio_greeks_log
+    no escriba filas mientras no haya posiciones abiertas"). Con
+    has_open_positions=False, NINGUNA fila se escribe (solo el header, ya
+    presente desde el constructor) - el archivo sigue existiendo para que
+    la rotacion/retencion sigan funcionando con normalidad.
+    """
+    path = _temp_logger_path()
+    try:
+        logger = PortfolioGreeksLogger(path=path)
+        logger.log_greeks(
+            portfolio_totals={"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0},
+            per_strategy_totals={"weekly_asymmetric": {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0}},
+            has_open_positions=False,
+        )
+        with open(path, newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        assert len(rows) == 1  # solo el header, ninguna fila fabricada
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_log_greeks_default_has_open_positions_true_preserves_old_behavior():
+    """Contraparte: sin pasar has_open_positions (default True), se sigue escribiendo como antes de la mejora."""
+    path = _temp_logger_path()
+    try:
+        logger = PortfolioGreeksLogger(path=path)
+        logger.log_greeks(
+            portfolio_totals={"delta": 1.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0},
+            per_strategy_totals={},
+        )
+        with open(path, newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        assert len(rows) == 2  # header + la fila de portfolio
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_logger_rotates_and_purges_archives_older_than_retention():
+    """
+    MEJORA 2026-11-24 ("Rotacion diaria con gzip ... con retencion
+    configurable (default 180 dias)"): rotacion diaria + compresion
+    (mismo patron que MarketSnapshotLogger, ver ggal_bot/log_rotation.py)
+    y, ademas, borrado de un archivo .gz ya rotado mas viejo que la
+    retencion configurada.
+    """
+    path = _temp_logger_path()
+    old_archive_path = None
+    recent_archive_path = None
+    try:
+        logger = PortfolioGreeksLogger(path=path, retention_days=30)
+        logger.log_greeks(
+            portfolio_totals={"delta": 1.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0}, per_strategy_totals={},
+        )
+
+        # Archivo .gz "viejo" (fuera de la retencion de 30 dias) creado a
+        # mano, simulando una rotacion real de hace mucho tiempo.
+        today = datetime.now(timezone.utc).date()
+        old_date = today - timedelta(days=60)
+        old_archive_path = path.with_name(f"{path.stem}-{old_date.isoformat()}{path.suffix}.gz")
+        with gzip.open(old_archive_path, "wb") as f:
+            f.write(b"archivo viejo, deberia purgarse")
+
+        # Fuerza la rotacion del archivo "vivo" (mtime de ayer) + el chequeo
+        # de retencion, via una segunda escritura que cruza el dia.
+        _set_mtime_to_yesterday(path, today)
+        logger.log_greeks(
+            portfolio_totals={"delta": 2.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0}, per_strategy_totals={},
+            now=datetime(today.year, today.month, today.day, 0, 5, tzinfo=timezone.utc),
+        )
+
+        yesterday = today - timedelta(days=1)
+        recent_archive_path = path.with_name(f"{path.stem}-{yesterday.isoformat()}{path.suffix}.gz")
+        assert recent_archive_path.exists(), "deberia haber rotado el archivo de ayer."
+        assert not old_archive_path.exists(), "el archivo de hace 60 dias deberia haberse purgado (retencion=30)."
+    finally:
+        path.unlink(missing_ok=True)
+        if old_archive_path is not None:
+            old_archive_path.unlink(missing_ok=True)
+        if recent_archive_path is not None:
+            recent_archive_path.unlink(missing_ok=True)
 
 
 ALL_TESTS = [
@@ -216,6 +313,9 @@ ALL_TESTS = [
     test_logger_appends_across_multiple_calls,
     test_logger_write_failure_does_not_raise,
     test_recompute_cycle_wires_portfolio_greeks_log_with_portfolio_and_per_strategy_rows,
+    test_log_greeks_skips_writing_rows_when_no_open_positions,
+    test_log_greeks_default_has_open_positions_true_preserves_old_behavior,
+    test_logger_rotates_and_purges_archives_older_than_retention,
 ]
 
 

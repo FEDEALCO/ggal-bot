@@ -4084,3 +4084,60 @@ Rejects desde el 18/11: solo 5, todos `greeks_limit_exceeded` (bloqueo correcto 
 ### Conclusión / recomendación
 
 El bot está operativamente sano ahora mismo (corriendo, sin posiciones abiertas, sin breaches, scalping confirmado apagado, los tres fixes de esta semana verificados en los datos reales de producción - no solo commiteados). Pero el resultado de fondo no cambió: **tanto scalping como weekly_asymmetric muestran PnL negativo estadísticamente significativo en todo el historial de shadow mode** (ningún IC95% cruza cero). Las correcciones de esta semana son de integridad/seguridad (evitan pérdidas evitables por bugs), no cambios que debieran convertir una estrategia sin edge en una con edge - consistente con el veredicto ya alcanzado por el panel Módulo B (sin edge demostrado tampoco ahí). Sugerencia: antes de considerar pasar de shadow mode a real, valdría la pena un review explícito de si weekly_asymmetric (la estrategia "principal" hoy) tiene alguna hipótesis de edge que todavía no se haya probado, o si el próximo paso es revisar params/thresholds actuales a la luz de este resultado.
+
+## Seguimiento 24/11 (2da parte, mismo día): últimos ajustes de seguridad antes de la pausa (kill switch, fail-safe del selector, retiro de GGAL_BOT_LONG_FIRST_MODE, rotación/retención de logs)
+
+**Pedido del usuario** (textual, 4 puntos, explícitamente de seguridad/hardening, no de lógica de trading, "Un solo bundle. Después de eso, pausa"):
+1. Comando exacto para disparar el kill switch a mano + confirmar en código que también bloquea `spread_completion` y cualquier otro camino de entrada.
+2. Fail-safe del selector: `GGAL_BOT_ACTIVE_STRATEGY=none` (ninguna estrategia de entrada), valor inválido cae a `none` con error en el log (nunca a `weekly_asymmetric`), con test.
+3. Eliminar `GGAL_BOT_LONG_FIRST_MODE` de la config y de `bot_state.json`, o hacer que el bot falle al arrancar si está definida.
+4. Rotación diaria + gzip para `ccl_bond_quotes.csv`, `portfolio_greeks_log.csv` y `ggal_bot.log`, con retención configurable (default 180 días); `portfolio_greeks_log` sin escribir filas sin posiciones abiertas.
+
+Todo implementado, testeado (suite completa: **892/892 tests OK**, `python -m pytest ggal_bot/validation/ -q`, incluidos 12 tests nuevos de esta tanda) y commiteado. Detalle por punto:
+
+### 1) Kill switch: comando de trip + dos gaps reales cerrados
+
+**VERIFICADO**: el comando exacto es
+
+```
+python -m ggal_bot.risk.kill_switch --trip "pausa de desarrollo"
+```
+
+(`_cli()` en `ggal_bot/risk/kill_switch.py` no soportaba `--trip` antes de hoy, solo `--reset`/`--status` - agregado, con test `test_cli_trip_disparara_el_kill_switch` en `test_fase53_kill_switch.py`). Para volver a operar: `python -m ggal_bot.risk.kill_switch --reset "motivo"`.
+
+**Confirmación en código, la parte que el usuario pidió explícitamente verificar**: ANTES de hoy, `self.kill_switch.is_tripped()` se consultaba en UN SOLO punto de `run_bot.py` (`_act_on_entry_signal`, compartido por las entradas principales de weekly_asymmetric y scalping) - verificado grepeando cada referencia a `kill_switch.` en el archivo. **Dos caminos de entrada NO lo consultaban en absoluto**: `_act_on_spread_completion_signal` (la pata CORTA de un spread de weekly_asymmetric) y `_act_on_signal` (las entradas de vol_arbitrage). Es decir, antes de hoy, disparar el kill switch NO bloqueaba completamente al bot - esas dos vías seguían abriendo posiciones nuevas. Ambos gaps se cerraron hoy (mismo patrón que la entrada principal: `is_tripped()` + log de advertencia + evento `REJECT` en el journal), con un test de integración por cada uno (`test_tripped_kill_switch_blocks_spread_completion_short_leg`, `test_tripped_kill_switch_blocks_vol_arbitrage_entry`) que construyen un `GgalOptionsBot()` real, disparan el switch y confirman que la posición NUNCA se abre. El kill switch sigue sin bloquear NUNCA una salida (Stop Loss/Take Profit/horizonte/guardia de fin de semana), a propósito - eso no cambió.
+
+### 2) `GGAL_BOT_ACTIVE_STRATEGY=none`: fail-safe real, no solo un valor más
+
+Agregado a `VALID_STRATEGIES` (`ggal_bot/config.py`): con este valor, `self.strategy` queda en `None` (igual que bajo `scalping`), ninguna rama de `recompute_cycle()` abre una entrada nueva, y el módulo aditivo de scalping NO se fuerza a encendido (a diferencia de `scalping`, `none` es literalmente "ninguna entrada" - test `test_none_strategy_selection_disables_entries_entirely`). El bot sigue gestionando salidas de posiciones ya abiertas y sigue logueando `market_snapshots`/CCL/griegas con normalidad.
+
+Dos fallbacks que ANTES caían silenciosamente a `weekly_asymmetric` (con solo un `logger.warning`) ahora caen a `none` con `logger.error`:
+- Un `GGAL_BOT_ACTIVE_STRATEGY` inválido (typo).
+- `GGAL_BOT_ACTIVE_STRATEGY=vol_arbitrage` sin `GGAL_BOT_SHADOW_MODE=true` (la salvaguarda de no-go de producción ya existente desde el 2026-09-08).
+
+Este segundo punto es una extensión deliberada más allá de lo pedido literalmente (el usuario pidió el fallback del valor inválido, no el de esta segunda salvaguarda) pero aplica el mismo principio de seguridad: antes de hoy, un `GGAL_BOT_ACTIVE_STRATEGY=vol_arbitrage` puesto por error en un deploy LIVE terminaba igual operando `weekly_asymmetric` con órdenes REALES sin que nadie lo haya elegido - exactamente el riesgo que motivó el punto 2 del usuario. Tests: `test_invalid_active_strategy_falls_back_to_none_with_error_logged`, `test_vol_arbitrage_selection_blocked_outside_shadow_mode_falls_back_to_none`, más el dispatch en `recompute_cycle` (`test_none_strategy_selection_recompute_cycle_never_calls_any_strategy_cycle`).
+
+**Efecto colateral esperado, no un bug**: `portfolio_greeks_log.csv` ahora también registra un scope `"none"` (siempre en cero - ningún `Position` real lleva ese `strategy_tag`), porque `run_bot.py` itera `VALID_STRATEGIES` completo para el desglose por estrategia.
+
+### 3) `GGAL_BOT_LONG_FIRST_MODE`: fail-fast al arrancar, no solo código muerto
+
+**VERIFICADO por grep exhaustivo** (`grep -rn "long_first.enabled\|LONG_FIRST_MODE" --include="*.py" .`, repetido hoy para confirmar antes de tocar nada): el campo `LongFirstConfig.enabled` (leído de esta env var) nunca se consultaba en ningún lado fuera de `config.py` mismo - era código muerto desde que se agregó. Se eligió la opción "hacé que el bot falle al arrancar" (de las dos que ofreció el usuario) por ser más a prueba de fallos que solo documentar: el campo se eliminó de `LongFirstConfig`, y `GgalOptionsBot.__init__` ahora levanta `RuntimeError` de inmediato si `GGAL_BOT_LONG_FIRST_MODE` está presente en el entorno (cualquier valor). Test: `test_long_first_mode_env_var_fails_bot_startup`.
+
+**⚠️ ACCIÓN REQUERIDA ANTES DEL PRÓXIMO RESTART EN NORTHFLANK**: según lo documentado en este mismo archivo (sección "Pasamos a pausa" de más arriba), `GGAL_BOT_LONG_FIRST_MODE` estaba efectivamente definida en el entorno de producción (`bot_state.json` la mostraba en `true`). Si sigue definida ahí cuando este cambio se despliegue, **el bot NO va a arrancar en absoluto** en el próximo restart - ni siquiera para seguir logueando `market_snapshots`/CCL, que el usuario pidió explícitamente mantener corriendo durante la pausa. Hay que quitar esa variable del entorno de Northflank ANTES de que el servicio se reinicie con este código (manualmente o por cualquier redeploy/crash-restart automático), no después.
+
+### 4) Rotación diaria + gzip + retención para los 3 archivos que no la tenían
+
+**VERIFICADO por grep** (repetido hoy): antes de este cambio, `ccl_bond_quote_log.py` y `portfolio_greeks_log.py` no tenían ninguna lógica de rotación (cero coincidencias de "rotat|gzip"), y la rotación ya existente de `MarketSnapshotLogger` (desde el 2026-10-08) nunca borraba un `.gz` ya archivado - acumulaba para siempre. Se factorizó un módulo nuevo y compartido, `ggal_bot/log_rotation.py` (deliberadamente FUERA de `ggal_bot/data/`, ver su docstring: ponerlo ahí rompía el orden de aislamiento de tests de `_env_isolation.py` al construir `PortfolioGreeksLogger` - detectado y corregido durante esta misma tanda, antes de commitear), con `rotate_if_new_day()` + `purge_old_archives()`.
+
+Los 3 archivos ahora rotan a medianoche UTC + gzip, con retención configurable vía **`GGAL_BOT_LOG_RETENTION_DAYS`, default 180 días** (`RiskConfig.log_retention_days`, `<=0` desactiva el borrado = retención infinita):
+- `ccl_bond_quotes.csv` / `portfolio_greeks_log.csv`: mismo patrón `{stem}-{YYYY-MM-DD}{suffix}.gz` que ya usaba `market_snapshots.csv`.
+- `ggal_bot.log`: vía `TimedRotatingFileHandler` (stdlib) con rotator/namer custom para comprimir con gzip; su propio `extMatch` se amplió para aceptar el sufijo `.gz` (si no, `backupCount` nunca habría borrado nada - el regex default de la stdlib no matchea un sufijo con `.gz` agregado por un namer custom).
+- `market_snapshots.csv`: sin cambios en su rotación ya existente, solo se le agregó el mismo borrado por retención (antes no existía para ningún archivo).
+
+**`portfolio_greeks_log.csv` sin filas sin posiciones abiertas**: `log_greeks(..., has_open_positions=...)` - `run_bot.py` pasa `any(p.quantity != 0 for p in self.portfolio.positions)` en cada ciclo. Con 0 posiciones abiertas (el estado actual del bot, ver sección anterior), el archivo deja de crecer por completo durante la pausa, aunque sigue existiendo y rotando con normalidad.
+
+**Disco esperado durante la pausa, actualizado**: con 0 posiciones abiertas, `portfolio_greeks_log.csv` deja de crecer (antes ~150MB/mes); `ccl_bond_quotes.csv` y `ggal_bot.log` siguen creciendo igual que antes (no dependen de posiciones) pero ahora rotan/comprimen/purgan solos - la estimación de ~0,6GB/mes de la sección "Pasamos a pausa" ya no acumula indefinidamente, se estabiliza en un volumen acotado por la retención de 180 días una vez que pasen esos 180 días desde el primer rotado de cada archivo.
+
+### Bundle entregado
+
+Un solo git bundle, commits de hoy sobre `c261b3f` (el último ya mergeado en la máquina del usuario), con los 4 puntos de arriba + esta sección de RESEARCH.md. Suite completa verificada antes de empaquetar: 892/892 tests OK.

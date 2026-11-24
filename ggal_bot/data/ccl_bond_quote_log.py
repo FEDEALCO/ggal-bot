@@ -38,6 +38,20 @@ real documentado ahi) es la opcion mas simple que cumple el pedido.
 OPT-IN, apagado por defecto (GGAL_BOT_ENABLE_CCL_BOND_QUOTE_LOG=false,
 ver ShadowConfig.enable_ccl_bond_quote_log) - mismo criterio que
 MarketSnapshotLogger/SignalFunnelLogger.
+
+ROTACION DIARIA + COMPRESION + RETENCION (MEJORA 2026-11-24, ultimos
+ajustes de seguridad antes de la pausa de desarrollo, a pedido explicito
+del usuario: "Rotacion diaria con gzip para ccl_bond_quotes.csv ... con
+retencion configurable"). Hasta esta mejora, este archivo NO tenia ninguna
+rotacion (verificado por grep, cero coincidencias de "rotat|gzip" antes de
+este cambio) - crecia sin limite (~166 MB/mes medidos en produccion, ver
+RESEARCH.md "Resumen ejecutivo"). Reusa el mismo patron ya probado en
+MarketSnapshotLogger (ver ese modulo, MEJORA 2026-10-08), factorizado a
+ggal_bot/log_rotation.py para no duplicar logica entre los 3 loggers
+CSV del proyecto. Rotacion SIEMPRE activa para este logger (sin flag de
+apagado - a diferencia de market_snapshot_rotate_daily, el usuario no pidio
+un on/off por archivo); retencion default 180 dias
+(RiskConfig.log_retention_days, <=0 desactiva el borrado).
 """
 from __future__ import annotations
 
@@ -48,7 +62,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-from ggal_bot import paths
+from ggal_bot import log_rotation, paths
 from ggal_bot.config import SETTINGS
 from ggal_bot.data.http_utils import http_get_json
 
@@ -73,19 +87,42 @@ class CclBondQuoteLogger:
 
     _HEADER = ["timestamp_utc", "symbol", "bid", "ask", "last", "bid_size", "ask_size"]
 
-    def __init__(self, path: Optional[Path] = None, tickers: Iterable[str] = DEFAULT_BOND_TICKERS):
+    def __init__(
+        self, path: Optional[Path] = None, tickers: Iterable[str] = DEFAULT_BOND_TICKERS,
+        rotate_daily: bool = True, retention_days: Optional[int] = None,
+    ):
+        """
+        `rotate_daily` (MEJORA 2026-11-24, ver docstring del modulo):
+        default True, sin leer de SETTINGS - a diferencia de
+        MarketSnapshotLogger, este logger no tenia (ni el usuario pidio) un
+        flag de apagado dedicado. Parametro explicito disponible igual para
+        tests que quieran aislar el comportamiento sin rotacion.
+
+        `retention_days`: si se omite, se lee de RiskConfig.log_retention_days
+        (180 por default).
+        """
         self._path = Path(path) if path is not None else paths.CCL_BOND_QUOTES_LOG
         self._tickers = tuple(t.upper() for t in tickers)
+        self._rotate_daily = rotate_daily
+        self._retention_days = retention_days if retention_days is not None else SETTINGS.risk.log_retention_days
         self._lock = threading.Lock()
         self._ensure_header()
 
     def _ensure_header(self) -> None:
         with self._lock:
+            self._rotate_if_new_day_locked()
             needs_header = (not self._path.exists()) or self._path.stat().st_size == 0
             if needs_header:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
                 with open(self._path, "a", newline="", encoding="utf-8") as f:
                     csv.writer(f).writerow(self._HEADER)
+
+    def _rotate_if_new_day_locked(self, now: Optional[datetime] = None) -> None:
+        """Debe llamarse con `self._lock` ya tomado - ver ggal_bot/log_rotation.py."""
+        current = now if now is not None else datetime.now(timezone.utc)
+        log_rotation.purge_old_archives(self._path, self._retention_days, now=current)
+        if self._rotate_daily:
+            log_rotation.rotate_if_new_day(self._path, now=current)
 
     def fetch_and_log(self, now: Optional[datetime] = None) -> None:
         """
@@ -136,12 +173,23 @@ class CclBondQuoteLogger:
             ])
 
         if rows:
-            self._write_rows(rows)
+            self._write_rows(rows, now=now)
 
-    def _write_rows(self, rows: List[list]) -> None:
+    def _write_rows(self, rows: List[list], now: Optional[datetime] = None) -> None:
         with self._lock:
             try:
+                # Chequeo de rotacion/retencion ANTES de cada escritura (no
+                # solo en __init__/_ensure_header): un proceso de larga vida
+                # que cruza la medianoche UTC en medio de una corrida debe
+                # rotar/comprimir el archivo del dia anterior ahora, no
+                # recien en el proximo restart (mismo criterio que
+                # MarketSnapshotLogger._write_rows).
+                self._rotate_if_new_day_locked(now=now)
+                needs_header = (not self._path.exists()) or self._path.stat().st_size == 0
                 with open(self._path, "a", newline="", encoding="utf-8") as f:
-                    csv.writer(f).writerows(rows)
+                    writer = csv.writer(f)
+                    if needs_header:
+                        writer.writerow(self._HEADER)
+                    writer.writerows(rows)
             except Exception:
                 logger.exception("No se pudo escribir el log de cotizaciones de bonos (CCL).")

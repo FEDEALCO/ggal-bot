@@ -80,11 +80,12 @@ def test_vol_arbitrage_selection_leaves_position_sizer_unset():
     """
     ACTUALIZADO (TANDA 2 "OPTIMIZACION EJECUTABLE", seccion 12, 2026-09-08):
     ahora requiere shadow.enabled=True explicito - vol_arbitrage fuera de
-    modo shadow cae a weekly_asymmetric (ver la nueva salvaguarda en
-    GgalOptionsBot.__init__ y test_vol_arbitrage_selection_blocked_outside_
-    shadow_mode_falls_back_to_weekly_asymmetric mas abajo). Este test sigue
-    validando UNICAMENTE el wiring de seleccion bajo vol_arbitrage
-    (position_sizer sin usar), no la salvaguarda en si.
+    modo shadow cae a "none" (ver la nueva salvaguarda en
+    GgalOptionsBot.__init__, AJUSTADA 2026-11-24 de weekly_asymmetric a
+    "none" - ver test_vol_arbitrage_selection_blocked_outside_shadow_mode_
+    falls_back_to_none mas abajo). Este test sigue validando UNICAMENTE el
+    wiring de seleccion bajo vol_arbitrage (position_sizer sin usar), no la
+    salvaguarda en si.
     """
     original = SETTINGS.strategy.active
     original_shadow = SETTINGS.shadow.enabled
@@ -100,14 +101,21 @@ def test_vol_arbitrage_selection_leaves_position_sizer_unset():
         SETTINGS.shadow.enabled = original_shadow
 
 
-def test_vol_arbitrage_selection_blocked_outside_shadow_mode_falls_back_to_weekly_asymmetric():
+def test_vol_arbitrage_selection_blocked_outside_shadow_mode_falls_back_to_none():
     """
-    NUEVO (TANDA 2 "OPTIMIZACION EJECUTABLE", seccion 12, 2026-09-08):
-    vol_arbitrage es NO-GO de produccion por instruccion explicita y
-    repetida del usuario. Antes de esta salvaguarda, nada impedia que
-    GGAL_BOT_ACTIVE_STRATEGY=vol_arbitrage con GGAL_BOT_SHADOW_MODE=false
-    (el default de shadow.enabled) arrancara el bot operando vol_arbitrage
-    con ordenes REALES. Ahora debe caer a weekly_asymmetric.
+    NUEVO (TANDA 2 "OPTIMIZACION EJECUTABLE", seccion 12, 2026-09-08),
+    AJUSTADO 2026-11-24 (ultimos ajustes de seguridad antes de la pausa de
+    desarrollo, a pedido explicito del usuario): vol_arbitrage es NO-GO de
+    produccion por instruccion explicita y repetida del usuario. Antes de
+    esta salvaguarda, nada impedia que GGAL_BOT_ACTIVE_STRATEGY=
+    vol_arbitrage con GGAL_BOT_SHADOW_MODE=false (el default de
+    shadow.enabled) arrancara el bot operando vol_arbitrage con ordenes
+    REALES. Hasta el 2026-11-24 caia a weekly_asymmetric - AJUSTADO para
+    caer a "none" en su lugar (mismo principio de fail-safe que
+    test_invalid_active_strategy_falls_back_to_none_with_error_logged mas
+    abajo): asi, un GGAL_BOT_ACTIVE_STRATEGY=vol_arbitrage puesto por error
+    en un deploy LIVE ya no termina operando weekly_asymmetric con ordenes
+    REALES sin que nadie lo haya elegido.
     """
     original = SETTINGS.strategy.active
     original_shadow = SETTINGS.shadow.enabled
@@ -115,9 +123,9 @@ def test_vol_arbitrage_selection_blocked_outside_shadow_mode_falls_back_to_weekl
     SETTINGS.shadow.enabled = False
     try:
         bot = GgalOptionsBot()
-        assert bot.active_strategy_name == "weekly_asymmetric"
-        assert isinstance(bot.strategy, WeeklyAsymmetricStrategy)
-        assert bot.position_sizer is not None
+        assert bot.active_strategy_name == "none"
+        assert bot.strategy is None
+        assert bot.position_sizer is None
     finally:
         SETTINGS.strategy.active = original
         SETTINGS.shadow.enabled = original_shadow
@@ -279,21 +287,131 @@ def test_warn_orphaned_positions_silent_when_position_matches_active_strategy():
         SETTINGS.strategy.active = original_strategy
 
 
-def test_invalid_active_strategy_falls_back_to_weekly_asymmetric():
+def test_invalid_active_strategy_falls_back_to_none_with_error_logged():
+    """
+    AJUSTADO 2026-11-24 (ultimos ajustes de seguridad antes de la pausa de
+    desarrollo, a pedido explicito del usuario: "que un valor invalido
+    caiga a 'none' con error en el log, nunca a weekly_asymmetric"). Hasta
+    este cambio, un GGAL_BOT_ACTIVE_STRATEGY invalido (ej. un typo) caia
+    SILENCIOSAMENTE a weekly_asymmetric con solo un warning - en un deploy
+    real, eso podia terminar operando la estrategia por defecto con
+    ordenes REALES sin que nadie la haya elegido. Ahora cae a "none"
+    (ninguna estrategia de entrada) con un logger.error explicito.
+    """
+    import run_bot as run_bot_module
+
     original = SETTINGS.strategy.active
     SETTINGS.strategy.active = "esto_no_existe"
+    errors_logged = []
+    original_error = run_bot_module.logger.error
+    run_bot_module.logger.error = lambda msg, *args: errors_logged.append(msg % args)
     try:
         bot = GgalOptionsBot()
-        assert bot.active_strategy_name == "weekly_asymmetric"
-        assert isinstance(bot.strategy, WeeklyAsymmetricStrategy)
+        assert bot.active_strategy_name == "none"
+        assert bot.strategy is None
+        assert bot.position_sizer is None
+        assert any("esto_no_existe" in e and "none" in e for e in errors_logged), (
+            f"esperaba un logger.error mencionando el valor invalido y el fallback a 'none': {errors_logged}"
+        )
     finally:
+        run_bot_module.logger.error = original_error
         SETTINGS.strategy.active = original
+
+
+def test_none_strategy_selection_disables_entries_entirely():
+    """
+    NUEVO (2026-11-24, fail-safe GGAL_BOT_ACTIVE_STRATEGY=none, a pedido
+    explicito del usuario: "ninguna estrategia de entrada"). Mismo wiring
+    que "scalping" bajo seleccion exclusiva (self.strategy/position_sizer/
+    technical_engine en None), pero sin que ningun motulo de scalping se
+    fuerce a encendido - "none" significa literalmente ninguna entrada.
+    """
+    original_strategy = SETTINGS.strategy.active
+    original_scalping_enabled = SETTINGS.scalping.enabled
+    SETTINGS.strategy.active = "none"
+    SETTINGS.scalping.enabled = False
+    try:
+        bot = GgalOptionsBot()
+        assert bot.active_strategy_name == "none"
+        assert bot.strategy is None
+        assert bot.position_sizer is None
+        assert bot.technical_engine is None
+        assert bot.scalping_enabled is False, (
+            "a diferencia de GGAL_BOT_ACTIVE_STRATEGY=scalping, 'none' no debe forzar "
+            "el modulo de scalping a encendido - 'none' es literalmente ninguna entrada."
+        )
+    finally:
+        SETTINGS.strategy.active = original_strategy
+        SETTINGS.scalping.enabled = original_scalping_enabled
+
+
+def test_none_strategy_selection_recompute_cycle_never_calls_any_strategy_cycle():
+    """
+    Analogo a test_scalping_exclusive_selection_recompute_cycle_never_calls_
+    other_strategies, pero para "none": bajo esta seleccion, NINGUNA de las
+    3 ramas de ciclo (weekly_asymmetric/vol_arbitrage/scalping) debe
+    llamarse jamas - ver docstrings de ese test para el criterio de
+    enforce_market_hours_gate=False/market_feed.poll no-op.
+    """
+    original_strategy = SETTINGS.strategy.active
+    original_shadow = SETTINGS.shadow.enabled
+    original_gate = SETTINGS.risk.enforce_market_hours_gate
+    SETTINGS.strategy.active = "none"
+    SETTINGS.shadow.enabled = True
+    SETTINGS.risk.enforce_market_hours_gate = False
+    try:
+        bot = GgalOptionsBot()
+        bot.market_feed.poll = lambda *_a, **_kw: None
+        bot._spot_book = OrderBookSnapshot(
+            SETTINGS.instruments.contado_ticker, bid=6999.0, ask=7001.0, bid_size=100, ask_size=100,
+        )
+
+        def _boom(*_a, **_kw):
+            raise AssertionError("no debia llamarse bajo GGAL_BOT_ACTIVE_STRATEGY=none")
+
+        bot._run_weekly_asymmetric_cycle = _boom
+        bot._run_vol_arbitrage_cycle = _boom
+        bot._run_scalping_cycle = _boom
+
+        bot.recompute_cycle()  # no debe levantar AssertionError desde _boom
+    finally:
+        SETTINGS.strategy.active = original_strategy
+        SETTINGS.shadow.enabled = original_shadow
+        SETTINGS.risk.enforce_market_hours_gate = original_gate
 
 
 # ---------------------------------------------------------------------------
 # _capital_available_ars(): capital comprometido baja a 0 cuando la
 # posicion se cierra (quantity=0)
 # ---------------------------------------------------------------------------
+
+def test_long_first_mode_env_var_fails_bot_startup():
+    """
+    MEJORA 2026-11-24 (ultimos ajustes de seguridad antes de la pausa de
+    desarrollo, a pedido explicito del usuario: "Elimina GGAL_BOT_LONG_
+    FIRST_MODE de la config y de bot_state.json, o hace que el bot falle
+    al arrancar si esta definida, para que nadie la use pensando que apaga
+    algo"). GGAL_BOT_LONG_FIRST_MODE era codigo MUERTO (nunca se leia fuera
+    de config.py - verificado por grep exhaustivo) - el campo se elimino de
+    LongFirstConfig y, ademas, el bot ahora se niega a arrancar si la env
+    var sigue definida en el entorno (cualquier valor, incluido "false").
+    """
+    assert "GGAL_BOT_LONG_FIRST_MODE" not in os.environ, (
+        "este test asume que la variable no esta seteada de antes - si lo esta, "
+        "algo mas en la suite la dejo sin limpiar."
+    )
+    os.environ["GGAL_BOT_LONG_FIRST_MODE"] = "true"
+    try:
+        raised = False
+        try:
+            GgalOptionsBot()
+        except RuntimeError as exc:
+            raised = True
+            assert "GGAL_BOT_LONG_FIRST_MODE" in str(exc)
+        assert raised, "GgalOptionsBot() deberia fallar al arrancar con GGAL_BOT_LONG_FIRST_MODE definida."
+    finally:
+        del os.environ["GGAL_BOT_LONG_FIRST_MODE"]
+
 
 def test_capital_available_ars_reflects_open_and_closed_positions():
     original = SETTINGS.strategy.active
@@ -696,12 +814,15 @@ def test_weekly_asymmetric_cycle_forces_neutral_when_technical_snapshot_is_synth
 ALL_TESTS = [
     test_default_weekly_asymmetric_wires_strategy_and_position_sizer,
     test_vol_arbitrage_selection_leaves_position_sizer_unset,
-    test_vol_arbitrage_selection_blocked_outside_shadow_mode_falls_back_to_weekly_asymmetric,
+    test_vol_arbitrage_selection_blocked_outside_shadow_mode_falls_back_to_none,
     test_scalping_exclusive_selection_disables_main_strategy_and_forces_scalping_on,
     test_scalping_exclusive_selection_recompute_cycle_never_calls_other_strategies,
     test_warn_orphaned_positions_flags_weekly_asymmetric_position_under_scalping_selection,
     test_warn_orphaned_positions_silent_when_position_matches_active_strategy,
-    test_invalid_active_strategy_falls_back_to_weekly_asymmetric,
+    test_invalid_active_strategy_falls_back_to_none_with_error_logged,
+    test_none_strategy_selection_disables_entries_entirely,
+    test_none_strategy_selection_recompute_cycle_never_calls_any_strategy_cycle,
+    test_long_first_mode_env_var_fails_bot_startup,
     test_capital_available_ars_reflects_open_and_closed_positions,
     test_weekly_asymmetric_cycle_reconciles_exit_before_sizing_new_entry,
     test_weekly_asymmetric_cycle_skips_entries_and_spreads_when_market_data_stale,

@@ -48,6 +48,16 @@ El path "vivo" (`paths.MARKET_SNAPSHOT_LOG`) es SIEMPRE el del dia en curso,
 asi que dashboard/data/market_data.py no necesita ningun cambio - sigue
 leyendo exactamente el mismo path de siempre, que ahora simplemente nunca
 acumula mas de ~1 dia de datos.
+
+RETENCION (MEJORA 2026-11-24, ultimos ajustes de seguridad antes de la
+pausa de desarrollo, a pedido explicito del usuario - "retencion
+configurable, default 180 dias"): hasta esta mejora, la rotacion de arriba
+NUNCA borraba un .gz ya archivado - acumulaba para siempre. Ahora, en cada
+chequeo de rotacion, tambien se purgan (ver ggal_bot/log_rotation.py,
+modulo compartido con CclBondQuoteLogger/PortfolioGreeksLogger) los .gz mas
+viejos que `retention_days` (default `RiskConfig.log_retention_days`,
+180 dias) - <=0 desactiva el borrado (retencion infinita, comportamiento
+identico al de antes de esta mejora).
 """
 from __future__ import annotations
 
@@ -60,7 +70,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
-from ggal_bot import paths
+from ggal_bot import log_rotation, paths
 
 logger = logging.getLogger("ggal_bot.data.market_snapshot_log")
 
@@ -90,19 +100,29 @@ class MarketSnapshotLogger:
     # de esquema con sufijo .schemaN). Sin dato real todavia (0.0 desde el
     # origen) se registra igual, nunca se fabrica un valor.
 
-    def __init__(self, path: Optional[Path] = None, rotate_daily: Optional[bool] = None):
+    def __init__(
+        self, path: Optional[Path] = None, rotate_daily: Optional[bool] = None,
+        retention_days: Optional[int] = None,
+    ):
         """
         `rotate_daily`: si se omite (default), se lee de
         RiskConfig.market_snapshot_rotate_daily (True por default - ver
         docstring del modulo). Parametro explicito disponible para tests y
         para cualquier caller que quiera forzar el comportamiento sin tocar
         SETTINGS global.
+
+        `retention_days` (MEJORA 2026-11-24, ver docstring del modulo): si
+        se omite, se lee de RiskConfig.log_retention_days (180 por default).
         """
         self._path = Path(path) if path is not None else paths.MARKET_SNAPSHOT_LOG
-        if rotate_daily is None:
+        if rotate_daily is None or retention_days is None:
             from ggal_bot.config import SETTINGS  # import tardio: evita ciclo de imports con config.py
-            rotate_daily = SETTINGS.risk.market_snapshot_rotate_daily
+            if rotate_daily is None:
+                rotate_daily = SETTINGS.risk.market_snapshot_rotate_daily
+            if retention_days is None:
+                retention_days = SETTINGS.risk.log_retention_days
         self._rotate_daily = rotate_daily
+        self._retention_days = retention_days
         self._lock = threading.Lock()
         self._ensure_header()
 
@@ -128,11 +148,17 @@ class MarketSnapshotLogger:
         (ej. ya se roto antes en este mismo arranque) NUNCA se sobreescribe
         - se deja el archivo actual sin rotar antes que perder datos.
         """
+        current = now if now is not None else datetime.now(timezone.utc)
+        # Retencion (MEJORA 2026-11-24, ver docstring del modulo): se purga
+        # SIEMPRE que se llega aca, independiente de `rotate_daily` - los
+        # archivos .gz ya archivados existen de antes, la retencion es una
+        # politica aparte de si se sigue rotando o no hoy.
+        log_rotation.purge_old_archives(self._path, self._retention_days, now=current)
+
         if not self._rotate_daily:
             return
         if not self._path.exists() or self._path.stat().st_size == 0:
             return
-        current = now if now is not None else datetime.now(timezone.utc)
         mtime = datetime.fromtimestamp(self._path.stat().st_mtime, tz=timezone.utc)
         if mtime.date() >= current.date():
             return

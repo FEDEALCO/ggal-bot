@@ -25,12 +25,17 @@ probarse igual con datos simulados corriendo
 
 from __future__ import annotations
 
+import gzip
 import logging
+import os
+import re
+import shutil
 import signal
 import sys
 import time
 import uuid
 from datetime import date, datetime, timezone
+from logging.handlers import TimedRotatingFileHandler
 from typing import Dict, List, Optional
 
 from ggal_bot.config import SETTINGS, VALID_STRATEGIES
@@ -99,9 +104,44 @@ def _art_time_converter(seconds: float) -> time.struct_time:
     return time.gmtime(seconds - 3 * 3600)
 
 
+def _gzip_rotator(source: str, dest: str) -> None:
+    """
+    Rotator custom de TimedRotatingFileHandler (ver _log_file_handler mas
+    abajo - MEJORA 2026-11-24, ultimos ajustes de seguridad antes de la
+    pausa de desarrollo, a pedido explicito del usuario: "Rotacion diaria
+    con gzip ... para ... ggal_bot.log"). A diferencia de los loggers CSV
+    (ver ggal_bot/log_rotation.py), este archivo lo escribe
+    directamente el modulo logging de la stdlib via un FileHandler, asi que
+    la rotacion se resuelve con el mecanismo nativo de TimedRotatingFileHandler
+    en vez de duplicar logica propia - comprime con gzip el archivo que
+    TimedRotatingFileHandler ya renombro y borra el original sin comprimir.
+    """
+    with open(source, "rb") as src, gzip.open(dest, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+    os.remove(source)
+
+
+# Rotacion diaria (medianoche UTC) + compresion gzip + retencion
+# configurable (GGAL_BOT_LOG_RETENTION_DAYS, default 180 dias - ver
+# RiskConfig.log_retention_days) para ggal_bot.log.
+_log_file_handler = TimedRotatingFileHandler(
+    LOG_FILE, when="midnight", utc=True, backupCount=SETTINGS.risk.log_retention_days, encoding="utf-8",
+)
+_log_file_handler.suffix = "%Y-%m-%d"
+# El regex de limpieza de TimedRotatingFileHandler (getFilesToDelete, el que
+# hace valer `backupCount` arriba) compara contra el sufijo LITERAL del
+# archivo ya renombrado via self.namer - con el namer de abajo agregando
+# ".gz", el extMatch default (solo "YYYY-MM-DD") ya no matchea
+# "YYYY-MM-DD.gz" y backupCount nunca borraria nada. Se amplia el regex
+# para aceptar el sufijo ".gz" opcional (mismo recurso documentado para
+# TimedRotatingFileHandler + compresion via namer/rotator custom).
+_log_file_handler.extMatch = re.compile(r"^\d{4}-\d{2}-\d{2}(\.gz)?$", re.ASCII)
+_log_file_handler.namer = lambda name: name + ".gz"
+_log_file_handler.rotator = _gzip_rotator
+
 logging.basicConfig(
     level=logging.INFO,
-    handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE, encoding="utf-8")],
+    handlers=[logging.StreamHandler(), _log_file_handler],
 )
 _art_log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 _art_log_formatter.converter = _art_time_converter
@@ -123,6 +163,30 @@ class GgalOptionsBot:
         nuevo con la configuracion por defecto (comportamiento identico al
         de antes de este parametro).
         """
+        # FAIL-FAST (AGREGADO 2026-11-24, ultimos ajustes de seguridad antes
+        # de la pausa de desarrollo, a pedido EXPLICITO del usuario: "para
+        # que nadie la use pensando que apaga algo"). GGAL_BOT_LONG_FIRST_MODE
+        # es codigo MUERTO (ver el comentario completo junto al campo
+        # eliminado en config.LongFirstConfig) - verificado por grep
+        # exhaustivo que nunca se leia fuera de config.py, asi que
+        # setearla NUNCA desactivo nada. En vez de dejarla como una env var
+        # que alguien puede setear pensando que tiene efecto, el bot se
+        # niega a arrancar mientras siga definida (cualquier valor) - esto
+        # es DELIBERADO incluso durante una pausa operativa (ver
+        # RESEARCH.md "Resumen ejecutivo"): si esta variable esta seteada
+        # en el entorno de despliegue (ej. Northflank), hay que QUITARLA de
+        # ahi antes del proximo restart, o el bot no va a arrancar en
+        # absoluto - ni siquiera para seguir logueando market_snapshots/CCL.
+        if "GGAL_BOT_LONG_FIRST_MODE" in os.environ:
+            raise RuntimeError(
+                "GGAL_BOT_LONG_FIRST_MODE esta definida en el entorno (valor=%r), pero es una "
+                "flag MUERTA - nunca se lee fuera de config.py (verificado por grep en todo el "
+                "repo). El bot NO arranca mientras esta variable siga seteada, para que nadie la "
+                "use pensando que apaga algo. Para desactivar entradas nuevas usar "
+                "GGAL_BOT_ACTIVE_STRATEGY=none (ninguna estrategia) o GGAL_BOT_MAX_CAPITAL_ARS=0 - "
+                "despues, quitar GGAL_BOT_LONG_FIRST_MODE por completo del entorno."
+                % (os.environ.get("GGAL_BOT_LONG_FIRST_MODE"),)
+            )
         # -- Motor cuantitativo y estado de mercado --------------------------
         self.option_chain = OptionChain()
         self.portfolio = Portfolio()
@@ -150,12 +214,26 @@ class GgalOptionsBot:
         # silencio o crashear el proceso.
         active_strategy_name = SETTINGS.strategy.active
         if active_strategy_name not in VALID_STRATEGIES:
-            logger.warning(
-                "GGAL_BOT_ACTIVE_STRATEGY=%r no es valido (opciones: %s); se usa "
-                "'weekly_asymmetric' por defecto.",
+            # FAIL-SAFE (AJUSTADO 2026-11-24, a pedido explicito del
+            # usuario, ultimos ajustes de seguridad antes de la pausa de
+            # desarrollo: "que un valor invalido caiga a 'none' con error
+            # en el log, nunca a weekly_asymmetric"). ANTES, un typo en
+            # GGAL_BOT_ACTIVE_STRATEGY caia SILENCIOSAMENTE a
+            # weekly_asymmetric con solo un warning - en un deploy real,
+            # eso podia terminar operando la estrategia por defecto con
+            # ordenes REALES sin que nadie la haya elegido. Ahora cae a
+            # "none" (ver VALID_STRATEGIES en config.py: ninguna estrategia
+            # de entrada) con logger.error: el bot arranca igual y sigue
+            # gestionando salidas de posiciones ya abiertas (ver
+            # _warn_orphaned_positions_for_active_strategy), pero nunca
+            # abre una entrada nueva por un valor mal escrito.
+            logger.error(
+                "GGAL_BOT_ACTIVE_STRATEGY=%r no es valido (opciones: %s); se usa 'none' "
+                "(NINGUNA estrategia de entrada) en vez de un default silencioso - revisar "
+                "la configuracion cuanto antes.",
                 active_strategy_name, ", ".join(VALID_STRATEGIES),
             )
-            active_strategy_name = "weekly_asymmetric"
+            active_strategy_name = "none"
 
         # SALVAGUARDA (TANDA 2 "OPTIMIZACION EJECUTABLE", seccion 12,
         # 2026-09-08): vol_arbitrage es NO-GO de produccion por instruccion
@@ -175,14 +253,27 @@ class GgalOptionsBot:
         # logger.critical explicito, en vez de arrancar en silencio con
         # exposicion short/vol_arbitrage real no autorizada.
         if active_strategy_name == "vol_arbitrage" and not SETTINGS.shadow.enabled:
+            # AJUSTADO 2026-11-24 (mismo principio de fail-safe que la
+            # validacion de arriba, a pedido explicito del usuario): esta
+            # salvaguarda forzaba "weekly_asymmetric" como alternativa - es
+            # decir, un GGAL_BOT_ACTIVE_STRATEGY=vol_arbitrage puesto por
+            # error (o por config vieja arrastrada) en un deploy LIVE
+            # terminaba igual operando weekly_asymmetric con ordenes REALES
+            # sin que nadie lo haya elegido, el mismo problema de fondo que
+            # motivo el cambio de arriba. Ahora se fuerza 'none' (ninguna
+            # estrategia de entrada, ver VALID_STRATEGIES en config.py) en
+            # su lugar - el bot sigue arrancando y gestionando salidas de
+            # posiciones ya abiertas, pero no abre nada nuevo hasta que un
+            # operador corrija la configuracion a proposito.
             logger.critical(
                 "GGAL_BOT_ACTIVE_STRATEGY=vol_arbitrage pero GGAL_BOT_SHADOW_MODE=false "
                 "(o sin setear): vol_arbitrage es NO-GO DE PRODUCCION (debe permanecer "
                 "SHADOW/PAPER ONLY, no cierra posiciones solo - ver TODO en _act_on_signal). "
-                "Se fuerza 'weekly_asymmetric' en su lugar. Para operar vol_arbitrage, hacerlo "
-                "UNICAMENTE con GGAL_BOT_SHADOW_MODE=true."
+                "Se fuerza 'none' (ninguna estrategia de entrada) en su lugar, NUNCA "
+                "weekly_asymmetric. Para operar vol_arbitrage, hacerlo UNICAMENTE con "
+                "GGAL_BOT_SHADOW_MODE=true."
             )
-            active_strategy_name = "weekly_asymmetric"
+            active_strategy_name = "none"
 
         self.active_strategy_name = active_strategy_name
 
@@ -213,6 +304,16 @@ class GgalOptionsBot:
             )
         elif self.active_strategy_name == "scalping":
             pass  # ver comentario de self.strategy arriba y el bloque de Scalping mas abajo.
+        elif self.active_strategy_name == "none":
+            # Fail-safe (AGREGADO 2026-11-24, ver VALID_STRATEGIES/
+            # StrategyConfig en config.py): ninguna estrategia de entrada -
+            # self.strategy queda en None, igual que bajo "scalping" arriba,
+            # y ninguna rama de recompute_cycle() lo dereferencia bajo esta
+            # seleccion (ver ahi). Util para una pausa operativa donde el
+            # bot debe seguir corriendo (gestionar salidas de posiciones ya
+            # abiertas, seguir logueando market_snapshots/CCL/griegas) sin
+            # poder abrir ninguna posicion nueva.
+            pass
         else:  # "weekly_asymmetric" (default)
             self.strategy = WeeklyAsymmetricStrategy(self.risk_manager, config=SETTINGS.long_first)
             self.position_sizer = PositionSizer()
@@ -459,7 +560,10 @@ class GgalOptionsBot:
         # #27/#28 item 5, 2026-10-02, a pedido explicito del usuario) - ver
         # ggal_bot/portfolio/portfolio_greeks_log.py. Instanciado SIEMPRE
         # (igual que market_snapshot_log arriba): default ON, sin flag.
-        self.portfolio_greeks_log = PortfolioGreeksLogger()
+        # `retention_days` pasado explicito (MEJORA 2026-11-24): ver el
+        # comentario junto a PortfolioGreeksLogger._DEFAULT_RETENTION_DAYS -
+        # ese modulo deliberadamente no lee SETTINGS por si solo.
+        self.portfolio_greeks_log = PortfolioGreeksLogger(retention_days=SETTINGS.risk.log_retention_days)
 
         # -- Cotizaciones de bonos para CCL implicito (MEJORA 2026-09-30,
         # ver ggal_bot/data/ccl_bond_quote_log.py y REPORT.md) - instanciado
@@ -1267,6 +1371,12 @@ class GgalOptionsBot:
                 # aditivo (self.scalping_enabled esta FORZADO a True en
                 # __init__ cuando active_strategy_name=="scalping").
                 all_signals = []
+            elif self.active_strategy_name == "none":
+                # Fail-safe (ver __init__ y VALID_STRATEGIES en config.py):
+                # ninguna estrategia de entrada corre este ciclo - self.strategy
+                # es None (igual que bajo "scalping" arriba), asi que esta rama
+                # tampoco puede dereferenciarlo.
+                all_signals = []
             else:
                 all_signals = self._run_weekly_asymmetric_cycle(spot)
 
@@ -1297,15 +1407,24 @@ class GgalOptionsBot:
         # estrategia, un archivo HISTORICO (nunca se sobreescribe) a
         # diferencia del snapshot vivo que ya publica self.state_writer.
         # Reusa `totals` (ya calculado arriba) para el scope "portfolio";
-        # VALID_STRATEGIES cubre las 3 estrategias posibles sin importar
-        # cual este activa como principal (scalping puede tener posiciones
-        # propias en modo aditivo aunque no sea la activa - ver
-        # Portfolio.greeks_for_strategy_tag). Un fallo de disco aca nunca
-        # debe tumbar el ciclo de trading real (ver
+        # VALID_STRATEGIES cubre las estrategias posibles (incluido "none",
+        # ver config.py) sin importar cual este activa como principal
+        # (scalping puede tener posiciones propias en modo aditivo aunque no
+        # sea la activa - ver Portfolio.greeks_for_strategy_tag). Un fallo
+        # de disco aca nunca debe tumbar el ciclo de trading real (ver
         # PortfolioGreeksLogger._write_rows).
+        #
+        # `has_open_positions` (MEJORA 2026-11-24, a pedido explicito del
+        # usuario: "que portfolio_greeks_log no escriba filas mientras no
+        # haya posiciones abiertas"): `quantity != 0` es el mismo criterio
+        # que ya usa el resto del bot para "posicion realmente abierta" (ver
+        # Position.has_unknown_greeks/_capital_available_ars) - una Position
+        # con quantity==0 es una ya cerrada que todavia no se purgo de la
+        # lista.
         self.portfolio_greeks_log.log_greeks(
             portfolio_totals=totals,
             per_strategy_totals={tag: self.portfolio.greeks_for_strategy_tag(tag) for tag in VALID_STRATEGIES},
+            has_open_positions=any(p.quantity != 0 for p in self.portfolio.positions),
         )
 
         if self._market_data_is_reliable_for_trading():
@@ -2507,6 +2626,30 @@ class GgalOptionsBot:
         if quote is None or quote.book.bid <= 0 or quote.book.ask <= 0:
             return
 
+        # Kill switch centralizado (Fase 5.3, ver ggal_bot/risk/kill_switch.py):
+        # GAP CERRADO (2026-11-24, a pedido explicito del usuario -
+        # "Confirma en codigo que el kill switch tambien bloquea ...
+        # cualquier otro camino de entrada"): verificado por lectura de
+        # codigo que este camino (vol_arbitrage) NUNCA habia consultado
+        # self.kill_switch - junto con _act_on_spread_completion_signal
+        # (ver mas abajo), era uno de los dos unicos caminos de entrada que
+        # no lo hacian (el otro, _act_on_entry_signal, ya lo consultaba
+        # desde Fase 5.3). Bloquea SOLO entradas nuevas, nunca salidas (ver
+        # docstring de KillSwitch sobre por que _act_on_exit_signal/
+        # _check_vol_arbitrage_exits no lo consultan).
+        if self.kill_switch.is_tripped():
+            state_ks = self.kill_switch.status()
+            logger.warning(
+                "Señal %s ignorada: kill switch disparado (%s: %s). Requiere reset manual "
+                "('python -m ggal_bot.risk.kill_switch --reset \"motivo\"').",
+                signal.symbol, state_ks.tripped_by, state_ks.reason,
+            )
+            self.position_event_journal.log_event(
+                "REJECT", symbol=signal.symbol, strategy_tag="vol_arbitrage",
+                side=getattr(signal, "action", "buy"), reason=f"kill_switch_tripped: {state_ks.reason}",
+            )
+            return
+
         # Guarda 0: base todavia en cooldown de reentrada tras un stop_loss
         # reciente (ver docstring de arriba y VolArbitrageConfig.
         # reentry_cooldown_seconds).
@@ -3204,6 +3347,31 @@ class GgalOptionsBot:
         """
         quote = self.option_chain.get(signal.short_symbol)
         if quote is None or quote.book.bid <= 0 or quote.book.ask <= 0:
+            return
+
+        # Kill switch centralizado (Fase 5.3, ver ggal_bot/risk/kill_switch.py):
+        # GAP CERRADO (2026-11-24, a pedido explicito del usuario -
+        # "Confirma en codigo que el kill switch tambien bloquea
+        # spread_completion ..."): verificado por lectura de codigo que
+        # este camino (la pata CORTA de un spread de weekly_asymmetric)
+        # NUNCA habia consultado self.kill_switch - era el unico camino de
+        # entrada de weekly_asymmetric que no lo hacia (la pata LARGA, via
+        # _act_on_entry_signal, ya lo consulta desde Fase 5.3). Bloquea
+        # SOLO esta pata nueva, nunca una salida - la larga que la financia,
+        # si ya esta abierta, sigue gestionada con normalidad (Stop Loss/
+        # Take Profit/horizonte/guardia de fin de semana).
+        if self.kill_switch.is_tripped():
+            state_ks = self.kill_switch.status()
+            logger.warning(
+                "Pata corta de spread completion %s ignorada: kill switch disparado (%s: %s). "
+                "La larga %s queda sola (riesgo acotado, sin pata corta descubierta). Requiere "
+                "reset manual ('python -m ggal_bot.risk.kill_switch --reset \"motivo\"').",
+                signal.short_symbol, state_ks.tripped_by, state_ks.reason, signal.long_symbol,
+            )
+            self.position_event_journal.log_event(
+                "REJECT", symbol=signal.short_symbol, strategy_tag="weekly_asymmetric",
+                side="sell", reason=f"kill_switch_tripped: {state_ks.reason}",
+            )
             return
 
         # CORREGIDO 2026-11-18 (caso real GFGV4000DI, 16/11: pata corta de

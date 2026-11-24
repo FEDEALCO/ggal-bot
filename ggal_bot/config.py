@@ -551,6 +551,22 @@ class RiskConfig:
     # prefiere un solo archivo acumulado).
     market_snapshot_rotate_daily: bool = _env_bool("GGAL_BOT_MARKET_SNAPSHOT_ROTATE_DAILY", True)
 
+    # --- Retencion de logs rotados (MEJORA 2026-11-24, ultimos ajustes de ---
+    # --- seguridad antes de la pausa de desarrollo, a pedido explicito del --
+    # --- usuario) -------------------------------------------------------------
+    # Dias que se conserva un archivo .gz ya rotado (ver
+    # ggal_bot/log_rotation.py) antes de borrarlo, para market_snapshots.csv,
+    # ccl_bond_quotes.csv, portfolio_greeks_log.csv y ggal_bot.log por igual -
+    # un unico valor compartido (el usuario pidio "retencion configurable",
+    # no una por archivo). ANTES de esta mejora NINGUN archivo rotado se
+    # borraba nunca (verificado leyendo market_snapshot_log.py, el unico de
+    # los 4 que ya rotaba: su rotacion desde el 2026-10-08 acumula .gz para
+    # siempre) - a este ritmo medido (~260 MB/mes comprimido solo de
+    # snapshots, ver RESEARCH.md "Resumen ejecutivo") el disco se llena en
+    # un tiempo finito sin limite. <=0 desactiva el borrado (retencion
+    # infinita, comportamiento identico al de antes de esta mejora).
+    log_retention_days: int = _env_int("GGAL_BOT_LOG_RETENTION_DAYS", 180)
+
     # --- Griegas "vigentes" solo si el book esta VIVO ahora (hallazgo de ---
     # --- auditoria, 2026-10-09, a pedido explicito del usuario) ----------------
     # OptionChain.recompute_all() (ver data/option_chain.py) solo recalcula
@@ -1079,7 +1095,22 @@ class ShadowConfig:
 
 @dataclass
 class LongFirstConfig:
-    enabled: bool = _env_bool("GGAL_BOT_LONG_FIRST_MODE", True)
+    # GGAL_BOT_LONG_FIRST_MODE ELIMINADA (2026-11-24, ultimos ajustes de
+    # seguridad antes de la pausa de desarrollo, a pedido EXPLICITO del
+    # usuario: "para que nadie la use pensando que apaga algo"). Este
+    # campo (`enabled`) era CODIGO MUERTO - verificado por grep exhaustivo
+    # en todo el repo (`grep -rn "long_first.enabled\|LONG_FIRST_MODE"
+    # --include="*.py" .`) de que nunca se leia en ningun lado fuera de
+    # config.py mismo: ningun modulo de run_bot.py/strategy/risk lo
+    # consultaba jamas, asi que setearlo a False NUNCA tuvo ningun efecto
+    # real sobre si el bot operaba weekly_asymmetric o no (quien si lo
+    # desactiva de verdad: GGAL_BOT_ACTIVE_STRATEGY=none, ver
+    # VALID_STRATEGIES, o GGAL_BOT_MAX_CAPITAL_ARS=0). En vez de dejar un
+    # campo muerto que invita a pensarlo como un interruptor real, el bot
+    # ahora FALLA AL ARRANCAR si la env var sigue definida en el entorno
+    # (ver el chequeo al inicio de GgalOptionsBot.__init__ en run_bot.py) -
+    # asi nadie puede setearla pensando que apaga algo sin que el bot se lo
+    # señale de inmediato.
 
     # --- Restriccion estructural: nunca posiciones descubiertas ---
     # (documental/flag de intencion - la garantia REAL es de codigo: ver
@@ -2015,7 +2046,21 @@ class ScalpingConfig:
 #   loguea (sin bloquear nada - la eleccion ya fue tomada) cada posicion
 #   que quede sin ninguna gestion bajo la seleccion vigente, para que
 #   nunca sea una sorpresa silenciosa en produccion.
-VALID_STRATEGIES: Tuple[str, ...] = ("weekly_asymmetric", "vol_arbitrage", "scalping")
+#
+# "none" -> FAIL-SAFE (AGREGADO 2026-11-24, ultimos ajustes de seguridad
+#   antes de la pausa de desarrollo, a pedido EXPLICITO del usuario:
+#   "ninguna estrategia de entrada"). Bajo este valor, self.strategy queda
+#   en None (igual que bajo "scalping") y ninguna rama de recompute_cycle()
+#   abre una entrada nueva - el bot sigue corriendo (gestiona salidas de
+#   posiciones ya abiertas, sigue logueando market_snapshots/CCL/griegas),
+#   pero no puede operar nada nuevo sin que un operador lo reactive a
+#   proposito. Es TAMBIEN el fallback seguro para un GGAL_BOT_ACTIVE_STRATEGY
+#   invalido o bloqueado por una salvaguarda (ver StrategyConfig mas abajo) -
+#   ANTES de este cambio, ambos casos caian silenciosamente a
+#   "weekly_asymmetric", es decir que un typo o una config vieja podian
+#   terminar operando la estrategia por defecto con ordenes REALES sin que
+#   nadie la haya elegido.
+VALID_STRATEGIES: Tuple[str, ...] = ("weekly_asymmetric", "vol_arbitrage", "scalping", "none")
 
 
 @dataclass
@@ -2023,10 +2068,17 @@ class StrategyConfig:
     """
     Que estrategia corre el orquestador principal (run_bot.py) como
     PRINCIPAL (entradas nuevas Y gestion de salidas) de forma EXCLUYENTE.
-    Un valor invalido en GGAL_BOT_ACTIVE_STRATEGY (fuera de
-    VALID_STRATEGIES) NO frena el arranque del bot: run_bot.py cae a
-    "weekly_asymmetric" y loguea una advertencia explicita (ver
-    GgalOptionsBot.__init__) en vez de fallar en silencio o crashear.
+
+    FAIL-SAFE (AJUSTADO 2026-11-24, a pedido explicito del usuario - ver
+    "none" en VALID_STRATEGIES arriba): un valor invalido en
+    GGAL_BOT_ACTIVE_STRATEGY (fuera de VALID_STRATEGIES), o uno bloqueado
+    por la salvaguarda de vol_arbitrage-fuera-de-shadow (ver
+    GgalOptionsBot.__init__), NO frena el arranque del bot - cae a "none"
+    (ninguna estrategia de entrada) con un logger.error explicito. ANTES de
+    este cambio caia a "weekly_asymmetric" con solo un warning: en un
+    deploy real eso podia terminar operando esa estrategia con ordenes
+    REALES sin que nadie la haya elegido - "none" nunca abre una posicion
+    nueva por si solo, asi que es un fallback seguro por construccion.
 
     Ver la nota de advertencia junto a VALID_STRATEGIES arriba antes de
     setear "scalping" aca en produccion.
