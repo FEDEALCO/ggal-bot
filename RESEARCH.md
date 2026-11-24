@@ -3991,3 +3991,68 @@ de `ggal_bot/`).
 resultado - la señal de ruptura sobre el panel de ADRs no muestra un
 edge que sobreviva el holdout pre-registrado, en ninguna de las dos
 corridas.
+
+---
+
+## Seguimiento 24/11: "analicemos como funcionó la estrategia y el bot" — revisión de performance con export fresco
+
+**Pedido del usuario** (rompe el "modo pausa" del seguimiento anterior): analizar cómo vienen funcionando la estrategia y el bot. Export usado: `ggal_bot_export_2026-11-24_0929` (en la máquina del usuario), con `position_events.csv`/`shadow_trades.csv`/`market_data_source_log.csv`/`signal_funnel.csv`/`bot_state.json` traídos a este sandbox vía `device_stage_files`, y `ggal_bot.log`/`market_snapshots.csv`/`portfolio_greeks_log.csv`/`ccl_bond_quotes.csv` (144-264MB cada uno) inspeccionados in-situ con `device_bash` (grep/wc, sin transferirlos).
+
+### 1) PnL acumulado, vía la herramienta correcta (NO mi primer intento)
+
+Primer intento (descartado): un script propio agrupando por `position_id` crudo dio PnL total **positivo** (+$336.546). Antes de reportarlo encontré que esto es EXACTAMENTE el bug ya documentado el 2026-10-27 más arriba en este mismo documento (BUG B: `position_id` se "reinventa" en cada restart del bot, así que una posición abierta antes de un restart y cerrada después queda invisible para un agrupamiento crudo). Descarté ese número y corrí la herramienta ya existente y ya testeada para esto: `python -m ggal_bot.ops.weekly_review` (usa `reconstruct_positions_from_event_journal`, agrupa por `(symbol, strategy_tag)`, sobrevive restarts).
+
+**Resultado real (histórico completo, 7/9 a 19/11, 3934 filas de journal)**:
+
+| Estrategia | N cerrados | Abiertos ahora | Win% | PnL neto (ARS) | IC95% PnL | Expectancy/trade | IC95% expectancy |
+|---|---|---|---|---|---|---|---|
+| scalping | 1295 | 0 | 6.3% | **-$3.143.863** | [-3.351.271, -2.928.135] | -$2.428 | [-2.588, -2.261] |
+| weekly_asymmetric | 213 | 0 | 6.6% | **-$1.109.144** | [-1.746.513, -552.993] | -$5.207 | [-8.200, -2.596] |
+
+Ambas estrategias, en TODO el historial de shadow mode disponible, muestran expectativa negativa con IC95% que NO cruza cero (estadísticamente significativo, no es ruido). **VERIFICADO**: ningún número fabricado, salida directa de `weekly_review.py` sobre el journal real. Esto es consistente con el veredicto ya alcanzado por separado en el panel de rupturas Módulo B (sección anterior): ninguna de las líneas de investigación evaluadas hasta ahora muestra un edge demostrado.
+
+"Abiertos"=0 para ambas estrategias, confirmado por DOS vías independientes: `reconstruct_positions_from_event_journal` (la misma que usa `run_bot.py` en producción) y `bot_state.json` del 2026-11-24T12:30:30 UTC (`portfolio_greeks_total` = {delta:0, gamma:0, vega:0, theta:0}, `active_signals=[]`, `risk_breaches="Griegas dentro de limite"`). El bot está vivo y corriendo ahora mismo.
+
+### 2) Las correcciones de esta semana, verificadas en producción (no solo "commiteadas")
+
+Reconstruí la línea de tiempo real cruzando restarts del proceso (`grep "Estrategia activa" ggal_bot.log`, timestamps en **hora local ART, UTC-3** - confirmado cruzando un restart de log contra un evento de journal en UTC a los pocos segundos de distancia) contra los commits:
+
+- Último restart del 18/11: **18:39:42 UTC** (log ART 15:39:42) - posterior a `a45d0b9` (14:28:07 UTC, throttle del backstop) y `afef3fb` (14:57:52 UTC, chequeo de book en spread_completion). Corrió sin otro restart hasta el 20/11.
+- Restarts del 20/11: **13:08:54 UTC** y **13:40:13 UTC** - alrededor de los commits `6fe043c`/`8da5153`/`6562089` (13:04-13:29 UTC). Desde ahí, sin restart hasta el export de hoy (24/11, 12:30 UTC).
+
+**Scalping OFF, confirmado por los datos (no solo por `bot_state.json`)**: última entrada de scalping en todo el journal: **2026-11-18T14:34:03 UTC** - cero entradas de scalping después, en los 6 días siguientes. Corte limpio, coincide con la ventana del restart de las 18:39:42 UTC.
+
+**Throttle del backstop (`a45d0b9`)**: el incidente que lo motivó (GFGV4000DI, 16-17/11) generó, contado directo del log, **13.915 líneas de `RESPALDO disparado... sin NINGUN book operable`** entre el 16/11 18:00 ART y el 17/11 10:31 ART (coincide con los "13.907 disparos en 16.5hs" citados en el propio mensaje de commit) - una cada ~4-5 segundos (sin throttle), hasta que la posición finalmente cerró. Una revisión completa de errores desde entonces no encontró ningún otro episodio de esa magnitud (ver abajo, episodio del 19/11, mucho más acotado). No hay un segundo caso de prueba de la misma escala para confirmar el throttle número-contra-número, pero el patrón de reintentos del 19/11 (cada ~2 min, no cada ~5seg) es consistente con que está activo.
+
+**Chequeo de book en spread_completion (`afef3fb`)**: no encontré ningún caso de una pata corta entrando sin verificar book operable desde que el fix está en vivo. Sí hubo una NUEVA pata corta de spread_completion esta semana (GFGV3800DI, 19/11 18:21:24 UTC, vendida a 25.501) que terminó cerrada con pérdida por el backstop (44.999, 21:08:41 UTC) - pero a diferencia del caso GFGV4000DI original, esta entrada pasó el gate (`is_tradeable()`) correctamente: el libro se volvió no operable DESPUÉS de la entrada (cerca del cierre de rueda), no en el momento de entrar. Es el backstop funcionando como está diseñado (cerrar exposición cuando el mercado deja de ser operable), no una repetición del bug. **HIPÓTESIS** (no pude confirmarlo leyendo el log de texto, que no imprime el motivo detallado de cada intento de entrada) pero consistente con todo lo demás observado ese día.
+
+**Tabla de vigencias de horario (`8da5153`)**: de 36 fills en `position_events.csv` desde el 18/11, 3 caen fuera de la rueda BYMA vigente (10:30-18:00 ART) - los 3 son cierres por `quote_gap_backstop` a las 21:08-21:15 UTC del 19/11 (8 a 15 minutos después del cierre de rueda, limpieza de fin de día con libro ya agotado), CERO entradas nuevas fuera de horario. El gate de entradas sigue funcionando correctamente.
+
+### 3) Reconstrucción del episodio de fin de rueda del 19/11 (UTC; el log está en ART, UTC-3 - confirmado cruzando timestamps)
+
+1. 14:48:59 — entra largo GFGV4200DI (34 @ 59.2, señal IV)
+2. 15:23:45 — toma de ganancia parcial, vende 17, quedan 17 largos
+3. 18:21:24 — spread_completion abre la pata corta GFGV3800DI (-17 @ 25.501), financiada por la larga de arriba
+4. 18:28:44 — entra una SEGUNDA larga, no relacionada, GFGV4000DI (38 @ 47.899, señal IV)
+5. ~18:37 UTC en adelante — el libro de GFGV3800DI se queda sin puntas; el backstop reintenta sin poder cerrar (book en 0/0), con cadencia de minutos (no de segundos)
+6. 19:23:16 — toma de ganancia parcial en GFGV4000DI, vende 19, quedan 19
+7. 21:08:20 — el backstop finalmente logra cerrar GFGV4200DI (venta de las 17 restantes @ 112.0 - ganancia grande vs. entrada 59.2)
+8. 21:08:29 — el bot detecta, 9 segundos después, que GFGV3800DI quedó SIN cobertura (su financiadora recién se cerró) - invariante de riesgo violada, logueado correctamente
+9. 21:08:41 — cierra GFGV3800DI 21 segundos después de detectar la descubierta (compra @ 44.999 - pérdida de ~$331/contrato en esa pata sola)
+10. 21:15:19 — cierra también GFGV4000DI (venta @ 73.0 - ganancia grande vs. entrada 47.899)
+
+**Lectura**: el spread como conjunto (GFGV4200DI largo + GFGV3800DI corto) cerró con ganancia neta pese a que la pata corta sola mostró pérdida (es el comportamiento esperado de un spread: la larga debe compensar y superar a la corta en la dirección ganadora). La detección de descubierta y el cierre de emergencia funcionaron en 21 segundos. Día neto positivo para weekly_asymmetric.
+
+### 4) Estado de los logs (por qué algunos archivos del export "no tienen nada nuevo")
+
+`position_events.csv` y `market_data_source_log.csv` no tienen ninguna fila después de 2026-11-19T21:15:19 UTC. **Confirmado que esto NO es un bug de logging** (el bot no se "rompió"): `ggal_bot.log`, `market_snapshots.csv`, `portfolio_greeks_log.csv` y `ccl_bond_quotes.csv` están todos activos hasta el momento del export (24/11, mtime ~12:30 UTC) y `bot_state.json` confirma 0 posiciones abiertas - sencillamente no hubo ninguna señal de entrada/salida desde el cierre del 19/11 hasta hoy (fin de semana + 2 ruedas sin señal calificada), así que esos dos archivos (que solo escriben en eventos de posición/fill) no tenían nada que escribir. `shadow_trades.csv` sigue congelado desde el 2/10 (el blindspot de rotación de esquema ya documentado) y `signal_funnel.csv` sigue vacío en toda su historia (0 filas de datos desde que existe) - ninguno de los dos es nuevo de esta semana.
+
+### 5) Otros hallazgos de la auditoría de invariantes (`audit_journal_invariants.py`, vía `weekly_review.py`)
+
+15 violaciones en 3934 filas: 1 CRITICAL (30/9, GFGC6600OC, hueco real de logging sin ENTRY que lo explique - histórico, no de esta semana) + 14 INFO. De las INFO, 7 son posiciones "huérfanas" (ENTRY sin CLOSE, 55-77 días de antigüedad, todas de septiembre) - casi seguro son el mismo BUG B (reinvención de `position_id` entre restarts) aplicado a posiciones viejas, no exposición real (greeks=0 ahora mismo lo confirma), pero quedan sin cerrar en el journal crudo. No requieren acción - es una limitación ya conocida de los datos de antes del fix del 27/10, no algo nuevo.
+
+Rejects desde el 18/11: solo 5, todos `greeks_limit_exceeded` (bloqueo correcto de una entrada de GFGV4400DI el 19/11 con griegas ya al límite). Cero disparos del kill switch desde el 21/10 (sigue sin dispararse en 5 semanas).
+
+### Conclusión / recomendación
+
+El bot está operativamente sano ahora mismo (corriendo, sin posiciones abiertas, sin breaches, scalping confirmado apagado, los tres fixes de esta semana verificados en los datos reales de producción - no solo commiteados). Pero el resultado de fondo no cambió: **tanto scalping como weekly_asymmetric muestran PnL negativo estadísticamente significativo en todo el historial de shadow mode** (ningún IC95% cruza cero). Las correcciones de esta semana son de integridad/seguridad (evitan pérdidas evitables por bugs), no cambios que debieran convertir una estrategia sin edge en una con edge - consistente con el veredicto ya alcanzado por el panel Módulo B (sin edge demostrado tampoco ahí). Sugerencia: antes de considerar pasar de shadow mode a real, valdría la pena un review explícito de si weekly_asymmetric (la estrategia "principal" hoy) tiene alguna hipótesis de edge que todavía no se haya probado, o si el próximo paso es revisar params/thresholds actuales a la luz de este resultado.
